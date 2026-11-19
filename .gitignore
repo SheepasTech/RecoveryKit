@@ -1,0 +1,32 @@
+# Case output: customer data (names, PINs, disk contents). Never commit.
+cases/*
+!cases/.gitkeep
+*.zip
+
+# Bundled runtime, fetched at build time, not stored in git
+python/*
+!python/.gitkeep
+
+# Third-party binaries live on the USB, checksums live in tools/manifest.sha256
+tools/*
+!tools/.gitkeep
+!tools/manifest.sha256
+
+# Secrets - generated per install, never commit
+config/token*
+*.secret
+.env
+.env.*
+
+# Logs, local tracking, editors / OS
+*.log
+debug/*
+.project/
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+*.swp
+*.code-workspace
+__pycache__/
+*.pyc
