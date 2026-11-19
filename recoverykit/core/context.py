@@ -69,6 +69,30 @@ class RegView:
         except regf.HiveError:
             return []
 
+    def values(self, hive, path):
+        """All values of a key as {name: value}; {} if the key is absent or unreadable."""
+        if self.online:
+            out = {}
+            try:
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, hive + chr(92) + path, 0, winreg.KEY_READ) as k:
+                    i = 0
+                    while True:
+                        try:
+                            name, val, _ = winreg.EnumValue(k, i)
+                        except OSError:
+                            break
+                        out[name] = val
+                        i += 1
+            except OSError:
+                pass
+            return out
+        h = self._hive(hive)
+        try:
+            k = h.open(path) if h else None
+            return k.values() if k else {}
+        except regf.HiveError:
+            return {}
+
     def exists(self, hive, path):
         if self.online:
             try:

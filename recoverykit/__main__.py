@@ -129,6 +129,7 @@ def menu(engine):
             ("scan", "Scan: find the target, collect logs, write the report (read-only)"),
             ("assistant", "Troubleshooting assistant: suggested next steps"),
             ("repair", "Repair and backup helpers (every step is shown and confirmed)"),
+            ("drivers", "Third-party drivers: newest first, propose removing one"),
             ("answers", "Answer / update the boot-failure questions"),
             ("bundle", "Bundle this run into a zip"),
             ("quit", "Quit"),
@@ -146,11 +147,14 @@ def menu(engine):
             engine.module("repair", "run_menu")
             engine.module("assistant", "collect")
             engine.report()
-        elif choice in ("assistant", "answers", "bundle") and not engine.scanned:
+        elif choice in ("assistant", "answers", "bundle", "drivers") and not engine.scanned:
             ui.say("Run the scan first: nothing is known about the target yet.")
         elif choice == "assistant":
             engine.suggestions(refresh=True)
             engine.module("assistant", "show")
+            engine.report()
+        elif choice == "drivers":
+            engine.module("drivers", "run_menu")
             engine.report()
         elif choice == "answers":
             from .modules import discovery

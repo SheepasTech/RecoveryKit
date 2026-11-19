@@ -96,6 +96,8 @@ class Engine:
             ui.say("Target: %s" % (discovery.describe(ctx.target) if ctx.target else "none"))
             ui.header("Collecting logs (read-only)")
             self.module("logs", "collect")
+            for extra in ("regdiff", "drivers", "triage"):   # read-only inventories (phases 6-8)
+                self.module(extra, "collect")
             plugins.run_all(ctx)
             self.read_only_check()
             self.module("assistant", "collect")

@@ -330,3 +330,41 @@ title = "SrtTrail.txt is missing"
 text = "SrtTrail.txt is not present: Startup Repair has not run on this install, or its log is absent. Run Startup Repair from WinRE to produce it."
 when = ["log.srttrail == missing", "booted != true"]
 evidence = ["log.srttrail"]
+
+# ---- rules added with the registry, driver and startup inventories (phases 6-8)
+
+[[rule]]
+id = "C-driver-rollback"
+branch = "C"
+order = 325
+title = "Look at the recently added drivers"
+text = "Third-party drivers were added shortly before the install's last activity: {drivers.recent}. If the failure started after a driver or hardware change, removing the newest one is a candidate (Repair helpers > drivers). Remove one at a time, test boot after each."
+when = ["booted != true", "drivers.recent_count > 0"]
+evidence = ["drivers.recent_count", "operator.recent_change"]
+
+[[rule]]
+id = "D-registry-notable"
+branch = "D"
+order = 425
+title = "Check the registry findings"
+text = "The registry snapshot has entries that affect startup (safe-boot flag, setup in progress, control-set mismatch, pending servicing, non-default shell or boot-execute). Read the list in the report section 4 and inventory/registry-snapshot.json before changing boot configuration."
+when = ["booted != true", "registry.notable_count > 0"]
+evidence = ["registry.notable_count"]
+
+[[rule]]
+id = "D-registry-changes"
+branch = "D"
+order = 427
+title = "Registry changed since the previous run"
+text = "Services or startup values differ from the previous run of this case. Read inventory/registry-changes.txt: it shows what a repair attempt or an update changed."
+when = ["booted != true", "registry.changes_count > 0"]
+evidence = ["registry.changes_count"]
+
+[[rule]]
+id = "E-startup-flagged"
+branch = "E"
+order = 575
+title = "Review the flagged startup entries"
+text = "Some autoruns, services or scheduled tasks start from user-writable folders, use script hosts, or point to missing files. They are things to look at, not a verdict. See inventory/autoruns.json, services.json and tasks.json."
+when = ["booted != true", "startup.flagged_count > 0"]
+evidence = ["startup.flagged_count"]

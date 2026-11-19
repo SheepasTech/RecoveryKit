@@ -78,7 +78,7 @@ def _flags(args):
 
 _DISM_REPAIR = {"/cleanup-image", "/scanhealth", "/checkhealth", "/restorehealth", "/source", "/limitaccess",
                 "/scratchdir", "/image", "/remove-package", "/packagename", "/get-packages", "/get-currentedition",
-                "/get-intl", "/get-drivers", "/english", "/logpath", "/format", "/revertpendingactions"}
+                "/get-intl", "/get-drivers", "/remove-driver", "/driver", "/english", "/logpath", "/format", "/revertpendingactions"}
 _DISM_EXPORT = {"/export-image", "/sourceimagefile", "/sourceindex", "/destinationimagefile", "/compress", "/swmfile",
                 "/checkintegrity", "/english", "/logpath", "/scratchdir"}
 _ROBOCOPY_BAD = {"/mov", "/move", "/purge", "/mir", "/zb", "/sec", "/secfix", "/nocopy", "/create", "/a-", "/a+", "/im", "/is", "/it"}

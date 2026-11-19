@@ -147,6 +147,26 @@ def render(data, audit):
         for title, i in problems:
             add("- %s / %s: %s%s" % (title, i.get("name"), i.get("status"), " - " + i["reason"] if i.get("reason") else " - (no reason recorded)"))
         add("")
+    look = []
+    for n in ((sections.get("registry") or {}).get("data") or {}).get("notable") or []:
+        look.append("Registry: %s" % n)
+    drv = (sections.get("drivers") or {}).get("data") or {}
+    if drv.get("recent"):
+        look.append("Drivers added in the %s days before the install's last activity: %s" % (
+            drv.get("recent_days", 30), ", ".join(str(x) for x in drv["recent"][:12])))
+    for name, label in (("autoruns", "autorun"), ("services", "service"), ("tasks", "scheduled task")):
+        fl = ((sections.get(name) or {}).get("data") or {}).get("flagged") or []
+        if fl:
+            look.append("%d flagged %s entr%s (see inventory/%s.json)" % (len(fl), label, "y" if len(fl) == 1 else "ies", name))
+    chg = ((sections.get("registry") or {}).get("data") or {}).get("changes") or []
+    if chg:
+        look.append("%d registry change(s) since the previous run (inventory/registry-changes.txt)" % len(chg))
+    if look:
+        add("Things to look at (findings, not verdicts):")
+        add("")
+        for x in look:
+            add("- %s" % str(x).replace("|", "/"))
+        add("")
     files = data.get("files") or []
     add("Files collected: %d ok, %d missing, %d error, %d metadata only." % tuple(
         sum(1 for f in files if f.get("status") == s) for s in ("ok", "missing", "error", "skipped")))

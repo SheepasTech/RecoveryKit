@@ -115,6 +115,26 @@ def facts(case_data):
         if mm is not None:
             f["source.mismatch_fields"] = list(mm)
 
+    recent = _g(sections, "drivers", "data", "recent")
+    if isinstance(recent, list):
+        f["drivers.recent_count"] = len(recent)
+        f["drivers.recent"] = ", ".join(str(x) for x in recent[:8])
+    notable = _g(sections, "registry", "data", "notable")
+    if isinstance(notable, list):
+        f["registry.notable_count"] = len(notable)
+    changes = _g(sections, "registry", "data", "changes")
+    if isinstance(changes, list):
+        f["registry.changes_count"] = len(changes)
+    flagged = 0
+    seen = False
+    for name in ("autoruns", "services", "tasks"):
+        fl = _g(sections, name, "data", "flagged")
+        if isinstance(fl, list):
+            seen = True
+            flagged += len(fl)
+    if seen:
+        f["startup.flagged_count"] = flagged
+
     if cd.get("booted_after_repair") is not None:
         f["booted"] = cd["booted_after_repair"]
     return f

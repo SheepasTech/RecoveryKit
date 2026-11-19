@@ -12,7 +12,7 @@ Python 3.11+ **stdlib only**. The kit must run from an embeddable Python in WinR
 
 ## Objects (read the source, it is short)
 
-- `recoverykit/core/context.py`: `Ctx` (`kit_root, cfg, env, case, ui, runner, options, inventory, target`), `Target` (`root, windir, online, letter, volume, disk, partition, info, reg`), `RegView` (`get(hive, path, name, default)`, `subkeys(hive, path)`, `exists(hive, path)`, `control_set()`; hive is `"SOFTWARE"` or `"SYSTEM"`; works for offline and running installs).
+- `recoverykit/core/context.py`: `Ctx` (`kit_root, cfg, env, case, ui, runner, options, inventory, target`), `Target` (`root, windir, online, letter, volume, disk, partition, info, reg`), `RegView` (`get(hive, path, name, default)`, `subkeys(hive, path)`, `values(hive, path)` (dict), `exists(hive, path)`, `control_set()`; hive is `"SOFTWARE"` or `"SYSTEM"`; works for offline and running installs).
 - `recoverykit/core/case.py`: `Case.section()`, `Section.item()/set()/data`, `Case.collect_file(src, rel_dest, source="target"|"host", max_bytes=None)` (returns an entry dict with `status`, `reason`, `size`, `sha256`), `write_text(rel, text)`, `write_json(rel, obj)`, `path(*parts)`. Relative paths use `/`.
 - `recoverykit/core/runner.py`: `Runner.run(argv, purpose, timeout=120, retry_rc=())` for **read-only** commands (raises `Refused` otherwise; a missing tool returns a `Result` with `rc=None` and `.error` set, it does not raise), `run_ps(name)` for the built-in PowerShell snippets, `run_diskpart(lines, purpose)` (list/select/detail only), `note_bcd_backup(path)`, `repair(step)`, `verified_tools`, `resolve(name)`. `Result`: `rc, out, error, timed_out, ok, seconds`. `classify(argv)` shows what is allowed. `RepairStep(id, title, effect, argv=None, diskpart=None, risk="", timeout=3600, touches_target=True, target_check=None, secrets=(), evidence="")`.
 - `ctx.inventory`: `disks` (from `core/winapi.disks()`: `number, model, serial, bus, size, style, offline, partitions[{number, offset, size, type, volume, letter, fs}]`), `volumes` (`guid_path, letter, fs, label, size, free, disk, partition, drive_type`), `installs` (list of `Target`).
@@ -25,7 +25,11 @@ Python 3.11+ **stdlib only**. The kit must run from an embeddable Python in WinR
 
 `case.json` (`ctx.case.data`): `schema, case_id, ticket, environment, target{root, online, letter, disk, partition, volume, info{product, edition, build, ubr, build_full, architecture, language, ui_languages}}, operator_answers{symptom, firmware_sees_disk, boot_menu_wbm, recent_change, data_backed_up}, sections{name: {title, status, reason, items[], data{}}}, files[], source_check, booted_after_repair`.
 
-Section names so far: `environment, disks, installs, target, free_space, boot_structure, bitlocker, hardware, operator` (discovery); `logs_target, event_logs, bcd, logs_host, disk_health, pending` (logs); `assistant`; `repairs`.
+Section names so far: `environment, disks, installs, target, free_space, boot_structure, bitlocker, hardware, operator` (discovery); `logs_target, event_logs, bcd, logs_host, disk_health, pending` (logs); `assistant`; `repairs`; `registry` (regdiff); `drivers`; `autoruns`, `services`, `tasks` (triage).
+
+Other hive files (a user's `NTUSER.DAT`) can be read with `from ..core import regf` and `regf.Hive(path)` (`open(path)`, `Key.values()`, `Key.subkey_names()`, `Key.subkeys()`, `hive.dirty`; raises `regf.HiveError`/`OSError`). On a running Windows the loaded user hives are locked: report that as the reason.
+
+Test fixture: `tests/fakewin.py` has `make_hive(path, tree)` (tree = `{"values": {name: sz("..")|dword(n)|multi([..])}, "keys": {name: tree}}`) and `make_target(root)` which builds a fake offline `<root>/Windows` with SOFTWARE and SYSTEM hives. Extend the tree you need by writing your own hives with `make_hive` in your test; do not change `make_target`'s existing output.
 
 ## Testing on the development PC
 
