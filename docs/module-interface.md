@@ -1,6 +1,6 @@
 # Module interface (for contributors)
 
-Python 3.11+ **stdlib only**. The kit must run from an embeddable Python in WinRE: no pip packages, no PowerShell assumed, ASCII-only console output, 64-bit only. Tests: `python -m unittest discover -s tests -v` from the project root (stdlib `unittest`).
+Python 3.11+ **stdlib only**. The kit must run from an embeddable Python in WinRE: no pip packages, no PowerShell assumed, ASCII-only console output, 64-bit only. Tests (over 500): `python -m unittest discover -s tests -v` from the project root (stdlib `unittest`).
 
 ## Hard rules for modules (`recoverykit/modules/*.py`, plugins)
 
@@ -41,7 +41,7 @@ To add a tool or form: add a pattern in `core/runner.py` and a test in `tests/`.
 
 `case.json` (`ctx.case.data`): `schema, case_id, ticket, environment, target{root, online, letter, disk, partition, volume, info{product, edition, build, ubr, build_full, architecture, language, ui_languages}}, operator_answers{symptom, firmware_sees_disk, boot_menu_wbm, recent_change, data_backed_up}, sections{name: {title, status, reason, items[], data{}}}, files[], source_check, booted_after_repair`.
 
-Section names so far, in scan order: `environment, disks, installs, output_location, target, free_space, boot_structure, bitlocker, hardware, operator` (discovery); `device`; `logs_target, event_logs, bcd, logs_host, disk_health, pending` (logs); `log_findings` (loganalysis); `registry` (regdiff); `drivers`; `autoruns, services, tasks` (triage); `plugin_<name>` (one per plugin); `assistant`. Created later: `repairs`, `source_check`. If `output_location` is an error the scan stops after discovery (the case would be written on the target volume).
+Section names so far, in scan order: `environment, disks, installs, output_location, target, free_space, boot_structure, bitlocker, hardware, operator` (discovery); `device`; `logs_target, event_logs, bcd, logs_host, disk_health, pending` (logs); `log_findings` (loganalysis); `registry` (regdiff); `drivers`; `autoruns, services, tasks` (triage); `plugin_<name>` (one per plugin); `assistant`. Created later: `repairs`, `source_check`. If `output_location` is an error the scan stops after discovery and writes no report (the case would be written on the target volume).
 
 Other hive files (a user's `NTUSER.DAT`) can be read with `from ..core import regf` and `regf.Hive(path)` (`open(path)`, `Key.values()`, `Key.subkey_names()`, `Key.subkeys()`, `hive.dirty`; raises `regf.HiveError`/`OSError`). On a running Windows the loaded user hives are locked: report that as the reason.
 

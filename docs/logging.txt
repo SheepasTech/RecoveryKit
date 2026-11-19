@@ -63,7 +63,11 @@ are printed on the console only, and the start line (START |, written to debug.l
 (--serve also writes its token to cases\_api-token.txt for local programs; the file is deleted
 when it exits.)
 
+A scan that stops because the case output would land on the target volume writes debug.log, a partial case.json and
+the inventory files of the disks, but no report.md; the reason is in debug.log.
+
 Reporting a problem
 -------------------
-Zip the run folder (or run run.cmd --bundle) and send it. The run folder may contain customer
-data: see docs\manual.md.
+Keep the whole run folder, above all debug.log and audit.log (and audit\), or run run.cmd --bundle
+and keep the zip it writes next to the run folder. Send it with a note of what you expected and what
+you saw. The run folder may contain customer data: see docs\manual.md.

@@ -4,35 +4,33 @@
 
 A USB toolkit that diagnoses an unbootable Windows installation, collects its logs and writes a report. Repairs exist but only run after a typed confirmation. It carries its own 64-bit Python, so it needs no Python and no PowerShell on the machine it runs on. 64-bit only.
 
-**Status.** Built and unit-tested on one development PC. It has not been run in WinRE or against a real broken PC yet, so whether the bundled Python starts there and which tools WinRE has are not confirmed. Use the first-run checklist below ("First run on a real machine") on the first real machine.
+**Status (version 0.5.1).** Built and tested by over 500 automated tests on one development PC. Not verified: a real WinRE boot (so whether the bundled Python starts there and which tools WinRE has are not confirmed), an administrator session, a real offline disk, any real repair command, two machines on a LAN, and the browser page used by hand. Follow "First run on a real machine" below on the first real machine.
 
-## Preparing the USB
+## First run on a real machine
 
-On a normal Windows PC, from the project folder:
+Nothing here has been run in WinRE yet. Treat the first real boot as a test and write down what you see. A scan only reads; it does not change the customer's disk.
 
-```
-powershell -ExecutionPolicy Bypass -File .\Install-ToUsb.ps1
-```
-
-- Default destination is `D:\ITWORK\RecoveryKit`. Use `-Destination <path>` for another one. The drive must exist; the root of the system drive is refused.
-- First run downloads the embedded Python into `python\` (checksum verified). `-RefreshPython` downloads it again.
-- `-WhatIf` shows what would be copied and changes nothing.
-- `cases\` on the USB is never deleted or overwritten, so collected case data survives a re-install.
-- It writes `kit-version.txt` and finishes by running `run.cmd --version`.
-
-## Booting the broken PC into WinRE
-
-1. Boot into WinRE: Troubleshoot > Advanced options > Command Prompt. Or, from Windows Setup, press Shift+F10.
-2. Find the USB letter. It differs on every PC. Try `dir D:\ITWORK`, `dir E:\ITWORK`, and so on, or run `diskpart`, then `list volume`, then `exit`.
-3. Run `<letter>:\ITWORK\RecoveryKit\run.cmd`.
+1. **Update the stick** (on your own PC, before you leave). Run `powershell -ExecutionPolicy Bypass -File .\Install-ToUsb.ps1` from the project folder; `-Destination <path>` names the stick (default `D:\ITWORK\RecoveryKit`; the drive must exist). It downloads the embedded Python on the first run (checksum verified; `-RefreshPython` downloads it again), copies the kit (`cases\` on the stick is never deleted or overwritten) and writes `kit-version.txt`. On the first run it also **creates this PC's certificate authority (CA)** in `%LOCALAPPDATA%\ITwork\CA` and puts only the CA certificate on the stick as `config\ca-cert.pem` (it prints the SHA-256 of that file). That file is what lets the stick trust your control server later. The CA key stays on this PC; see "TLS" below. The script ends by checking the stick for private keys and token values and by running `run.cmd --version`; if it names a file, fix that before using the stick. `-WhatIf` shows what would be copied and changes nothing.
+2. **Boot the broken PC into WinRE**: Troubleshoot > Advanced options > Command Prompt. Or press Shift+F10 in Windows Setup.
+3. **Find the stick's letter.** It differs on every PC. Try `dir D:\ITWORK`, `dir E:\ITWORK`, and so on, or run `diskpart`, then `list volume`, then `exit`.
+4. **Start a scan**: `<letter>:\ITWORK\RecoveryKit\run.cmd --scan` (or `run.cmd` and choose Scan). Note whether the first line says `Using bundled Python`; if it does not, write down what it says. The kit may ask which install is the target and a few questions about the failure (`--auto` skips all questions, and then no repair is ever confirmed). A scan is read-only.
+5. **Check the output before you trust it.**
+   - The `Target:` line shows the chosen Windows folder, edition, build, language, disk number, partition number, size and disk model. Compare it with what you know about the machine. If it is not the customer's disk, stop and choose again or quit.
+   - The `Device ID:` lines: eight codes with the component behind each. `XXXX` means a component could not be read. In WinRE these describe the customer's PC.
+   - The section list at the end: every line that says `error` or `missing` has a reason next to it. Missing tools (`wevtutil`, `manage-bde`) and a session without administrator rights are normal in some environments; the report says what was skipped. Write down anything you do not understand.
+   - If it says `Scan stopped`, see "When a scan stops".
+6. **Read the report.** It is `report.md` in the run folder, `cases\<case-id>\<YYYYMMDD-HHMM>\` on the stick (the path is printed on the last lines). In WinRE read it with `type`; on the main machine open it after step 7. Check the confirmed facts, the "not yet established" list and the findings.
+7. **Bundle and bring it back.** `run.cmd --bundle` (or the menu item "Bundle this run into a zip") writes `<run folder>.zip` next to the run folder, for example `cases\<case-id>\<YYYYMMDD-HHMM>.zip`. Copy it to your PC from the stick, or fetch it through the control server (see "Using the control server").
+8. **Repairs come last.** Only after the report makes sense: use `--dry-run` first, one step at a time, test-boot after each step and record the result. No repair has ever been run for real.
+9. **If something looks wrong, keep the whole run folder.** The two files that matter most are `debug.log` (everything shown, asked, answered and run) and `audit.log` (every command attempted, with exit code; the full output is in `audit\`). Also write down what you expected, what you saw, and what differed from this manual. The run folder can hold customer data; see "Customer data".
 
 ## Running on a normal Windows
 
-Attach the disk of the broken PC and run `run.cmd` from the kit. Run it as administrator for full results.
+Attach the disk of the broken PC and run `run.cmd` from the kit. Run it as administrator for full results. The device ID then describes the PC you are working on, not the customer's, and the scan says so.
 
 ## Switches
 
-Run `run.cmd --help` for the same list. Abbreviations of switch names are not accepted.
+Run `run.cmd --help` (or `-h`) for the same list. Abbreviations of switch names are not accepted.
 
 Scan:
 
@@ -63,7 +61,7 @@ Remote session (the agent dials out; no port is opened on the target):
 | Switch | Effect |
 |---|---|
 | `--connect <url>` | Control server URL, for example `https://192.168.1.10:8765`. It must start with `http://` or `https://` (any case); `http://` only for a server run with `--no-tls`. A server that cannot be reached gives one line and exit code 2 |
-| `--token <T>` | Agent token of the server (`agent_token` in the server's `config\token-server.json`). Needed with `--connect` |
+| `--token <T>` | Agent token of the server (`agent_token` in `config\token-server.json` in the kit folder on the server PC). Needed with `--connect` |
 | `--ca <file>` | CA certificate that signed the server (default `config\ca-cert.pem` on the stick). Used for `https://` URLs |
 | `--pin <sha256>` | Expected SHA-256 fingerprint of the server's TLS certificate (64 hex characters, colons allowed), for a server whose CA is not on the stick. Replaces the CA check: given together with `--ca`, the pin is used and `--ca` ignored (the program says so) |
 | `--session-minutes <n>` | Session length (default 60) |
@@ -79,7 +77,7 @@ Control server (on the main machine):
 | `--bind <ip>` | Interface to bind (default 127.0.0.1; give the LAN address to be reachable) |
 | `--store <dir>` | Where received bundles are stored (default `cases\_server`) |
 | `--intake <dir>` | Also copy bundles to `<dir>\ITW <ticket>\` (vault intake) |
-| `--ctl ...` | Operator client: `agents`, `pair ID CODE`, `get ID PATH`, `post ID PATH [JSON]`, `fetch-bundle ID`, `bundles`, `revoke ID`. The code may be typed in any case, with or without the dash |
+| `--ctl ...` | Operator client: `agents`, `pair ID CODE`, `get ID PATH`, `post ID PATH [JSON]`, `fetch-bundle ID`, `bundles`, `revoke ID`. Optional `--url URL`, `--token T`, `--pin SHA256`, `--ca FILE` come first (for example `run.cmd --ctl --url http://192.168.1.10:8765 agents` for a `--no-tls` server). On the server PC the operator token and the CA certificate are found by themselves. The code may be typed in any case, with or without the dash |
 
 Other:
 
@@ -104,6 +102,8 @@ debug.log     everything shown and run
 audit.log     every command attempted, with exit code
 audit/        full output of each command
 ```
+
+`--bundle` adds `<YYYYMMDD-HHMM>.zip` next to the run folder.
 
 Details of the logs: `docs\logging.txt`.
 
@@ -132,7 +132,7 @@ CPU -RAM -RSPD-MOBO-GPU -USER-DISK-UNIT
 YWUC-EHQX-DZBG-LWAM-TTAD-UFOB-XPJB-SDVR
 ```
 
-Each code is a hash of that component, so the same CPU always gives the same CPU code and a RAM swap changes only the RAM codes. `RSPD` is "rated / running" memory speed: when the running speed is below the rated one, the XMP/EXPO profile is not active. `XXXX` means the component could not be read.
+Each code is a hash of that component, so the same CPU always gives the same CPU code and a RAM swap changes only the RAM codes. `RSPD` is "rated / running" memory speed: when the running speed is below the rated one, the XMP/EXPO profile is not active. `XXXX` means the component could not be read. The system UUID or serial behind the last code (`UNIT`) is not printed in the report or on the console; it reads "kept in device.json", and the value is in `inventory\device.json` and the device registry on the stick.
 
 The stick keeps a `devices` folder next to `cases`:
 
@@ -161,7 +161,7 @@ Besides the logs, a scan writes read-only findings and inventories into `invento
 
 ## When a scan stops
 
-A scan stops, before collecting anything, if the case output (or the `devices\` folder) would be written onto the target Windows volume. Nothing is written to the target. The screen says `Scan stopped: ... Choose another output location with --out.` Run it again with a folder on another drive, for example:
+A scan stops, before collecting anything, if the case output (or the `devices\` folder) would be written onto the target Windows volume. Nothing is written to the target and no `report.md` is written (it would land on the target). The screen says `Scan stopped: ... Choose another output location with --out.` Run it again with a folder on another drive, for example:
 
 ```
 run.cmd --scan --out E:\cases
@@ -208,34 +208,34 @@ Each step is run one at a time. After a step, test-boot the target and record th
 
 With `--dry-run` a repair step shows everything and runs nothing. Per step the screen prints: why (the finding that triggered it), the exact command, the effect, the risk, for BCD steps the backup file, and the line `DRY RUN: the command will be recorded but not executed.` It still asks `Run this command?`. Answer yes and `audit.log` gets an entry of kind `dry-run` ("not executed"); answer no and it gets `declined`. The target is not touched either way. Use it to read what a repair would do before doing it.
 
-## First run on a real machine (not yet tested in WinRE)
-
-Nothing here has been run in WinRE. Treat the first real boot as a test and write down what you see.
-
-1. Boot WinRE (or Shift+F10), find the stick, start `run.cmd`. Note whether the bundled Python starts (the first line says `Using bundled Python`).
-2. Scan first, read-only: choose Scan, or `run.cmd --scan`. Note any section marked `missing` or `error` (for example no `wevtutil`, no `manage-bde`) and the reason.
-3. Compare the chosen disk with what you know: model, size, partition, edition and language. If it is not the customer's disk, stop.
-4. Open `report.md` in the case folder (`type`, or on the main machine after bundling). Check facts, the "not yet established" list and the findings.
-5. Only then consider repairs: try `--dry-run` first, one step at a time, test-boot after each, record the result.
-6. Bundle the case (`--bundle` or the menu) and copy it to the main machine. Write down what differed from this manual.
-
-## Headless and remote use
+## Headless use
 
 - No server, nobody at the keyboard: `run.cmd --scan --auto --bundle`.
-- A program on the same machine: `run.cmd --serve` and call the agent API on 127.0.0.1 with the token it prints.
-- From the main machine: start `run.cmd --server --bind <LAN address>` there, then on the target run `run.cmd --connect https://<address>:8765 --token <agent_token>` and tell the operator the pairing code shown on the target's screen: 10 letters and digits in two groups, like `K7QF4-M2XWP` (no I, O, 0 or 1 in it; the operator can type it in any case, with or without the dash, in the browser page or with `--ctl pair <id> <code>`). If the server sees 20 messages with a wrong signature for the agent's id it revokes the agent ("too many invalid signatures" in the agent list); the target says so when its session ends, and `--connect` has to be run again for a new session and a new code. Open `https://<address>:8765/` in a browser (it will warn about the certificate unless this PC's CA is installed in the browser; the page is only a front end, every call still needs the operator token), or use `run.cmd --ctl`.
+- A program on the same machine: `run.cmd --serve` and call the agent API on 127.0.0.1 with the token it prints. Routes: `docs\api.md`.
 
-The target never opens a LAN port: it dials out. A remote session is read-only unless it was started with `--allow-remote-repairs`, and ends on a keypress on the target, after `--session-minutes` (default 60), or when revoked. Traffic is encrypted with TLS unless the server was started with `--no-tls` (then it is authenticated but not encrypted: trusted LAN only). All routes are in `docs\api.md`.
+## Using the control server
+
+The control server runs on your main PC. The target only dials out to it and opens no port. A remote session is read-only unless the target was started with `--allow-remote-repairs`. It ends on a keypress on the target, after `--session-minutes` (default 60), or when you revoke it. This has only been tried between processes on one PC, not between two machines on a LAN.
+
+1. **Start the server** on your PC: `run.cmd --server --bind <your LAN IP>`. Without `--bind` it listens on 127.0.0.1 only. TLS is on by default: the first start creates the CA if needed and issues a server certificate (see "TLS"). It prints the server URL, the CA fingerprint and the path of the tokens file, `config\token-server.json` in the kit folder on this PC: `agent_token` is for the target, `operator_token` is for you (the page asks for it; `--ctl` reads it by itself). If the certificate cannot be made, the server refuses to start unless you give `--no-tls`. `--no-tls` serves plain HTTP: traffic is signed but not encrypted, and someone on the LAN who also has the agent token can take over a session, so use it on a trusted LAN only.
+2. **On the target** (a stick prepared with `Install-ToUsb.ps1` on this PC already carries the CA certificate): `run.cmd --connect https://<ip>:8765 --token <agent_token>`, with the address the server printed. If the target's date is wrong, see "Clocks in WinRE" first.
+3. **Read the pairing code** from the target's screen: 10 letters and digits in two groups, like `K7QF4-M2XWP` (no I, O, 0 or 1). It is shown on the console only and never logged.
+4. **Pair it.** In a browser on your PC open `https://<ip>:8765/` (it warns about the certificate unless your CA is installed in the browser), paste the operator token and enter the code for the agent. Or on the server PC: `run.cmd --ctl agents` shows the agent id, then `run.cmd --ctl pair <id> <code>`. The code may be typed in any case, with or without the dash. Five wrong codes lock the session. If the server sees 20 messages with a wrong signature for the agent, it revokes it ("too many invalid signatures" in the agent list); run `--connect` again on the target for a new session and a new code.
+5. **Run a scan**: in the page, or `run.cmd --ctl post <id> /scan` (it takes a minute or more). Read results with `run.cmd --ctl get <id> /report` or `/sections`.
+6. **Fetch the bundle**: in the page, or `run.cmd --ctl fetch-bundle <id>`. The server stores the zip under `--store` (default `cases\_server`) and, with `--intake <dir>`, also copies it to `<dir>\ITW <ticket>\`. `run.cmd --ctl bundles` lists what is stored.
+7. **Revoke** when done: in the page, or `run.cmd --ctl revoke <id>`. That ends the session on the target.
+
+The browser page was driven by a script in headless Edge (`tests\browser\smoke.mjs`); nobody has used it by hand yet. All routes are in `docs\api.md`.
 
 ## TLS
 
-The technician's main PC (the control host) is the certificate authority (CA) for all ITwork tools (ADR 0020).
+The technician's main PC (the control host) is the certificate authority (CA) for all ITwork tools.
 
 - **Where it lives.** `%LOCALAPPDATA%\ITwork\CA\` on the server PC: `ca-cert.pem` (public), `ca-key.pem` (the private key), `issued.log` and a `README.txt`. It is created the first time it is needed, by `New-ItworkCertificates.ps1` (Windows PowerShell 5.1 or PowerShell 7, no administrator rights, nothing is added to the Windows certificate store). Use `--ca-dir <dir>` for another folder.
 - **The key stays on the server PC.** Never copy `ca-key.pem` to a USB stick, a share or a ticket: whoever has it can impersonate the server. `Install-ToUsb.ps1` copies from `config\` only `kit.toml` and `assistant.toml` (an allowlist) plus the CA's `ca-cert.pem` (refused if it contains a key block), and refuses to finish if, under the destination (outside `cases\`, `devices\` and `python\`), a file called `ca-key.pem`, `server-key.pem` or `token-server.json` exists, or any file smaller than 64 KB (also inside a small zip) contains a private key block or a token key as it is written in `token-server.json` (the operator and the agent token, in quotes); it names the files. `Install-ToUsb.ps1 -CheckOnly <folder>` runs only that check on a folder (exit 0 clean, 1 not). If the CA folder is lost, a new CA is made and every stick needs `Install-ToUsb.ps1` again.
 - **Server certificate.** `run.cmd --server` issues `config\server-cert.pem` and `config\server-key.pem` (git-ignored) from the CA when they are missing, expire within 30 days, or do not cover this PC's name and addresses (computer name, `localhost`, `127.0.0.1`, the LAN addresses and `--bind`). It prints the server URL and the CA fingerprint. If PowerShell or the script is missing the server does not start; fix that or use `--no-tls`.
 - **Sticks.** Run `Install-ToUsb.ps1` on the server PC: it puts `config\ca-cert.pem` on the stick (and prints its fingerprint; use `-CaDir` for a CA elsewhere). The agent (`--connect https://...`) trusts a server only if its certificate chains to that file and the address you typed is in the certificate. A stick without the file refuses an `https://` connection; it never falls back to an unverified one. `--ca <file>` uses another CA file; `--pin <sha256>` trusts exactly one server certificate instead (for a server whose CA is not on the stick).
 - **The server's address changed** (new DHCP lease, another network): restart `run.cmd --server`. It sees the address is not in the certificate and issues a new one from the same CA; sticks need no change.
-- **Clocks in WinRE.** WinRE often starts with a wrong date. A certificate is only valid between its dates (certificates start 24 hours before they were issued), so a clock that is far off makes the connection fail with a message that shows the local date. Set it first, in the WinRE command prompt: `date 2026-11-19` and `time 14:30` (use today's date and the time in your format), then connect again.
+- **Clocks in WinRE.** WinRE often starts with a wrong date. A certificate is only valid between its dates (certificates start a day before they were issued), so a target clock that is more than about a day behind makes verification fail, with a message that shows the local date. Set it first, in the command prompt on the target: type `date`, then `time`, enter today's date and the time in the format they ask for, then connect again.
 - **The operator client** `run.cmd --ctl` on the server PC finds the CA certificate in the CA folder by itself and uses `https://127.0.0.1:8765` when there is one (pass `--url http://...` for a `--no-tls` server, or `--ca <file>`).
 - Not built: client certificates for agents (mutual TLS). The agent token and the pairing code still authenticate the agent.

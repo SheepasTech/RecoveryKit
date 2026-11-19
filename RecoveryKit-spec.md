@@ -4,7 +4,7 @@ Portable USB toolkit that diagnoses, collects evidence from, and (only with conf
 
 Merges `project idea1.txt` (a hand-worked case and its guardrails) and `project idea2.txt` (the RecoveryKit vision). Replaces `debug/log-extractor.ps1`.
 
-Status: built and unit-tested on the development PC (Windows 11, not elevated). Not yet run in WinRE or against a real broken PC. Statements below describe what the code does; where the environment decides (which tools WinRE has), the kit reports what is missing instead of assuming.
+Status (RecoveryKit 0.5.1): built and tested by an automated suite of over 500 tests on the development PC (Windows 11, not elevated). Not verified: a real WinRE boot, an administrator session, a real offline disk, any real repair command, two machines on a LAN, and the browser page used by hand (it was only driven by a script in headless Edge). Statements below describe what the code does; where the environment decides (which tools WinRE has), the kit reports what is missing instead of assuming.
 
 ## 1. Principles
 
@@ -15,7 +15,7 @@ Status: built and unit-tested on the development PC (Windows 11, not elevated). 
 5. **Back up before changing.** Before any BCD change, export the original to the case folder; the wrapper refuses the change unless that export exists as a file. The kit never writes to the target's registry.
 6. **Record everything.** Every command, its arguments, exit code and output goes to the audit log, including refused, declined and dry-run commands. A repair writes a "started" line before it runs, so an interrupted repair leaves a trace.
 7. **SFC clean does not mean bootable.** The report never says "fixed" until the target has booted; that is a user-confirmed field.
-8. **Everything degrades.** If a section cannot run, the report says why. A failed section never aborts the others, and nothing fails silently. The one stop: a scan ends when the case output would be written onto the target volume (use `--out`).
+8. **Everything degrades.** If a section cannot run, the report says why. A failed section never aborts the others, and nothing fails silently. The one stop: a scan ends when the case output would be written onto the target volume (use `--out`); it writes no report then, because the report would land on the target.
 
 ## 2. Environments and capability matrix
 
@@ -36,12 +36,12 @@ Rules:
 ```
 RecoveryKit/
   run.cmd                  launcher: finds its own drive, picks Python, starts the menu
-  Install-ToUsb.ps1        fetches the embeddable Python and copies the kit to a stick
+  Install-ToUsb.ps1        fetches the embeddable Python, copies the kit to a stick (config by allowlist), adds the CA certificate, checks the result for keys and tokens
   python/                  embeddable 64-bit Python + ._pth pointing at lib/
   lib/                     empty: no third-party dependencies
   recoverykit/             core/ (hive parser, IOCTLs, wrapper, case, log, ui), modules/,
                            engine.py, net.py, web/ (browser page)
-  config/                  kit.toml, assistant.toml (decision rules)
+  config/                  kit.toml, assistant.toml (decision rules), ca-cert.pem (CA certificate, public part, put there by the installer)
   cases/                   output, one folder per case (see section 4)
   devices/                 device registry and per-device settings (see section 4)
   plugins/                 optional, with manifest.sha256 (see section 5)
@@ -59,7 +59,7 @@ RecoveryKit/
 One **case** per target disk and run set.
 
 - **Case ID** = `ITW-<ticket>-<target id>` if the operator enters a ticket number, else `T-<target id>`. The target ID is derived from the **target** (disk serial / UniqueId plus a hash of the offline registry `MachineGuid`), not the machine running the kit. This fixes the old script, which hashed the bench PC.
-- **Device ID** = eight codes of four capital letters, joined by dashes: `CPU-RAM-RSPD-MOBO-GPU-USER-DISK-UNIT`. Each code is a hash of one component (CPU name; RAM size and module part numbers; rated and running memory speed; board manufacturer and product; PCI IDs of the display adapters; last logged-on user; target disk model; system UUID or board serial), so a changed component changes only its code. `XXXX` means not readable. It comes from SMBIOS and the hardware registry key, which need no WMI or PowerShell. It describes the machine the kit runs on: in WinRE that is the customer's PC; with the disk attached to a bench PC it is the bench PC, and the scan says so. The case ID does not depend on it.
+- **Device ID** = eight codes of four capital letters, joined by dashes: `CPU-RAM-RSPD-MOBO-GPU-USER-DISK-UNIT`. Each code is a hash of one component (CPU name; RAM size and module part numbers; rated and running memory speed; board manufacturer and product; PCI IDs of the display adapters; last logged-on user; target disk model; system UUID or board serial), so a changed component changes only its code. `XXXX` means not readable. The UUID or serial behind the last code is not shown on the console, in the report, in `case.json` or through the API (it reads "kept in device.json"); the raw value stays in `inventory/device.json` and the device registry. It comes from SMBIOS and the hardware registry key, which need no WMI or PowerShell. It describes the machine the kit runs on: in WinRE that is the customer's PC; with the disk attached to a bench PC it is the bench PC, and the scan says so. The case ID does not depend on it.
 - `devices/` next to `cases/`: `index.md` (all devices in plain words), `components.json` (every code and the component it stands for), `devices/<ID>/device.json` (components, hardware, runs) and `devices/<ID>/settings.json` (notes, ticket, answers; applied at each scan, command-line values win). `--decode-id <ID>` prints the components. `devices/` holds user names and serial numbers: customer data, like `cases/`.
 - Folder: `cases/<case-id>/<YYYYMMDD-HHMM>/` (`cases/_pending/...` until the target is known).
 
@@ -135,12 +135,15 @@ Staged and confirmed one at a time, each followed by "test boot, then record the
 
 ### 6.6 Control server (phase 4, optional)
 - Off by default; on only when the operator runs `run.cmd --connect` on the target. The session ends on a keypress on the target, after `--session-minutes` (default 60), or when the server revokes it.
-- **The agent connects out** to the server on the main machine (HTTP, long-poll; no WebSocket). No inbound ports on the target. The agent API itself listens on 127.0.0.1 only.
+- **The agent connects out** to the server on the main machine (HTTPS by default, long-poll; no WebSocket). No inbound ports on the target. The agent API itself listens on 127.0.0.1 only.
 - The server binds to the interface named with `--bind` (default 127.0.0.1; give the LAN address), never `0.0.0.0` by default.
-- Authentication: a pre-shared agent token (generated on the server in `config/token-server.json`) plus a per-session 6-digit pairing code shown on the target that the operator enters on the server before any job is relayed. Every message is signed with HMAC-SHA256 over path, nonce and body in both directions. After pairing the signing key is derived from the pairing code, so the agent token alone cannot speak for a paired session. TLS is the default: the control host PC is the certificate authority, `--server` issues its certificate from the CA in `%LOCALAPPDATA%\ITwork\CA` via `New-ItworkCertificates.ps1`, and agents verify it against the CA certificate that `Install-ToUsb.ps1` put on the stick (`--pin` is the alternative). An `https://` connection is never made unverified; the server refuses to start without TLS unless `--no-tls` is given (then traffic is authenticated but not encrypted: trusted LAN only).
+- Authentication: a pre-shared agent token (generated on the server in `config/token-server.json`) plus a per-session pairing code shown on the target that the operator enters on the server before any job is relayed. The code is 10 characters from an alphabet without I, O, 0 and 1, shown as `XXXXX-XXXXX`; it may be typed in any case, with or without the dash. Five wrong codes lock the session.
+- Every message carries two HMAC-SHA256 values: a head MAC (`X-RK-Head`, over path, metadata and `Content-Length`) that the server checks before it reads any body byte, and a signature (`X-RK-Sig`) over a direction label, path, metadata and the body's hash. The label is `req` on what the agent sends and `resp` on what the server answers, so a request cannot be reflected back as an answer. Before pairing the key is the agent token; after pairing it is a session key derived from the agent token, the agent id and the pairing code, so the agent token alone cannot speak for a paired session. 20 invalid signatures for one agent id revoke that session; the agent then has to start a new one (new id, new code).
+- TLS is the default. The control host PC is the certificate authority: `--server` issues its certificate from the CA in `%LOCALAPPDATA%\ITwork\CA` via `New-ItworkCertificates.ps1` (the CA is created on first need), and agents verify it against the CA certificate that `Install-ToUsb.ps1` put on the stick (`--pin` is the alternative). An `https://` connection is never made unverified. The server refuses to start without TLS unless `--no-tls` is given; then traffic is authenticated but not encrypted, and on a LAN where someone also has the agent token the session can be taken over: trusted LAN only. Certificates are valid from a day before they are issued; a target clock that is further off makes verification fail (WinRE clocks are often wrong).
+- Limits: 64 connections at a time, 8 per remote address (the local machine is exempt and has reserved slots); request bodies up to 64 MiB, an agent's result up to 1 GiB; a request must arrive within 120 s, plus 1 s per MiB for a result.
 - Modes: **read-only** (GET routes, scan, bundle, answers, source check) by default; **repairs** only when the target session was started with `--allow-remote-repairs` (`--allow-repairs` for the loopback API). A repair request carries `confirm: "yes"` and the single-use token returned for that exact command line; the token dies with the next scan or listing. The command wrapper still applies every rule. No arbitrary-shell route exists.
 - Every remote action goes into `audit.log` with the operator name. The API token and the pairing code are shown on the console only and never written to a log. Server log: `<store>\_server-logs\`.
-- Server stores received bundles under `--store` (named by the server, verified as zip, never overwritten), can copy them to a vault intake folder, and lists stored cases. It serves one browser page at `/`. Fleet history beyond that is not built.
+- Server stores received bundles under `--store` (named by the server, verified as zip, never overwritten), can copy them to a vault intake folder, and lists stored cases. It serves one browser page at `/` (the operator pastes the operator token once). Fleet history beyond that is not built.
 - Network bring-up in WinRE: the operator types `wpeutil InitializeNetwork` (the wrapper allows it, no module runs it); for missing NIC drivers, `drvload` of an `.inf` (allowed without switches).
 
 ### 6.7 Log findings (phase 1)
@@ -163,25 +166,27 @@ Staged and confirmed one at a time, each followed by "test boot, then record the
 - Vendored dependencies (none) and `tools/` binaries are pinned and checksummed. The bundled Python is pinned by SHA-256 in `Install-ToUsb.ps1`.
 - The control host is the certificate authority: the CA key stays on that PC (never on a stick); sticks carry only the CA certificate; no unverified TLS connection is ever made.
 - Forbidden-command list (section 1.4) is enforced in the command wrapper, not just by convention.
-- Plugins are trusted code with the kit's rights. A plugin loads only with a matching SHA-256 in `plugins/manifest.sha256`.
+- Plugins are trusted code with the kit's rights. A plugin loads only with a matching SHA-256 in `plugins/manifest.sha256`; list only code you have read.
+- Everything read from a target (registry hives, event logs, text logs, file names) is treated as hostile input: parsers are bounded and fail with one error type, links are not followed, collected files must resolve inside the target and land inside the case folder, and every value written to `report.md`, `devices/index.md` or the console is escaped or stripped of control characters.
+- The installer copies `config/` by allowlist and ends with a check of file contents for private keys and token values (`-CheckOnly <folder>` runs only that check).
 
 ## 8. Phases and acceptance
 
-Every phase below is built and unit-tested on the development PC. None has been run in WinRE or against a real broken PC; that run is the acceptance step for each "done when".
+Every phase below is built and covered by the automated tests on the development PC. None has been run in WinRE or against a real broken PC; that run is the acceptance step for each "done when".
 
 | Phase | Scope | Done when | State |
 |---|---|---|---|
 | 1 | Discovery + log collection + report | On a stock WinRE boot, `run.cmd` finds the offline install, picks the correct disk without any hard-coded letter, produces a case folder where every section is `ok`/`missing`/`error` with reasons, and nothing on the target changed (verified by timestamps/hashes) | Built. Tested on a fake offline Windows and on the running Windows of the dev PC. Not run in WinRE |
 | 2 | Repair helpers | Source-mismatch check blocks the lt-LT/en-US case; each repair shows its command, asks, logs, and exports before changing BCD | Built. Source check proven on the lt-LT/en-US case; repairs run in dry-run only |
 | 3 | Assistant | Given the idea 1 case inputs, suggests the same next steps in the same order | Built. Idea 1 case fixture yields branches A to E in order |
-| 4 | Control server | Pair, read-only stream, bundle retrieval and revocation work over LAN; no inbound port on target | Built. Proven over 127.0.0.1 only, with and without TLS (real handshakes against a test CA); not yet between two machines on a LAN |
+| 4 | Control server | Pair, read-only stream, bundle retrieval and revocation work over LAN; no inbound port on target | Built. Proven over 127.0.0.1, with and without TLS, between real processes (real handshakes against a test CA); not between two machines on a LAN |
 | 5 | Plugins and extras | Third-party module loads through the command wrapper only, with a matching checksum | Built (loader, manifest, source check). No plugin shipped |
 | 6 | Registry diffing | A second scan lists what changed in the startup-relevant keys | Built |
 | 7 | Driver rollback | Recent third-party drivers listed; removal of one is a confirmed step | Built; removal in dry-run only |
 | 8 | Malware triage | Autoruns, services, tasks listed with neutral flags; nothing removed | Built |
 | 9 | Scheduled tasks | Target task inventory (part of 8); unattended scheduled scans from the server | Target side built; server side planned |
 | 10 | Fleet mode | Server tracks many agents and cases, history per machine | First cut: stored-cases view built from bundles; no persistent agent list |
-| 11 | GUI | Browser front end on the same API | First cut: one page served by the server; not yet seen in a browser |
+| 11 | GUI | Browser front end on the same API | First cut: one page served by the server. Driven in headless Edge by `tests/browser/smoke.mjs` (sign-in, pairing, scan, panels, bundle, revoke); nobody has used it by hand |
 | 12 | Plugin marketplace | Signed plugin index, install and update from the server | Planned |
 
 Deferred (not built): server-side scheduled scans (needs a decision on unattended sessions), plugin marketplace (needs a signature scheme; the standard library has no asymmetric signing), client certificates for agents (mutual TLS), custom WinPE image.
@@ -207,6 +212,4 @@ Answered:
 Open:
 1. What does a real WinRE boot show: does the bundled Python start, which tools exist (`wevtutil`, `manage-bde`, `robocopy`), does the console show the menu correctly?
 2. Client certificates (mutual TLS) for agents: wanted or not? Server certificates are settled: the control host is the CA and sticks carry its certificate.
-3. Should the project journal and decision records (`.project/`, currently git-ignored) be committed?
-4. Should the old test case and device entry on the USB (`cases\ITW-99999-...`, `devices\`) be kept?
-5. Should the commit that contained `.mcp.json` (a private network address and a local path) be removed from the public history?
+3. Should the old test case and device entry on the USB (`cases\ITW-99999-...`, `devices\`) be kept?

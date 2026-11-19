@@ -1,7 +1,7 @@
 # Browser smoke test for the control-server page
 
 Drives the real `recoverykit/web/index.html` page in headless Microsoft Edge through the Chrome DevTools Protocol
-(no npm packages). It is a manual check, not part of the unit-test suite (`python -m unittest`).
+(no npm packages). It is a check you run by hand, not part of the unit-test suite (`python -m unittest`). It is a script that clicks through the page; it does not replace a person using the page in a normal browser, which nobody has done yet.
 
 Run it from the RecoveryKit folder:
 
@@ -10,7 +10,7 @@ Run it from the RecoveryKit folder:
 Needs: Microsoft Edge (`msedge.exe` under Program Files), Node.js 22+ (global `WebSocket` and `fetch`), and Python
 with the repo's own modules. Nothing is installed and everything talks to 127.0.0.1 only.
 
-What it does: `serve_fixture.py` starts a plain-HTTP control server and one connected dry-run agent against a fake
+What it does: `serve_fixture.py` starts a plain-HTTP (`--no-tls`) control server and one connected dry-run agent against a fake
 offline Windows, all in temp dirs (the repo's `config/` and `cases/` are not touched). `smoke.mjs` then walks the page
 like a user (sign-in, pair, scan, report views, bundle, revoke, forget token), including a markup injection probe,
 and prints PASS/FAIL per step plus console messages, exceptions, failed requests, non-127.0.0.1 requests and CSP
