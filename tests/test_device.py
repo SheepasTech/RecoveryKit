@@ -161,6 +161,62 @@ class Store(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(ddir, "components.json.bad")))
             json.load(open(os.path.join(ddir, "components.json"), encoding="utf-8"))
 
+    def test_unit_value_is_kept_in_device_json_only(self):
+        uuid = HW["system"]["uuid"]
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            ctx = self.ctx(tmp)
+            did = device.collect(ctx)
+            ddir = os.path.join(tmp, "devices")
+            unit = {s["segment"]: s for s in ctx.case.data["device"]["segments"]}["UNIT"]
+            self.assertEqual((unit["detail"], unit["value"]), (device.HIDDEN, device.HIDDEN))
+            self.assertEqual(device.HIDDEN, "(kept in device.json)")
+            self.assertNotEqual(unit["code"], device.UNKNOWN)
+            self.assertTrue(any(device.HIDDEN in ln for ln in ctx.ui.lines))
+            self.assertFalse(any(uuid in ln for ln in ctx.ui.lines))
+            self.assertNotIn(uuid, json.dumps(ctx.case.data))
+            self.assertNotIn(uuid, json.dumps(ctx.case.data["sections"]["device"]))
+            with open(os.path.join(ddir, "index.md"), encoding="utf-8") as f:
+                self.assertNotIn(uuid, f.read())
+            # the report shows the code and the hidden text, not the UUID
+            from recoverykit.modules import report
+            text = report.render(ctx.case.data, [])
+            self.assertNotIn(uuid, text)
+            self.assertIn(unit["code"], text)
+            self.assertIn("kept in device.json", text)
+            # the raw value stays where it is needed
+            with open(os.path.join(ddir, did, "device.json"), encoding="utf-8") as f:
+                dev = json.load(f)
+            self.assertEqual(dev["hardware"]["system"]["uuid"], uuid)
+            self.assertNotIn(uuid, json.dumps(dev["segments"]))
+            with open(os.path.join(ddir, "components.json"), encoding="utf-8") as f:
+                reg = json.load(f)
+            self.assertEqual(reg["UNIT"][unit["code"]]["value"], uuid)
+            with open(ctx.case.path("inventory", "device.json"), encoding="utf-8") as f:
+                self.assertIn(uuid, f.read())
+            # --decode-id prints `detail or value`: the hidden text, and the raw value only under raw_value
+            by = {s["segment"]: s for s in device.decode(ddir, did)}
+            self.assertEqual(by["UNIT"]["detail"], device.HIDDEN)
+            self.assertEqual(by["UNIT"]["value"], device.HIDDEN)
+            self.assertEqual(by["UNIT"]["raw_value"], uuid)
+            self.assertNotIn("raw_value", by["CPU"])
+
+    def test_lone_surrogate_in_a_device_detail_is_written(self):
+        hw = json.loads(json.dumps(HW))
+        hw["cpu"]["name"] = "Intel\ud800 CPU"
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            t = target(tmp)
+            self.addCleanup(t.reg.close)
+            did, segs = device.build(hw, t)
+            ddir = os.path.join(tmp, "devices")
+            device.remember(ddir, did, segs, hw, {"time": "now", "case_id": "T-1", "environment": "winre", "run": "r"})
+            for name in ("components.json", os.path.join(did, "device.json")):
+                with open(os.path.join(ddir, name), encoding="utf-8") as f:
+                    self.assertIn("ud800", f.read(), name)
+            with open(os.path.join(ddir, "index.md"), encoding="utf-8") as f:     # the Markdown escaper replaces it
+                self.assertIn("Intel� CPU", f.read())
+            device._save(os.path.join(ddir, "x.json"), {"k": "a\udfffb"})
+            self.assertTrue(os.path.isfile(os.path.join(ddir, "x.json")))
+
 
 class Smbios(unittest.TestCase):
     def test_parse_synthetic_table(self):

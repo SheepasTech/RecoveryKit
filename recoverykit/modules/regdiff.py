@@ -33,8 +33,7 @@ def snapshot(reg):
     cs = reg.control_set()
     services = {}
     base = cs + "\\" + SVC
-    for name in reg.subkeys("SYSTEM", base):
-        vals = reg.values("SYSTEM", base + "\\" + name)
+    for name, vals in reg.children("SYSTEM", base):
         services[name] = {"start": _norm(vals.get("Start")), "type": _norm(vals.get("Type")),
                           "image_path": _norm(vals.get("ImagePath")),
                           "error_control": _norm(vals.get("ErrorControl"))}
@@ -185,6 +184,9 @@ def collect(ctx):
         for name, d in sorted(reg.dirty.items()):
             if d:
                 sec.item("hive " + name, "ok", "hive not cleanly flushed: values may be stale")
+        for name, msgs in sorted(getattr(reg, "notes", {}).items()):
+            for msg in msgs:
+                sec.item("hive " + name + " read limit", "ok", msg)
         ctx.case.write_json(SNAP_REL, snap)
         sec.data["counts"] = {k: len(v) for k, v in snap.items()}
         notes = notable(snap)

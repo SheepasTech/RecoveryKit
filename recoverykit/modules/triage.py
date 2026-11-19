@@ -104,6 +104,22 @@ def _inside(path, base):
         return False
 
 
+def _ci(vals, name):
+    """Value `name` from a values dict, case-insensitive (registry value names are)."""
+    low = name.lower()
+    for k, v in vals.items():
+        if k.lower() == low:
+            return v
+    return None
+
+
+def _read_limits(reg, hive, sec):
+    """Report a truncated registry enumeration as an item (status ok: what was read is valid)."""
+    for msg in getattr(reg, "notes", {}).get(hive, []):
+        if msg.startswith("more than "):
+            sec.item("hive %s read limit" % hive, "ok", msg)
+
+
 def _capped(entries):
     """(first MAX_FLAGGED flagged entries, count of the rest) for section data."""
     fl = [e for e in entries if e["flags"]]
@@ -258,10 +274,11 @@ def _autoruns(ctx, sec):
         add("Windows", "AppInit_DLLs", appinit, extra=(F_APPINIT,))
 
     ifeo = r"Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
-    for exe in reg.subkeys("SOFTWARE", ifeo):
-        dbg = _txt(reg.get("SOFTWARE", ifeo + "\\" + exe, "Debugger"))
+    for exe, vals in reg.children("SOFTWARE", ifeo):
+        dbg = _txt(_ci(vals, "Debugger"))
         if dbg:
             add("IFEO", exe, dbg, extra=(F_IFEO,))
+    _read_limits(reg, "SOFTWARE", sec)
 
     boot = reg.get("SYSTEM", cs + r"\Control\Session Manager", "BootExecute")
     for s in (boot if isinstance(boot, (list, tuple)) else [boot]):
@@ -359,8 +376,7 @@ def _services(ctx, sec):
     reg, root, windir = t.reg, t.root, t.windir
     base = reg.control_set() + r"\Services"
     out = []
-    for name in sorted(reg.subkeys("SYSTEM", base)):
-        v = reg.values("SYSTEM", base + "\\" + name)
+    for name, v in sorted(reg.children("SYSTEM", base), key=lambda c: c[0]):
         start = v.get("Start")
         if not isinstance(start, int) or start not in (0, 1, 2):
             continue
@@ -372,6 +388,7 @@ def _services(ctx, sec):
     why = getattr(reg, "errors", {}).get("SYSTEM")
     if why:
         sec.item("hive SYSTEM", "error", why + ADMIN_HINT)
+    _read_limits(reg, "SYSTEM", sec)
     ctx.case.write_json("inventory/services.json", out[:MAX_INVENTORY])
     flagged, more = _capped(out)
     sec.data = {"count": len(out), "flagged": flagged, "flagged_not_shown": more}

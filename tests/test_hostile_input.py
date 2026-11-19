@@ -4,6 +4,7 @@ Each test reproduces the trigger of a finding of .project/reviews/2026-11-19-sec
 B9, B11-B13 and the parent-junction / destination-traversal items) and asserts the parser or collector
 stays bounded and raises nothing unexpected.
 """
+import json
 import os
 import random
 import shutil
@@ -627,6 +628,368 @@ class WimHostile(TmpCase):
         self.assertEqual([i["index"] for i in info["images"]], [2])
         self.assertEqual(len(info["images"][0]["name"]), 200)
         self.assertTrue(any("INDEX" in e for e in info["errors"]))
+
+
+# ---------------------------------------------------------------- third review N1: lone surrogates in names
+class SurrogateNames(TmpCase):
+    BAD = "crash\ud800.dmp"
+    USER = "bob\udfff"
+
+    def make(self, *parts, data=b"MDMP"):
+        p = os.path.join(*parts)
+        try:
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "wb") as f:
+                f.write(data)
+        except (OSError, UnicodeError, ValueError) as e:
+            self.skipTest("this file system refuses a lone surrogate in a name: %s" % e)
+        return p
+
+    def assert_case_json(self, case, needle):
+        with open(case.path("case.json"), encoding="utf-8") as f:
+            raw = f.read()
+        self.assertIsInstance(json.loads(raw), dict)
+        self.assertIn(needle, raw)
+        self.assertFalse(os.path.exists(case.path("case.json.tmp")))
+
+    def test_unit_surrogates_in_data_item_json_text_and_log(self):
+        case = case_mod.Case(os.path.join(self.tmp, "out"))
+        self.addCleanup(case.close)
+        case.data["target"]["name"] = "a\ud800b"
+        with case.section("one", "One") as sec:
+            sec.item("minidump " + self.BAD, "ok", "copied \udfff")
+        p = case.write_json("inventory/x.json", {"n": [self.USER]})
+        t = case.write_text("logs/x.txt", "line \ud800\n")
+        case_mod.LOG.info("name %s", self.BAD)
+        self.assert_case_json(case, r"\ud800")
+        with open(p, encoding="utf-8") as f:
+            raw = f.read()
+        self.assertEqual(json.loads(raw), {"n": ["bob\udfff"]})
+        self.assertIn(r"\udfff", raw)
+        with open(t, encoding="utf-8") as f:
+            self.assertIn(r"\ud800", f.read())
+        with open(case.path("debug.log"), encoding="utf-8") as f:
+            self.assertIn(r"crash\ud800.dmp", f.read())
+
+    def test_section_survives_a_failing_save(self):
+        case = case_mod.Case(os.path.join(self.tmp, "out"))
+        self.addCleanup(case.close)
+        with mock.patch.object(case, "save", side_effect=UnicodeEncodeError("utf-8", "x", 0, 1, "boom")):
+            with case.section("a", "A") as sec:
+                sec.item("x", "ok")
+        self.assertEqual(case.data["sections"]["a"]["status"], "ok")
+        with case.section("b", "B"):
+            pass
+        self.assertIn("b", case.data["sections"])
+
+    def make_ctx(self, with_user=True):
+        win = fakewin.make_target(os.path.join(self.tmp, "target"))
+        root = os.path.join(self.tmp, "target") + "\\"
+        self.make(win, "Minidump", self.BAD)
+        self.make(root, "Users", self.USER, "NTUSER.DAT", data=b"not a hive")
+        case = case_mod.Case(os.path.join(self.tmp, "out"))
+        self.addCleanup(case.close)
+        reg = RegView(win, online=False)
+        self.addCleanup(reg.close)
+        t = Target(root=root, windir=win, online=False, letter="W", volume={}, disk=None, partition=None, reg=reg)
+        runner = mock.Mock()
+        runner.verified_tools = {}
+        cfg = {"limits": {"max_log_mb": 1, "max_dump_mb": 1, "max_minidumps": 10}, "logs": {}}
+        ctx = Ctx(self.tmp, cfg, {"admin": True}, case, SimpleNamespace(say=lambda *a, **k: None), runner, target=t)
+        return ctx, case
+
+    def test_minidump_and_profile_names_with_surrogates_do_not_end_the_scan(self):
+        ctx, case = self.make_ctx()
+        logs.collect(ctx)
+        triage.collect(ctx)
+        secs = case.data["sections"]
+        for name in ("logs_target", "event_logs", "bcd", "logs_host", "disk_health", "pending",
+                     "autoruns", "services", "tasks"):
+            self.assertIn(name, secs)
+        self.assertEqual(secs["logs_target"]["status"], "ok")
+        self.assertTrue(any(self.BAD in i["name"] for i in secs["logs_target"]["items"]))
+        self.assertTrue(any(self.USER in i["name"] for i in secs["autoruns"]["items"]))
+        self.assert_case_json(case, r"crash\ud800.dmp")
+        self.assert_case_json(case, r"bob\udfff")
+
+
+# ---------------------------------------------------------------- third review N2 + N4: hive lookups and budgets
+class HiveLookups(TmpCase):
+    def start_value(self, raw, n=2):
+        vk = raw.vk("Start", 0x80000004, n, vtype=4)
+        return raw.cell(struct.pack("<I", vk)), 1
+
+    def services_hive(self, count):
+        """SYSTEM hive whose Services list points `count` times at one nk named 'a/b' (the review's trigger)."""
+        raw = RawHive()
+        vl, nval = self.start_value(raw)
+        leaf = raw.nk("a/b", nval=nval, vallist=vl)
+        lst = raw.cell(b"lf" + struct.pack("<H", count) + struct.pack("<II", leaf, 0) * count)
+        services = raw.nk("Services", nsub=count, sublist=lst)
+        cs_list = raw.cell(b"lf" + struct.pack("<H", 1) + struct.pack("<II", services, 0))
+        cs = raw.nk("ControlSet001", nsub=1, sublist=cs_list)
+        root_list = raw.cell(b"lf" + struct.pack("<H", 1) + struct.pack("<II", cs, 0))
+        root = raw.nk("ROOT", nsub=1, sublist=root_list)
+        win = os.path.join(self.tmp, "Windows")
+        raw.write(os.path.join(win, "System32", "config", "SYSTEM"), root)
+        return win
+
+    def test_regdiff_snapshot_with_4000_services_pointing_at_one_key_is_fast(self):
+        from recoverykit.modules import regdiff
+        rv = RegView(self.services_hive(4000), online=False)
+        self.addCleanup(rv.close)
+        t0 = time.time()
+        snap = regdiff.snapshot(rv)
+        took = time.time() - t0
+        print("regdiff.snapshot, 4000 services -> one key: %.3f s" % took)
+        self.assertLess(took, 3.0)
+        self.assertEqual(snap["services"], {"a/b": {"start": 2, "type": None, "image_path": None,
+                                                    "error_control": None}})
+
+    def test_triage_services_with_4000_services_pointing_at_one_key_is_fast(self):
+        win = self.services_hive(4000)
+        reg = RegView(win, online=False)
+        self.addCleanup(reg.close)
+        case = case_mod.Case(os.path.join(self.tmp, "out"))
+        self.addCleanup(case.close)
+        ctx = SimpleNamespace(case=case, ui=SimpleNamespace(say=lambda *a: None),
+                              target=SimpleNamespace(root=self.tmp + "\\", windir=win, online=False, reg=reg))
+        t0 = time.time()
+        with case.section("services", "s") as sec:
+            out = triage._services(ctx, sec)
+        took = time.time() - t0
+        print("triage._services, 4000 services -> one key: %.3f s" % took)
+        self.assertLess(took, 3.0)
+        self.assertEqual(len(out), 4000)
+
+    def test_truncated_enumeration_is_noted_and_reported_as_item(self):
+        win = self.services_hive(5001)
+        reg = RegView(win, online=False)
+        self.addCleanup(reg.close)
+        kids = reg.children("SYSTEM", r"ControlSet001\Services", max_children=3)
+        self.assertEqual(len(kids), 3)
+        self.assertTrue(kids.truncated)
+        self.assertEqual(reg.children("SYSTEM", r"ControlSet001\Services", max_children=5001).truncated, False)
+        case = case_mod.Case(os.path.join(self.tmp, "out"))
+        self.addCleanup(case.close)
+        ctx = SimpleNamespace(case=case, ui=SimpleNamespace(say=lambda *a: None),
+                              target=SimpleNamespace(root=self.tmp + "\\", windir=win, online=False, reg=reg))
+        with case.section("services", "s") as sec:
+            out = triage._services(ctx, sec)
+        self.assertEqual(len(out), 5000)
+        msg = "more than 5000 entries: only the first 5000 were read"
+        self.assertIn(msg, reg.notes["SYSTEM"])
+        item = [i for i in sec.items if i["reason"] == msg]
+        self.assertTrue(item and item[0]["status"] == "ok", sec.items)
+
+    def test_key_named_with_a_slash_is_found_and_openable(self):
+        win = self.services_hive(1)
+        path = os.path.join(win, "System32", "config", "SYSTEM")
+        with regf.Hive(path) as h:
+            services = h.open(r"ControlSet001\Services")
+            self.assertEqual([k.name for k in services.children()], ["a/b"])
+            self.assertEqual(h.open("ControlSet001\\Services\\a/b").value("Start"), 2)
+            self.assertIsNone(h.open("ControlSet001/Services"))
+            names_values = services.child_values()
+            self.assertEqual(names_values, ([("a/b", {"Start": 2})], False))
+
+    def test_values_stops_at_16_mib_and_keeps_memory_low(self):
+        import tracemalloc
+        raw = RawHive()
+        cell = raw.cell(bytes(1 << 20))
+        vks = [raw.vk("v%03d" % i, 1 << 20, cell) for i in range(300)]
+        vl = raw.cell(b"".join(struct.pack("<I", o) for o in vks))
+        root = raw.nk("ROOT", nval=len(vks), vallist=vl)
+        path = os.path.join(self.tmp, "big.hive")
+        raw.write(path, root)
+        with regf.Hive(path) as h:
+            tracemalloc.start()
+            try:
+                vals = h.root().values()
+                peak = tracemalloc.get_traced_memory()[1]
+            finally:
+                tracemalloc.stop()
+            print("Key.values(), 300 vk -> one 1 MiB cell: peak %.1f MiB" % (peak / 2 ** 20))
+            self.assertLess(peak, 40 * 2 ** 20)
+            self.assertEqual(len(vals), 300)
+            full = [n for n, v in vals.items() if len(v) == 1 << 20]
+            self.assertEqual(len(full), 16)
+            self.assertTrue(all(v == b"" for n, v in vals.items() if n not in full))
+            self.assertTrue(any("more than" in n for n in h.notes), h.notes)
+            self.assertEqual(len(h.root().value("v299")), 1 << 20)     # a named lookup is not budgeted away
+
+
+# ---------------------------------------------------------------- third review N3: evtx per-file budget
+class EvtxFileBudget(TmpCase):
+    @staticmethod
+    def name_struct(name):
+        return struct.pack("<IHH", 0, 0, len(name)) + name.encode("utf-16-le") + b"\x00\x00"
+
+    def element(self, base, name, kids_fn):
+        """BinXml element (no attributes) built to sit at chunk offset `base`; names are inline."""
+        ns = self.name_struct(name)
+        head = b"\x01" + b"\x00\x00" + b"\x00\x00\x00\x00" + struct.pack("<I", base + 11) + ns
+        kids = kids_fn(base + len(head) + 1)
+        return head + b"\x02" + kids + b"\x04"
+
+    @staticmethod
+    def text(s):
+        return b"\x05\x01" + struct.pack("<H", len(s)) + s.encode("utf-16-le")
+
+    def event_definition(self, refs):
+        """Template body: <Event><System><Level>2</Level><Channel>{sub 0} x refs</Channel></System></Event>."""
+        ref = b"\x0d\x00\x00\x01"
+
+        def channel(base):
+            return self.element(base, "Channel", lambda b: ref * refs)
+
+        def system(base):
+            lvl = self.element(base, "Level", lambda b: self.text("2"))
+            return lvl + channel(base + len(lvl))
+
+        return self.element(0x100 + 24, "Event", lambda base: self.element(base, "System", system))
+
+    def chunk(self, records, definition=None, def_body=None):
+        buf = bytearray(0x10000)
+        buf[0:8] = evtx.CHUNK_MAGIC
+        body = def_body if def_body is not None else definition
+        struct.pack_into("<I", buf, 0x100 + 20, len(body))
+        buf[0x100 + 24:0x100 + 24 + len(body)] = body
+        off = 0x200
+        for rid, payload in records:
+            size = 24 + len(payload) + 4
+            buf[off:off + 4] = evtx.REC_MAGIC
+            struct.pack_into("<IQQ", buf, off + 4, size, rid, 132000000000000000)
+            buf[off + 24:off + 24 + len(payload)] = payload
+            struct.pack_into("<I", buf, off + size - 4, size)
+            off += size
+        struct.pack_into("<I", buf, 0x30, off)
+        return bytes(buf)
+
+    @staticmethod
+    def instance(sub):
+        """Template instance of the definition at 0x100 with one string substitution."""
+        return (b"\x0c" + b"\x00" * 5 + struct.pack("<I", 0x100) + struct.pack("<I", 1)
+                + struct.pack("<HBB", len(sub), 0x01, 0) + sub)
+
+    def write(self, chunks):
+        path = os.path.join(self.tmp, "t.evtx")
+        head = bytearray(0x1000)
+        head[0:8] = evtx.FILE_MAGIC
+        struct.pack_into("<H", head, 0x2A, len(chunks))
+        with open(path, "wb") as f:
+            f.write(bytes(head) + b"".join(chunks))
+        return path
+
+    def test_hand_built_event_parses(self):
+        chunk = self.chunk([(7, self.instance("Application".encode("utf-16-le")))], self.event_definition(1))
+        evs, st = evtx.read_events(self.write([chunk]), levels=(2,))
+        self.assertEqual(st["errors"], [])
+        self.assertEqual([e["channel"] for e in evs], ["Application"])
+
+    def test_huge_channel_text_is_bounded_in_memory(self):
+        import tracemalloc
+        big = ("A" * 30000).encode("utf-16-le")                # 60 KB value
+        chunk = self.chunk([(1, self.instance(big))], self.event_definition(800))     # 800 x 30000 = 24M chars
+        path = self.write([chunk])
+        tracemalloc.start()
+        try:
+            evs, st = evtx.read_events(path, levels=(2,))
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        print("evtx Channel expanding to 24M characters: peak %.1f MiB" % (peak / 2 ** 20))
+        self.assertLess(peak, 40 * 2 ** 20)
+        self.assertEqual(evs, [])
+        self.assertTrue(st["errors"])
+
+    def test_channel_provider_and_computer_are_clipped(self):
+        big = ("B" * 30000).encode("utf-16-le")
+        chunk = self.chunk([(1, self.instance(big))], self.event_definition(20))      # 600,000 characters
+        evs, st = evtx.read_events(self.write([chunk]), levels=(2,))
+        self.assertEqual(len(evs), 1)
+        self.assertEqual(len(evs[0]["channel"]), evtx.MAX_DATA_LEN)
+        self.assertLessEqual(len(evtx._text(evtx._El("x"))), evtx.MAX_TEXT)
+        el = evtx._El("x")
+        el.kids.append("z" * 200000)
+        self.assertEqual(len(evtx._text(el)), evtx.MAX_TEXT)
+
+    def expensive_chunk(self, records=300):
+        """Chunk of tiny records that all instantiate one definition that blows the per-record budget."""
+        body = b"\x0d\x00\x00\x21" * 8 + b"\x00"                # 8 references to substitution 0, a BinXml fragment
+        frag = b"\x05\x01" + struct.pack("<H", 1) + "a".encode("utf-16-le")
+        for _ in range(7):                                       # 8**7 resolutions without a budget
+            frag = (b"\x0c" + b"\x00" * 5 + struct.pack("<I", 0x100) + struct.pack("<I", 1)
+                    + struct.pack("<HBB", len(frag), 0x21, 0) + frag)
+        return self.chunk([(i + 1, frag) for i in range(records)], def_body=body)
+
+    def test_many_tiny_records_sharing_an_expensive_definition_finish_fast(self):
+        path = self.write([self.expensive_chunk() for _ in range(20)])
+        t0 = time.time()
+        evs, st = evtx.read_events(path)
+        took = time.time() - t0
+        print("evtx 20 chunks x 300 records on one expensive definition: %.2f s, seen %d, truncated %r"
+              % (took, st["records_seen"], st.get("truncated")))
+        self.assertLess(took, 5.0)
+        self.assertEqual(evs, [])
+        self.assertTrue(st["errors"])
+
+    def test_per_file_step_budget_stops_and_says_so(self):
+        path = self.write([self.expensive_chunk(50) for _ in range(6)])
+        with mock.patch.object(evtx, "MAX_FILE_STEPS", 150000):
+            evs, st = evtx.read_events(path)
+        self.assertIn("steps", st["truncated"])
+        self.assertLess(st["records_seen"], 300)
+
+    def test_per_file_time_budget_stops_and_says_so(self):
+        path = self.write([self.expensive_chunk(50) for _ in range(6)])
+        with mock.patch.object(evtx, "MAX_FILE_SECONDS", -1.0):
+            evs, st = evtx.read_events(path)
+        self.assertIn("time budget", st["truncated"])
+        self.assertEqual(evs, [])
+
+    def test_logs_item_says_stopped_early(self):
+        path = self.write([self.expensive_chunk(50) for _ in range(6)])
+        case = case_mod.Case(os.path.join(self.tmp, "out"))
+        self.addCleanup(case.close)
+        win = os.path.join(self.tmp, "Windows")
+        logdir = os.path.join(win, "System32", "winevt", "Logs")
+        os.makedirs(logdir)
+        shutil.copy(path, os.path.join(logdir, "System.evtx"))
+        runner = mock.Mock()
+        runner.run.return_value = SimpleNamespace(error="no wevtutil", rc=None, out="", ok=False)
+        t = Target(root=self.tmp + "\\", windir=win, online=False, letter="W", volume={}, disk=None, partition=None)
+        cfg = {"limits": {}, "logs": {"event_logs": ["System"]}}
+        ctx = Ctx(self.tmp, cfg, {"admin": True}, case, SimpleNamespace(say=lambda *a, **k: None), runner, target=t)
+        with mock.patch.object(evtx, "MAX_FILE_STEPS", 150000):
+            with case.section("event_logs", "e") as sec:
+                logs._event_logs(ctx, sec)
+        self.assertIn("stopped early: ", sec.items[0]["reason"])
+
+
+# ---------------------------------------------------------------- third review N14: oversized INF
+class DriversOversized(TmpCase):
+    def test_inf_over_the_cap_is_skipped_not_an_error(self):
+        win = os.path.join(self.tmp, "Windows")
+        inf = os.path.join(win, "INF")
+        os.makedirs(inf)
+        with open(os.path.join(inf, "oem1.inf"), "wb") as f:
+            f.write(b"; " + b"x" * (drivers.MAX_INF_BYTES + 10))
+        with open(os.path.join(inf, "oem2.inf"), "w") as f:
+            f.write("[Version]\nProvider=P\n")
+        case = case_mod.Case(os.path.join(self.tmp, "out"))
+        self.addCleanup(case.close)
+        t = Target(root=self.tmp + "\\", windir=win, online=False, letter="W", volume={}, disk=None, partition=None)
+        ctx = Ctx(self.tmp, {}, {}, case, SimpleNamespace(say=lambda *a, **k: None), mock.Mock(), target=t)
+        drivers.collect(ctx)
+        sec = case.data["sections"]["drivers"]
+        big = [i for i in sec["items"] if i["name"] == "oem1.inf"]
+        self.assertEqual([(i["status"], i["reason"]) for i in big], [("skipped", "larger than 2 MB")])
+        self.assertEqual(sec["status"], "ok")
+        self.assertEqual(sec["reason"], "")
+        listed = {d["inf"]: d for d in drivers.inventory(win)}
+        self.assertEqual(listed["oem1.inf"]["skipped"], "larger than 2 MB")
+        self.assertNotIn("error", listed["oem1.inf"])
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shutil
+import platform
 
 from ..core import winapi
 from ..core.context import LCID, RegView, Target
@@ -251,35 +252,74 @@ def _inside(p, root):
         return False
 
 
+_ADMIN_SHARE_RE = re.compile(r"^\\\\([^\\]+)\\([A-Za-z])\$(?:\\(.*))?$")
+
+
+def _unspell(p):
+    r"""`p` with the Windows spellings of a local path folded to X:\...: \?\X:\..., \.\X:\..., \?\UNC\server\share
+    (-> \server\share) and \localhost\X$\... / \127.0.0.1\X$\... / \<this computer>\X$\... (-> X:\...)."""
+    s = str(p)
+    low = s.lower()
+    if low.startswith("\\\\?\\unc\\"):
+        s = "\\\\" + s[8:]
+    elif low.startswith(("\\\\?\\", "\\\\.\\")) and re.match(r"[A-Za-z]:", s[4:6]):
+        s = s[4:]
+    m = _ADMIN_SHARE_RE.match(s)
+    if m:
+        own = {"localhost", "127.0.0.1", "::1", (os.environ.get("COMPUTERNAME") or "").lower()}
+        own.add(platform.node().lower())
+        if m.group(1).lower() in own - {""}:
+            s = "%s:\\%s" % (m.group(2).upper(), m.group(3) or "")
+    return s
+
+
+def _resolve(p):
+    return os.path.normcase(os.path.realpath(_unspell(os.path.abspath(_unspell(p)))))
+
+
+def _same(a, b):
+    try:
+        return os.path.samefile(a, b)
+    except (OSError, ValueError):
+        return False
+
+
 def check_output_location(ctx):
-    """Reason string when the case output (or the devices folder) is on the TARGET of an offline target (a
+    r"""Reason string when the case output (or the devices folder) is on the TARGET of an offline target (a
     scan would write to the target); None when it is fine or the target is the running Windows. Paths are
-    compared after realpath, so a junction or subst drive that leads to the target is caught; a target given
-    by --target-path counts as the folder itself, a target that is a whole volume as the whole volume."""
+    compared after realpath and after folding the other spellings (\?\, \?\UNC\, volume GUID,
+    \localhost\C$), so a junction, subst drive or share that leads to the target is caught; a target given
+    by --target-path counts as the folder itself (every parent of the output path is compared to it with
+    samefile), a target that is a whole volume as the whole volume."""
     t = ctx.target
     if t is None or t.online:
         return None
     out_root = os.path.abspath(ctx.case.out_root)
     paths = [out_root, os.path.abspath(ctx.options.get("devices_dir")
                                        or os.path.join(os.path.dirname(out_root), "devices"))]
-    troot = _real(t.root)
+    troot = _resolve(t.root)
+    whole_volume = bool(t.letter) or not t.info.get("explicit_path")
     for p in paths:
-        rp = _real(p)
+        rp = _resolve(p)
         drive = os.path.splitdrive(rp)[0]
         hit = _inside(rp, troot)
-        whole_volume = bool(t.letter) or not t.info.get("explicit_path")
+        cur = rp
+        while not hit:                      # a parent that is the target folder (mount point, other spelling)
+            hit = _same(cur, t.root)
+            parent = os.path.dirname(cur)
+            if parent == cur:
+                break
+            cur = parent
         if not hit and drive and whole_volume:
-            hit = bool(t.letter and drive[:1].upper() == t.letter.upper())
+            hit = bool(t.letter and drive[:1].upper() == t.letter.upper() and len(drive) == 2)
             if not hit:
-                try:
-                    hit = os.path.samefile(drive + "\\", t.root)
-                except OSError:
-                    pass
+                hit = _same(drive + "\\", t.root)
         if hit:
             return ("case output is on the target volume: scanning would write to the target (%s resolves to %s). "
-                    "Already written there before this check: the run folder %s (debug.log, case.json and the "
-                    "inventory files of the disks) and the write-test probe .rk-write-test in %s. Nothing further "
-                    "was run or collected." % (p, rp, ctx.case.dir, out_root))
+                    "Nothing further was written there. What already exists there from before this check: the "
+                    "run folder %s (debug.log and case.json as written before the check, and the inventory files "
+                    "of the disks) and the write-test probe .rk-write-test in %s. The reason is in that debug.log."
+                    % (p, rp, ctx.case.dir, out_root))
     return None
 
 

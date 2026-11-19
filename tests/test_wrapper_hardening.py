@@ -502,5 +502,99 @@ class Property(unittest.TestCase):
             self.assertIn(classify(argv)[0], NOT_RUNNABLE, argv)
 
 
+class ThirdReview(Tmp):
+    """Third review 2026-11-19: N11, N14 (runner part), N1 (runner part), S7, S10, smartctl whole tokens."""
+
+    def bad(self, *argvs, **kw):
+        for argv in argvs:
+            self.assertIn(classify(argv, **kw)[0], NOT_RUNNABLE, argv)
+
+    def test_n11_network_path_spellings(self):
+        from recoverykit.core.runner import is_network_path
+        for p in ("\\\\h\\s\\x", "//h/s/x", "\\/h\\s", "/\\h\\s", "  \\\\h\\s ", "\\\\?\\UNC\\h\\s\\x",
+                  "\\\\?\\unc\\h\\s"):
+            self.assertTrue(is_network_path(p), p)
+        for p in ("C:\\x", "x.evtx", "\\\\?\\C:\\x", "\\\\?\\Volume{1234}\\x", "\\\\.\\C:", "\\x\\y", ""):
+            self.assertFalse(is_network_path(p), p)
+        self.bad(["wevtutil", "qe", "\\/evil\\share\\x.evtx", "/lf:true"], ["wevtutil", "gl", "//h/s/x.evtx", "/lf:true"],
+                 ["wevtutil", "gli", "\\\\?\\UNC\\h\\s\\x.evtx", "/lf:true"],
+                 ["reg", "query", "\\/host\\HKLM\\Software"],
+                 ["dism", "/Get-WimInfo", "/WimFile:\\\\evil\\share\\x.wim"],
+                 ["dism", "/Get-ImageInfo", "/ImageFile://evil/share/x.wim", "/Index:1"],
+                 ["dism", "/Get-WimInfo", "/WimFile:\\/evil\\share\\x.wim"])
+        self.assertEqual(classify(["dism", "/Get-WimInfo", "/WimFile:D:\\sources\\install.wim"])[0], READ)
+        self.assertEqual(classify(["dism", "/Get-WimInfo", "/WimFile:\\\\?\\D:\\install.wim"])[0], READ)
+        self.assertEqual(classify(["wevtutil", "qe", "\\\\?\\D:\\x.evtx", "/lf:true"])[0], READ)
+
+    def test_s7_bcdedit_switches_are_exact(self):
+        d = self.tmp.name
+        store = os.path.join(d, "bcd.work")
+        self.bad(["bcdedit", "/store", store, "/store:W:\\Boot\\BCD", "/enum"],
+                 ["bcdedit", "/enum:x"], ["bcdedit", "/store", store, "/enum:all"],
+                 ["bcdedit", "/store", store, "/v=y", "/enum"], ["bcdedit", "/store", store, "/enum", "/v:1"],
+                 ["bcdedit", "/store:" + store, "/enum"], case_dir=d)
+        self.assertEqual(classify(["bcdedit", "/store", store, "/enum", "all", "/v"], case_dir=d)[0], READ)
+        self.assertEqual(classify(["bcdedit", "/STORE", store, "/ENUM"], case_dir=d)[0], READ)
+
+    def test_smartctl_whole_tokens(self):
+        self.bad(["smartctl", "-X:1", "/dev/pd0"], ["smartctl", "-l:scterc,70,70", "/dev/pd0"],
+                 ["smartctl", "-a:1", "/dev/pd0"], ["smartctl", "--json=c", "/dev/pd0"], ["smartctl", "-a=1", "/dev/pd0"],
+                 ["smartctl", "-x:", "/dev/pd0"], ["smartctl", "--scan=x"])
+        self.assertEqual(classify(["smartctl", "-x", "-j", "/dev/pd0"])[0], READ)
+
+    def test_s10_robocopy_destination_and_sources(self):
+        d = self.tmp.name
+        sysroot = os.environ.get("SystemRoot", "C:\\Windows")
+        drive = os.environ.get("SystemDrive", "C:")
+        bad = [["robocopy", "D:\\payload", sysroot + "\\System32", "/E"], ["robocopy", "D:\\payload", sysroot, "/E"],
+               ["robocopy", "D:\\payload", drive + "\\", "/E"], ["robocopy", "D:\\payload", drive, "/E"],
+               ["robocopy", "D:\\payload", "\\\\server\\share\\x", "/E"], ["robocopy", "\\\\server\\share", "D:\\x", "/E"],
+               ["robocopy", "//server/share", "D:\\x"], ["robocopy", "\\/server\\share", "D:\\x"],
+               ["robocopy", "@list.txt", "D:\\x"], ["robocopy", "D:\\x", "@list.txt"], ["robocopy", "-x", "D:\\x"]]
+        for var in ("ProgramFiles", "ProgramFiles(x86)", "ProgramData"):
+            if os.environ.get(var):
+                bad.append(["robocopy", "D:\\payload", os.path.join(os.environ[var], "Sub"), "/E"])
+                bad.append(["robocopy", "D:\\payload", os.environ[var].lower() + "\\.\\x\\..\\y", "/E"])
+        self.bad(*bad, case_dir=d)
+        self.assertEqual(classify(["robocopy", "W:\\Users", "E:\\b\\Users", "/E"], case_dir=d)[0], HOST)
+
+    def test_s10_drvload(self):
+        for argv in (["drvload"], ["drvload", "a.inf", "b.inf"], ["drvload", "x.txt"], ["drvload", "x"],
+                     ["drvload", "\\\\h\\s\\x.inf"], ["drvload", "//h/s/x.inf"], ["drvload", "@list.inf"],
+                     ["drvload", "*.inf"], ["drvload", "x?.inf"], ["drvload", "-x.inf"], ["drvload", "x.inf", "/offline"]):
+            self.assertEqual(classify(argv)[0], FORBIDDEN, argv)
+        for argv in (["drvload", "D:\\drivers\\net.inf"], ["drvload", "X.INF"]):
+            self.assertEqual(classify(argv)[0], HOST, argv)
+
+    def test_n14_not_a_command_line_is_refused_and_audited(self):
+        r = Runner(self.case, ScriptedUI(["yes"] * 4), ROOT, dry_run=True)
+        r.repairs_enabled = True
+        for bad in (None, 5, "ipconfig /all"):
+            with self.assertRaises(Refused):
+                r.run(bad, "bad")
+            with self.assertRaises(Refused):
+                r.run_diskpart(bad, "bad")
+            with self.assertRaises(Refused):
+                r.repair(RepairStep(id="x", title="t", effect="e", argv=bad))
+            with self.assertRaises(Refused):
+                r.repair(RepairStep(id="x", title="t", effect="e", argv=None, diskpart=bad))
+        a = self.audit()
+        self.assertEqual(len(a), 12)
+        self.assertTrue(all(x["kind"] == "refused" and "not a command line" in x["error"] for x in a))
+
+    def test_n1_lone_surrogate_in_argument_and_output(self):
+        r = Runner(self.case, ScriptedUI([]), ROOT, dry_run=True)
+        r._exec = lambda argv, timeout, **kw: Result(list(argv), rc=0, out="file crash\ud800.dmp ok")
+        res = r.run(["wevtutil", "qe", "crash\ud800.evtx", "/lf:true"], "t")
+        self.assertEqual(res.rc, 0)
+        with self.assertRaises(Refused):
+            r.run(["ipconfig", "/all", "\ud800x\x01"], "t")
+        with open(self.case.path("audit.log"), encoding="utf-8") as f:
+            text = f.read()
+        self.assertIn("\\ud800", text)
+        with open(self.case.path("audit", "0001-wevtutil.txt"), encoding="utf-8") as f:
+            self.assertIn("crash\\ud800.dmp", f.read())
+
+
 if __name__ == "__main__":
     unittest.main()

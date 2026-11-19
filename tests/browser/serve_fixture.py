@@ -1,7 +1,8 @@
 """Starts a control server (plain HTTP, 127.0.0.1) plus one connected dry-run agent for the browser smoke test.
 
 Usage: python tests/browser/serve_fixture.py [port]
-Prints one JSON line {"url", "operator_token", "agent_id", "pairing_code"}, then waits until stdin closes.
+Prints one JSON line {"url", "operator_token", "agent_id", "pairing_code"} (the code as the agent shows it,
+XXXXX-XXXXX), then waits until stdin closes.
 Everything lives in a temp dir; the repo's config/ and cases/ are not touched.
 """
 import json

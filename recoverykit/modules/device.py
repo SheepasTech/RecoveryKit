@@ -37,6 +37,7 @@ SEGMENTS = [
     ("UNIT", "This unit (system UUID or board serial)"),
 ]
 UNKNOWN = "XXXX"
+HIDDEN = "(kept in device.json)"     # shown instead of the UUID/serial of the UNIT segment
 LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 SKIP_PROFILES = {"public", "default", "default user", "all users", "defaultuser0", "defaultapppool"}
 DEFAULT_SETTINGS = {"notes": "", "ticket": "", "target": "", "answers": {}}
@@ -47,7 +48,7 @@ def code(segment, value):
     value = " ".join(str(value or "").split())
     if not value:
         return UNKNOWN
-    n = int.from_bytes(hashlib.sha256(("%s|%s" % (segment, value.lower())).encode("utf-8")).digest()[:8], "big")
+    n = int.from_bytes(hashlib.sha256(("%s|%s" % (segment, value.lower())).encode("utf-8", "backslashreplace")).digest()[:8], "big")
     out = ""
     for _ in range(4):
         n, r = divmod(n, 26)
@@ -128,6 +129,18 @@ def build(hw, target):
     return "-".join(s["code"] for s in segs), segs
 
 
+def public_segments(segs):
+    """The segments as shown on the console, in report.md, case.json and the API: the UNIT value (UUID or serial)
+    is replaced by HIDDEN (the code is still there). The raw value stays in components.json,
+    inventory/device.json and the hardware block of devices/<ID>/device.json."""
+    out = []
+    for s in segs:
+        if isinstance(s, dict) and s.get("segment") == "UNIT" and s.get("code") != UNKNOWN:
+            s = dict(s, value=HIDDEN, detail=HIDDEN)
+        out.append(s)
+    return out
+
+
 def decode(devices_dir, device_id):
     """Look every code of an ID up in components.json. Unknown codes come back with value None."""
     reg = _load(os.path.join(devices_dir, "components.json"), {})
@@ -137,8 +150,12 @@ def decode(devices_dir, device_id):
         slot = reg.get(seg)
         e = slot.get(c) if isinstance(slot, dict) else None
         e = e if isinstance(e, dict) else {}
-        out.append({"segment": seg, "label": label, "code": c, "value": e.get("value"),
-                    "detail": e.get("detail")})
+        value, detail = e.get("value"), e.get("detail")
+        if seg == "UNIT" and value is not None:       # the raw value only under raw_value
+            out.append({"segment": seg, "label": label, "code": c, "value": HIDDEN, "detail": HIDDEN,
+                        "raw_value": value})
+            continue
+        out.append({"segment": seg, "label": label, "code": c, "value": value, "detail": detail})
     return out
 
 
@@ -169,7 +186,7 @@ def _load(path, default, expect=dict, problems=None):
 def _save(path, obj):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
+    with open(tmp, "w", encoding="utf-8", errors="backslashreplace") as f:
         json.dump(obj, f, indent=2, ensure_ascii=False, default=str)
     os.replace(tmp, path)
 
@@ -207,7 +224,7 @@ def remember(ddir, device_id, segs, hw, run):
     dpath = os.path.join(ddir, device_id, "device.json")
     dev = _load(dpath, {}, problems=notes)
     dev.setdefault("first_seen", today)
-    dev.update(id=device_id, last_seen=today, segments=segs, hardware=hw)
+    dev.update(id=device_id, last_seen=today, segments=public_segments(segs), hardware=hw)
     runs = dev.get("runs")
     if not isinstance(runs, list):
         runs = dev["runs"] = []
@@ -241,7 +258,7 @@ def _write_index(ddir):
         d = {s["segment"]: _text(s.get("detail"), 120) or "-" for s in segs if isinstance(s, dict) and "segment" in s}
         runs = dev.get("runs")
         rows.append("| %s | %s | %s | %s | %s | %s | %s | %s | %s | %d |" % (
-            _code(dev.get("id") or name, 80) or "-", d.get("CPU", "-"), d.get("RAM", "-"), d.get("RSPD", "-"),
+            _code(dev.get("id") or name, 80, table=True) or "-", d.get("CPU", "-"), d.get("RAM", "-"), d.get("RSPD", "-"),
             d.get("MOBO", "-"), d.get("GPU", "-"), d.get("USER", "-"), d.get("DISK", "-"),
             _text(dev.get("last_seen"), 40) or "-", len(runs) if isinstance(runs, list) else 0))
     text = ["# Devices seen by this kit", "",
@@ -251,7 +268,7 @@ def _write_index(ddir):
             "| Device ID | CPU | RAM | RAM speed | Mainboard | Graphics | User | Target disk | Last seen | Runs |",
             "|---|---|---|---|---|---|---|---|---|---|"] + [r.replace("\n", " ") for r in rows]
     try:
-        with open(os.path.join(ddir, "index.md"), "w", encoding="utf-8") as f:
+        with open(os.path.join(ddir, "index.md"), "w", encoding="utf-8", errors="backslashreplace") as f:
             f.write("\n".join(text) + "\n")
     except OSError as e:
         LOG.error("DEVICE| index.md not written: %s", e)
@@ -263,8 +280,9 @@ def collect(ctx):
         hw = hwinfo.collect()
         device_id, segs = build(hw, ctx.target)
         ctx.case.write_json("inventory/device.json", {"id": device_id, "segments": segs, "hardware": hw})
-        sec.data = {"id": device_id, "segments": segs}
-        ctx.case.data["device"] = {"id": device_id, "segments": segs}
+        shown = public_segments(segs)
+        sec.data = {"id": device_id, "segments": shown}
+        ctx.case.data["device"] = {"id": device_id, "segments": shown}
         for e in hw.get("errors") or []:
             sec.item("hardware", "error", e)
         for s in segs:
@@ -273,7 +291,7 @@ def collect(ctx):
                     s["label"], " (no target chosen)" if s["segment"] in ("USER", "DISK") and ctx.target is None else ""))
         ui = ctx.ui
         ui.say("Device ID: %s" % device_id)
-        for s in segs:
+        for s in shown:
             ui.say("  %-4s %s  %s" % (s["segment"], s["code"], s["detail"] or "(not readable)"))
         if ctx.target is not None and ctx.env.get("kind") == "windows" and not ctx.target.online:
             sec.reason = ("the hardware codes describe the PC the kit is running on; the target is a disk attached "

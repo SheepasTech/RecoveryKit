@@ -2,6 +2,30 @@
 
 Newest first. "Verified" says how a change was checked; anything not listed there was not checked.
 
+## 0.5.1 - 2026-11-19
+
+Security and robustness (third independent review)
+- A file or folder name on the target that is not valid Unicode no longer ends a scan: every file that receives target strings is written with escapes, and a failing save cannot leave a section.
+- Hive reading is linear in the size of the hive: children of a key are walked once instead of being re-opened by name (a crafted hive took over a minute, now 0.02 s); a key name may contain `/`; values have a byte budget per call.
+- The event-log reader has a budget per file (steps and 60 s) and per value, and says when it stopped early.
+- Pairing code is 10 characters from an unambiguous alphabet, shown as `XXXXX-XXXXX`; 20 invalid signatures for an agent revoke its session; signatures carry a direction label.
+- Control server: the operator token is checked before a request body is read; at most 8 connections per client address with reserved slots for the local machine; the upload deadline grows with the size of the result; a failed upload is reported to the operator at once.
+- Certificate script: creating the CA is atomic (six parallel first runs give one CA); files are written to a temporary name and renamed; key files get an access list of the current user only, also when an existing key file is replaced; certificates are valid from a day before issue; a server key that does not match its certificate is re-issued.
+- Installer: `config` is copied by allowlist; the final check looks into files for key material and token values.
+- Report: `%` is escaped, invisible format characters are dropped, a pipe in a command stays a pipe, a code value cannot be read as a Dataview or Templater expression. The unit identifier (system UUID or serial) is no longer printed in the report, the device table or on the console; it stays in `device.json`.
+- Wrapper: one rule for network paths in every spelling; exact switch tokens for `bcdedit` and `smartctl`; copy-out cannot target the running system's folders or a network share.
+- A scan that stops because the output folder is on the target writes nothing further there, also when the folder is given as a `\\?\` or `\\localhost\C$` path.
+
+Fixed
+- Found in a live run, not by the tests: the server could not start with TLS from the project folder, because replacing an existing key file kept that file's extra access entries. A regression test covers it.
+- Two assistant rules told the operator to run commands the kit itself refuses as unsafe (`bcdedit` on the EFI partition's store, `chkdsk /scan` described as read-only).
+
+Verified
+- The page of the control server in headless Edge, driven through the DevTools protocol: pairing, relayed scan, every panel, an injection probe through real data, light and dark, wide and narrow.
+- Real two-process sessions over TLS with a temporary CA.
+- The reviewer's own fuzzing: 25,600 mutated hives and 6,040 mutated event logs produced only the intended error types; 535 million command lines enumerated, nothing in the read-only class writes or executes.
+- Not verified: two machines on a LAN, anything in WinRE, an administrator session, a real repair.
+
 ## 0.5.0 - 2026-11-19
 
 Added

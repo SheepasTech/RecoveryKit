@@ -111,6 +111,24 @@ _ROBO_VALUE = {"/copy": {"DAT", "DT", "D"}, "/dcopy": {"DAT", "DA", "T", "D"}}
 _ROBO_NUM = {"/r", "/w"}
 
 
+def is_network_path(p):
+    r"""True if `p` names a network location: after stripping white space and quotes, a path that starts with
+    two backslashes once "/" is read as "\" (so `//host/share` and `\/host\share` count, as Windows reads them),
+    and `\\?\UNC\...`. The local prefixes `\\?\X:\`, `\\?\Volume{` and `\\.\` are not network paths."""
+    s = str(p).strip().strip("\"'").strip().replace("/", "\\")
+    if not s.startswith("\\\\"):
+        return False
+    low = s.lower()
+    if low.startswith(("\\\\?\\unc\\", "\\\\.\\unc\\")):
+        return True
+    if low.startswith("\\\\.\\"):
+        return False
+    if low.startswith("\\\\?\\"):
+        rest = low[4:]
+        return not (re.match(r"[a-z]:(\\|$)", rest) or rest.startswith("volume{"))
+    return True
+
+
 def _inside(path, folder):
     """True if absolute, normalised `path` is inside `folder` (never raises)."""
     try:
@@ -134,10 +152,43 @@ def _same_or_inside(a, b):
         return False
 
 
+def _protected_destination(raw, dst):
+    """Reason when `dst` is the system drive root or inside the running system's protected trees, else None."""
+    prot = []
+    for var in ("SystemRoot", "windir", "ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "ProgramData"):
+        v = os.environ.get(var)
+        if v:
+            prot.append(v)
+    drive = os.environ.get("SystemDrive") or os.path.splitdrive(os.environ.get("SystemRoot", ""))[0]
+    if drive and raw.strip().upper() == drive.upper():      # "C:" alone is the current folder of drive C
+        return "robocopy destination is the system drive"
+    cands = {dst}
+    try:
+        cands.add(os.path.normcase(os.path.realpath(raw)))
+    except (OSError, ValueError):
+        pass
+    for c in cands:
+        if drive and c == _norm(drive + "\\"):
+            return "robocopy destination is the root of the system drive"
+        for v in prot:
+            for pv in {_norm(v), os.path.normcase(os.path.realpath(v))}:
+                if _same_or_inside(c, pv):
+                    return "robocopy destination is inside a protected folder of the running system (%s)" % v
+    return None
+
+
 def _robocopy(args, case_dir=None):
     if len(args) < 2 or args[0].startswith("/") or args[1].startswith("/"):
         return FORBIDDEN, "robocopy needs a source and a destination first"
+    for a in args[:2]:
+        if a.startswith(("@", "-")):
+            return FORBIDDEN, "robocopy source and destination must not start with @ or -"
+        if is_network_path(a):
+            return FORBIDDEN, "robocopy does not copy from or to a network path; use Explorer for a share"
     src, dst = _norm(args[0]), _norm(args[1])
+    why = _protected_destination(args[1], dst)
+    if why:
+        return FORBIDDEN, why
     if _same_or_inside(dst, src) or _same_or_inside(src, dst):
         return FORBIDDEN, "robocopy destination and source must be separate folders (not equal, not nested)"
     prev = None
@@ -259,6 +310,8 @@ def _classify(argv, case_dir=None):
 
     if exe == "dism":
         if "/get-wiminfo" in fl or "/get-imageinfo" in fl:
+            if any(is_network_path(v) for n in ("/wimfile", "/imagefile") for v in _switch_values(args, n)):
+                return FORBIDDEN, "dism does not read an image on a network path"
             return (READ, "") if set(fl) <= {"/get-wiminfo", "/get-imageinfo", "/wimfile", "/imagefile", "/index", "/english"} \
                 else (UNKNOWN, "unexpected dism arguments")
         if "/online" in fl:
@@ -295,6 +348,9 @@ def _classify(argv, case_dir=None):
             store = args[idx[0] + 1]
             del rest[idx[0]:idx[0] + 2]
         store_ok = store is None or bool(case_dir and _inside(store, case_dir))
+        if ("/export" in fl or set(fl) <= {"/enum", "/v", "/store"}) and \
+                not all(x in ("/enum", "/v", "/store", "/export") for x in low if x.startswith("/")):
+            return FORBIDDEN, "bcdedit read switches must be exactly /enum, /v, /store or /export (no :value)"
         if "/export" in fl:
             idx = [i for i, x in enumerate(low) if x == "/export"]
             if len(idx) != 1 or not set(fl) <= {"/export", "/store"}:
@@ -324,7 +380,7 @@ def _classify(argv, case_dir=None):
 
     if exe == "reg":
         if low and low[0] == "query":
-            if len(args) < 2 or not _REG_KEY_RE.fullmatch(args[1]):
+            if len(args) < 2 or is_network_path(args[1]) or not _REG_KEY_RE.fullmatch(args[1]):
                 return FORBIDDEN, "reg query needs a local HKLM/HKCU/... key (no remote host paths)"
             if not all(x.lower() in _REG_SWITCHES for x in args[2:] if x.startswith(("/", "-"))):
                 return FORBIDDEN, "reg query switch is not on the allowlist"
@@ -362,7 +418,7 @@ def _classify(argv, case_dir=None):
             else:
                 okn = set()
             want = 1 if low[0] in ("qe", "query-events", "gl", "get-log", "gli", "get-loginfo") else 0
-            if len(pos) != want or (pos and pos[0].startswith(("\\\\", "//"))):
+            if len(pos) != want or (pos and is_network_path(pos[0])):
                 return FORBIDDEN, "wevtutil needs one local log name or file (no remote host paths)"
             for x in sw:
                 n, sep, _v = x.lower().partition(":")
@@ -389,6 +445,9 @@ def _classify(argv, case_dir=None):
         if not set(sfl) <= _SMART_OK or any(a.startswith("-") and a not in _SMART_OK and a.lower() in _SMART_OK
                                             for a in args):
             return FORBIDDEN, "smartctl is limited to reading"
+        for a in args:       # whole tokens: '-X:1' or '-l:scterc,70,70' are not the switches they start with
+            if (a.startswith("-") or (a.startswith("/") and not a.lower().startswith("/dev/"))) and a not in _SMART_OK:
+                return FORBIDDEN, "smartctl switch %r is not on the allowlist" % a
         for i, a in enumerate(args):
             nxt = args[i + 1] if i + 1 < len(args) else ""
             prev = args[i - 1].lower() if i else ""
@@ -415,6 +474,9 @@ def _classify(argv, case_dir=None):
     if exe == "drvload":
         if any(a.startswith("/") for a in args):
             return FORBIDDEN, "drvload switches (such as /offline) are not offered"
+        if len(args) != 1 or not args[0].lower().endswith(".inf") or is_network_path(args[0]) \
+                or any(c in args[0] for c in "@*?") or args[0].startswith("-"):
+            return FORBIDDEN, "drvload takes exactly one local .inf file (no wildcard, no @file, no network path)"
         return HOST, ""
     return UNKNOWN, "%s is not on the allowlist" % exe
 
@@ -520,7 +582,7 @@ class Runner:
         if out:
             outfile = "audit/%04d-%s.txt" % (res.seq, _base(argv[0]) if argv else "none")
             try:
-                with open(self.case.path(*outfile.split("/")), "w", encoding="utf-8", errors="replace") as f:
+                with open(self.case.path(*outfile.split("/")), "w", encoding="utf-8", errors="backslashreplace") as f:
                     f.write(out)
             except OSError as e:
                 outfile = "(could not write output: %s)" % e
@@ -529,7 +591,7 @@ class Runner:
                  "seconds": round(res.seconds, 2), "timed_out": res.timed_out, "error": res.error,
                  "note": note, "output_file": outfile}
         try:
-            with open(self.case.path("audit.log"), "a", encoding="utf-8") as f:
+            with open(self.case.path("audit.log"), "a", encoding="utf-8", errors="backslashreplace") as f:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
         except OSError as e:
             LOG.error("AUDIT | cannot write audit.log: %s", e)
@@ -544,6 +606,8 @@ class Runner:
             return self._seq
 
     def _refuse(self, argv, kind, reason, purpose, secrets=()):
+        if not isinstance(argv, (list, tuple)):
+            argv = ["<%s>" % type(argv).__name__]
         res = Result(list(argv), error="refused: " + reason, seq=self._next(), kind="refused")
         self._audit(res, purpose, note=kind, secrets=secrets)
         raise Refused(reason)
@@ -624,6 +688,8 @@ class Runner:
         retry_rc: exit codes treated as transient and retried once (e.g. DISM error 32).
         A missing tool is not an exception: the Result has rc None and .error set.
         """
+        if not isinstance(argv, (list, tuple)):
+            self._refuse(argv, FORBIDDEN, "not a command line", purpose, secrets=secrets)
         kind, reason = classify(argv, case_dir=self.case.dir)
         if kind != READ:
             self._refuse(argv, kind, reason or "not a read-only command; use a repair step", purpose, secrets=secrets)
@@ -660,6 +726,8 @@ class Runner:
 
     def run_diskpart(self, lines, purpose, timeout=120):
         """Run a read-only diskpart script (list/select/detail only)."""
+        if not isinstance(lines, (list, tuple)):
+            self._refuse(lines, FORBIDDEN, "not a command line", purpose)
         kind, reason = classify_diskpart(lines)
         argv = _dp_argv(lines)
         if kind != READ:
@@ -692,6 +760,11 @@ class Runner:
         export, or the target re-check fails.
         """
         lines = None
+        sec = getattr(step, "secrets", ())
+        purpose = "repair step %s: %s" % (getattr(step, "id", "?"), getattr(step, "title", "?"))
+        body = step.diskpart if step.diskpart is not None else step.argv
+        if not isinstance(body, (list, tuple)):
+            self._refuse(body, FORBIDDEN, "not a command line", purpose, sec)
         if step.diskpart is not None:
             argv = _dp_argv(step.diskpart)
             kind, reason = classify_diskpart(step.diskpart)
@@ -701,8 +774,6 @@ class Runner:
         else:
             argv = list(step.argv)
             kind, reason = classify(argv, case_dir=self.case.dir)
-        sec = step.secrets
-        purpose = "repair step %s: %s" % (step.id, step.title)
         if kind in (FORBIDDEN, UNKNOWN):
             self._refuse(argv, kind, reason, purpose, sec)
         if kind == READ:

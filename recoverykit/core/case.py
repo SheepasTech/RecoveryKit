@@ -142,19 +142,22 @@ class Case:
         finally:
             self.data["sections"][name] = sec.as_dict()
             LOG.info("SECTION| end %s: %s %s", name, sec.status, sec.reason)
-            self.save()
+            try:
+                self.save()
+            except Exception:  # noqa: BLE001 - one unwritable value must never end the scan
+                LOG.error("SECTION| case.json could not be saved after %s\n%s", name, traceback.format_exc())
 
     def write_json(self, rel, obj):
         p = self.path(*rel.split("/"))
         os.makedirs(os.path.dirname(p), exist_ok=True)
-        with open(p, "w", encoding="utf-8") as f:
+        with open(p, "w", encoding="utf-8", errors="backslashreplace") as f:
             json.dump(obj, f, indent=2, ensure_ascii=False, default=str)
         return p
 
     def write_text(self, rel, text):
         p = self.path(*rel.split("/"))
         os.makedirs(os.path.dirname(p), exist_ok=True)
-        with open(p, "w", encoding="utf-8", errors="replace") as f:
+        with open(p, "w", encoding="utf-8", errors="backslashreplace") as f:
             f.write(text)
         return p
 
@@ -236,7 +239,7 @@ class Case:
 
     def save(self):
         tmp = self.path("case.json.tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
+        with open(tmp, "w", encoding="utf-8", errors="backslashreplace") as f:
             json.dump(self.data, f, indent=2, ensure_ascii=False, default=str)
         # On Windows the replace fails while another program (a status poll, an antivirus scan, an editor)
         # has case.json open. That must never end a scan: retry briefly, then keep the .tmp and say so.

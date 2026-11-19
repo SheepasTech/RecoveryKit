@@ -37,7 +37,7 @@ def _mb(n):
 def _audit(case_dir):
     out = []
     try:
-        with open(os.path.join(case_dir, "audit.log"), encoding="utf-8") as f:
+        with open(os.path.join(case_dir, "audit.log"), encoding="utf-8", errors="replace") as f:
             for line in f:
                 try:
                     e = json.loads(line)
@@ -79,7 +79,7 @@ def render(data, audit):
         d, p, v = tgt.get("disk") or {}, tgt.get("partition") or {}, tgt.get("volume") or {}
         add("| Item | Value |")
         add("|---|---|")
-        add("| Target | %s%s |" % (C(tgt.get("root")) or "?", " (the RUNNING Windows, not an offline install)" if tgt.get("online") else " (offline install)"))
+        add("| Target | %s%s |" % (C(tgt.get("root"), table=True) or "?", " (the RUNNING Windows, not an offline install)" if tgt.get("online") else " (offline install)"))
         add("| Disk | Disk %s, %s, %s, %s, %s |" % (T(d.get("number", "?"), 20), T(d.get("model")) or "model unknown", _gb(d.get("size")), T(d.get("bus"), 40) or "?", T(d.get("style"), 40) or "?"))
         add("| Partition | %s, %s (%s) |" % (T(p.get("number", "?"), 20), _gb(p.get("size")), T(p.get("type"), 60) or "?"))
         add("| File system | %s, %s free of %s |" % (T(v.get("fs"), 40) or "?", _gb(v.get("free")), _gb(v.get("size"))))
@@ -139,7 +139,7 @@ def render(data, audit):
             if a.get("timed_out"):
                 note = "TIMED OUT. " + note
             add("| %s | %s | %s | %s | %s |" % (
-                T(a.get("seq"), 20), T(a.get("kind"), 40), C(a.get("command", ""), 110) or "-",
+                T(a.get("seq"), 20), T(a.get("kind"), 40), C(a.get("command", ""), 110, table=True) or "-",
                 T(a.get("exit_code"), 20) if a.get("exit_code") is not None else "-", note))
         add("")
     for r in data.get("repair_log") or []:
@@ -221,7 +221,7 @@ def render(data, audit):
         add("%d. **%s** %s" % (n, T(s.get("title"), 150), T(s.get("text"), 1200)))
         ev = s.get("evidence") or {}
         if ev:
-            add("   - Because: %s" % "; ".join("%s = %s" % (T(k, 60), T(v, 200)) for k, v in ev.items()))
+            add("   - Because: %s" % "; ".join("%s = %s" % (T(k, 60), "absent" if v is None else T(v, 200)) for k, v in ev.items()))
     wc = assist.get("what_changed") or []
     if wc:
         add("")

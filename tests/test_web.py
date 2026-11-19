@@ -61,6 +61,15 @@ class PageStatic(unittest.TestCase):
             m = re.search(r'\bid="([^"]+)"', tag)
             self.assertRegex(text, r'<label[^>]*\bfor="%s"' % re.escape(m.group(1)))
 
+    def test_pairing_input_takes_the_dashed_code_and_is_not_autocompleted(self):
+        script = re.search(r"<script>(.*)</script>", read_page().decode("ascii"), re.S).group(1)
+        start = script.index("function addPairing")
+        block = script[start:script.index("function updateAgentRow")]
+        self.assertIn("maxLength = 11", block)                 # XXXXX-XXXXX
+        self.assertIn('autocomplete = "off"', block)
+        self.assertRegex(block, r'setAttribute\(\s*"autocapitalize"\s*,\s*"characters"\s*\)')
+        self.assertIn("spellcheck = false", block)
+
     def test_status_line_is_live_region(self):
         self.assertRegex(read_page().decode("ascii"), r'<div id="statusline"[^>]*aria-live="polite"')
 

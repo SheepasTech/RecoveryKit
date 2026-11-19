@@ -24,12 +24,16 @@ MENU_COUNT = 15
 
 
 # ---------------------------------------------------------------- parsing
+class _TooLarge(ValueError):
+    pass
+
+
 def _read_text(path):
     """Decode an INF: UTF-16 when it has a BOM, else UTF-8, else Latin-1. Raises OSError/ValueError."""
     with open(path, "rb") as f:
         raw = f.read(MAX_INF_BYTES + 1)
     if len(raw) > MAX_INF_BYTES:
-        raise ValueError("file is larger than %d MB" % (MAX_INF_BYTES // 2 ** 20))
+        raise _TooLarge("file is larger than %d MB" % (MAX_INF_BYTES // 2 ** 20))
     if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
         return raw.decode("utf-16")
     if raw.startswith(b"\xef\xbb\xbf"):
@@ -155,6 +159,8 @@ def inventory(windir):
             info = _parse_inf(_read_text(path))
             e.update(info)
             e["boot_critical"] = (info["class"] or "").lower() in BOOT_CRITICAL
+        except _TooLarge:
+            e["skipped"] = "larger than %d MB" % (MAX_INF_BYTES // 2 ** 20)
         except (OSError, ValueError, OverflowError, MemoryError, RecursionError) as ex:
             e["error"] = ("%s: %s" % (type(ex).__name__, getattr(ex, "strerror", None) or ex))[:MAX_STR]
         out.append(e)
@@ -207,6 +213,8 @@ def collect(ctx):
         for d in drivers:
             if d.get("error"):
                 sec.item(d["inf"], "error", d["error"])
+            elif d.get("skipped"):
+                sec.item(d["inf"], "skipped", d["skipped"])
         if recent:
             ctx.ui.say("Drivers installed in the %d days before the install's last activity:" % RECENT_DAYS)
             for d in recent:

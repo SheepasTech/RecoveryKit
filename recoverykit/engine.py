@@ -20,7 +20,7 @@ from .core import env as envmod
 from .core.case import Case
 from .core.context import Ctx
 from .core.log import LOG
-from .core.runner import Refused, Runner
+from .core.runner import Refused, Runner, is_network_path
 
 API = "/api/v1"
 
@@ -124,8 +124,7 @@ class Engine:
             abort = ctx.options.get("abort_scan")
             if abort:
                 ui.say("Scan stopped: %s. Choose another output location with --out." % abort)
-                self.scanned = False
-                self.report()
+                self.scanned = False        # no report: report.md and case.json would land on the target volume
                 return self.sections()
             ui.say("Target:%s" % (discovery.describe(ctx.target) if ctx.target else "none"))
             self.module("device", "collect")
@@ -461,7 +460,7 @@ def _dispatch(e, method, p, q, b, remote, operator):
         src = str(b["path"])
         if any(ord(ch) < 32 or ord(ch) == 127 for ch in src):
             raise ApiError(400, "path must not contain control characters")
-        if remote and src.startswith(("\\\\", "//")):
+        if remote and is_network_path(src):
             raise ApiError(403, "a relayed session may not use a network path as the repair source")
         return e.check_source(src, b.get("index"))
     if p == "/repair/run":

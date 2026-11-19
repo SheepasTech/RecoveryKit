@@ -81,7 +81,7 @@ class Hive:
     def open(self, path):
         """Return the Key at backslash-separated `path` (case-insensitive) or None."""
         key = self.root()
-        for part in [p for p in path.replace("/", "\\").split("\\") if p]:
+        for part in [p for p in path.split("\\") if p]:
             key = key.subkey(part)
             if key is None:
                 return None
@@ -98,6 +98,7 @@ MAX_SUBKEYS = 200000
 MAX_VALUES = 4096
 MAX_VALUE_BYTES = 1 << 20
 MAX_BIG_DATA = 16 << 20
+VALUES_BUDGET = 16 << 20   # data bytes one Key.values() call may read
 DB_SEGMENT = 16344
 _PARSE_ERRORS = (struct.error, IndexError, ValueError, OverflowError, MemoryError, RecursionError)
 
@@ -185,6 +186,28 @@ class Key:
                 continue
         return out
 
+    def children(self):
+        """Yield the subkeys one by one, walking the subkey list once (same caps as subkeys())."""
+        for off in self._sub_offsets():
+            try:
+                yield Key(self.hive, off)
+            except HiveError:
+                continue
+
+    def child_values(self, max_children=5000):
+        """Return (list of (name, values dict), truncated) for the subkeys, one walk, at most max_children."""
+        out, truncated = [], False
+        for k in self.children():
+            if len(out) >= max_children:
+                truncated = True
+                break
+            try:
+                vals = k.values()
+            except HiveError:
+                vals = {}
+            out.append((k.name, vals))
+        return out, truncated
+
     def subkey_names(self):
         return [k.name for k in self.subkeys()]
 
@@ -224,13 +247,22 @@ class Key:
         except _PARSE_ERRORS as e:
             raise HiveError("bad value list: %s" % e)
 
-    def _values_raw(self):
-        """Yield (name, type, bytes)."""
+    def _values_raw(self, budget=None):
+        """Yield (name, type, bytes). With `budget` (bytes), data past it comes back empty."""
+        used, noted = 0, False
         for name, vtype, s, dsize, doff in self._vk_records():
+            if budget is not None and used >= budget:
+                if not noted:
+                    noted = True
+                    self.hive.notes.append("values of key %s: more than %d bytes of data, the rest not read"
+                                           % (self.name, budget))
+                yield name, vtype, b""
+                continue
             try:
                 data = self._data(s, dsize, doff)
             except HiveError:
                 data = b""
+            used += len(data)
             yield name, vtype, data
 
     def _data(self, vk_start, dsize, doff):
@@ -265,7 +297,7 @@ class Key:
             raise HiveError("bad value data: %s" % e)
 
     def values(self):
-        return {name: decode(vtype, data) for name, vtype, data in self._values_raw()}
+        return {name: decode(vtype, data) for name, vtype, data in self._values_raw(VALUES_BUDGET)}
 
     def value(self, name, default=None):
         low = name.lower()

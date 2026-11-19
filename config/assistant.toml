@@ -234,7 +234,7 @@ id = "D-inspect-bcd"
 branch = "D"
 order = 410
 title = "Inspect the BCD, do not rewrite it"
-text = "The BCD has not been captured. Export and read it first (needs administrator or WinRE): bcdedit /store <ESP letter>:\\EFI\\Microsoft\\Boot\\BCD /enum all. Inspect only; keep the export in the case folder."
+text = "The BCD has not been captured. The scan copies the BCD of the EFI partition untouched into exports/ (bcd-*.bak) and lists the working copy in logs/ (target-bcd-*.txt): read that listing, and if it is missing see why under the BCD items of the collection section. The kit never opens the store on the EFI partition itself, because bcdedit writes log files next to a store it opens. Inspect only; keep the copy in the case folder."
 when = ["bcd.captured is false", "booted != true"]
 evidence = ["bcd.captured", "boot.efi_count"]
 
@@ -291,7 +291,7 @@ id = "E-chkdsk-scan"
 branch = "E"
 order = 530
 title = "Run a read-only chkdsk"
-text = "Run chkdsk <target letter>: /scan on the mounted target volume. It only reads; do not use /f or /r until the data is backed up."
+text = "Run chkdsk <target letter>: with no switches on the mounted target volume. No switches means read-only mode: it reports problems and changes nothing. /scan and /f change the volume and are repair steps; do not use them or /r until the data is backed up."
 when = ["booted != true"]
 evidence = ["target.present"]
 

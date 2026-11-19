@@ -7,10 +7,11 @@
 - ctl():                 small operator client for the server API       (run.cmd --ctl ...)
 
 Agent <-> server messages: metadata as base64 JSON in the X-RK-Meta header, raw
-body, X-RK-Sig = HMAC-SHA256(key, path + "\\n" + meta_b64 + "." + sha256(body)) and X-RK-Head =
-HMAC-SHA256(key, path + "." + meta_b64 + "." + Content-Length), which the server checks before it reads the body.
+body, X-RK-Sig = HMAC-SHA256(key, label + "\\n" + path + "\\n" + meta_b64 + "." + sha256(body)) and X-RK-Head =
+HMAC-SHA256(key, "req\\n" + path + "." + meta_b64 + "." + Content-Length), which the server checks before it reads the body.
+label is "req" on requests and "resp" on responses, so a request is never valid as an answer.
 key is the agent token until the agent is paired, then the session key
-HMAC-SHA256(agent_token, "session|" + agent_id + "|" + pairing_code).
+HMAC-SHA256(agent_token, "session|" + agent_id + "|" + pairing_code), the pairing code being its 10 normalised characters.
 The path is the request path; the response is signed over the same request path.
 Requests carry a fresh nonce and a rising counter; the response signature covers
 the request nonce, so neither side accepts a replay or a peer without the token.
@@ -26,6 +27,7 @@ import queue
 import re
 import secrets
 import shutil
+import socket
 import ssl
 import sys
 import threading
@@ -49,7 +51,14 @@ MAX_CASE_JSON = 20 * 2**20     # largest case.json /cases will read out of a sto
 RESULT_CTYPES = ("application/json", "application/zip", "application/octet-stream", "text/markdown")
 RESULT_PATH = "/agent/v1/result"
 MAX_CONNECTIONS = 64           # concurrent connections per HTTP server; the next one gets 503 at once
+PER_ADDRESS_CONNECTIONS = 8    # concurrent connections per remote address (LOOPBACK_ADDRS are exempt)
+LOOPBACK_ADDRS = ("127.0.0.1", "::1")   # exempt from the per-address limit; may use LOOPBACK_RESERVE slots above the cap
+LOOPBACK_RESERVE = 8
 REQUEST_DEADLINE = 120         # seconds for headers + body of one request, in total
+RESULT_SECONDS_PER_MIB = 1     # the result route gets this many more seconds per MiB of Content-Length
+PAIR_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"    # no I, O, 0, 1
+PAIR_LENGTH = 10
+BAD_MAC_LIMIT = 20             # wrong MACs for one existing agent id before that agent is revoked
 PAIRED_IDLE = 7200             # a paired (or revoked) agent entry silent this long is dropped
 AGENT_ID_RE = re.compile(r"[0-9a-f]{8}")
 MAX_ZIP_MEMBERS = 20_000       # fetch_bundle limits, checked on the zip directory before testzip()
@@ -68,23 +77,93 @@ class TlsError(ConnectionError):
     """An https:// connection was refused or failed verification; the message is one line for the operator."""
 
 
+class ProtocolError(ConnectionError):
+    """The server answered, but not as a RecoveryKit server that shares our token would; one line for the operator."""
+
+
+class UrlError(ValueError):
+    """A server URL that cannot be used; the message is one line."""
+
+
+def normalize_url(url):
+    """http://host[:port] or https://host[:port]: scheme in lower case, no trailing slash; anything else is a UrlError."""
+    m = re.match(r"^(https?)://([^/?#\s]+)(.*)$", str(url).strip(), re.I)
+    if not m:
+        raise UrlError("%r is not a server URL: it must start with http:// or https:// (for example "
+                       "https://192.168.1.10:8765)" % str(url)[:80])
+    out = m.group(1).lower() + "://" + m.group(2) + m.group(3)
+    try:
+        urllib.parse.urlsplit(out).port
+    except ValueError:
+        raise UrlError("%r has an invalid port" % out[:80]) from None
+    return out.rstrip("/")
+
+
+def normalize_pin(pin):
+    """A SHA-256 fingerprint as 64 lower-case hex characters (colons allowed), else ValueError."""
+    p = str(pin).strip().replace(":", "")
+    if not re.fullmatch(r"[0-9A-Fa-f]{64}", p):
+        raise ValueError("--pin must be the SHA-256 fingerprint of the server certificate: 64 hex characters "
+                         "(colons allowed)")
+    return p.lower()
+
+
+def unreachable(url, err, flag="--url"):
+    """One line for a server that cannot be reached."""
+    reason = " ".join((str(err) or type(err).__name__).split())[:200]
+    if "WRONG_VERSION_NUMBER" in reason:
+        reason += " (the server may be running with --no-tls: pass %s http://... )" % flag
+    return "cannot reach the server at %s: %s" % (url, reason)
+
+
 # ---------------------------------------------------------------- shared helpers
-def _sig(token, path, meta_b64, body):
-    msg = (path.encode("utf-8") + b"\n" + meta_b64.encode("ascii") + b"." +
+def _sig(token, path, meta_b64, body, label="req"):
+    """label: "req" on what an agent sends, "resp" on what the server answers (a request is no valid answer)."""
+    msg = (label.encode("ascii") + b"\n" + path.encode("utf-8") + b"\n" + meta_b64.encode("ascii") + b"." +
            hashlib.sha256(body).hexdigest().encode("ascii"))
     return hmac.new(token.encode("utf-8"), msg, hashlib.sha256).hexdigest()
 
 
+def _normalize_code(code):
+    """Pairing code as typed -> the 10 characters that are hashed: upper case, no dashes, no spaces. Nothing else is
+    mapped (an O stays an O)."""
+    return str(code).strip().upper().replace("-", "").replace(" ", "")
+
+
+def _new_code():
+    return "".join(secrets.choice(PAIR_ALPHABET) for _ in range(PAIR_LENGTH))
+
+
+def _show_code(code):
+    return "%s-%s" % (code[:PAIR_LENGTH // 2], code[PAIR_LENGTH // 2:])
+
+
+def _code_hash(code, agent_id):
+    return hashlib.sha256(("%s|%s" % (_normalize_code(code), agent_id)).encode()).hexdigest()
+
+
 def _session_key(token, agent_id, code):
     """The key both sides use for an agent from the moment it is paired: it needs the pairing code as well."""
-    return hmac.new(token.encode("utf-8"), ("session|%s|%s" % (agent_id, code)).encode("utf-8"),
+    return hmac.new(token.encode("utf-8"), ("session|%s|%s" % (agent_id, _normalize_code(code))).encode("utf-8"),
                     hashlib.sha256).hexdigest()
 
 
 def _head_sig(key, path, meta_b64, content_length):
     """MAC over the request line and headers only, so the server can refuse before it reads any body."""
-    msg = ("%s.%s.%s" % (path, meta_b64, content_length)).encode("utf-8")
+    msg = ("req\n%s.%s.%s" % (path, meta_b64, content_length)).encode("utf-8")
     return hmac.new(key.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+
+
+def _reply_ok(key, path, headers, data, nonce):
+    """Is this a genuine answer to our request: signed with the "resp" label and carrying our nonce?"""
+    rmeta = headers.get("X-RK-Meta") or ""
+    if not rmeta or not hmac.compare_digest((headers.get("X-RK-Sig") or "").encode("utf-8", "replace"),
+                                            _sig(key, path, rmeta, data, "resp").encode()):
+        return False
+    try:
+        return _unpack(rmeta).get("nonce") == nonce
+    except (ValueError, TypeError, AttributeError):
+        return False
 
 
 def _signed_headers(key, path, meta_b64, body):
@@ -243,6 +322,8 @@ class _Handler(BaseHTTPRequestHandler):
                 n = int(cl)
                 if n > limit:
                     return self._refuse(413, "body too large")
+            if self.command in ("GET", "HEAD") and n > 0:
+                return self._refuse(400, "a %s request must not have a body" % self.command)
             vet = getattr(self.server, "vet", None)
             if vet is not None:           # the app authenticates the headers before any body byte is read
                 veto = vet(self.command, u.path, self.headers, n)
@@ -260,6 +341,8 @@ class _Handler(BaseHTTPRequestHandler):
                         except OSError:
                             pass
                     return
+            if u.path == RESULT_PATH:     # authenticated by vet: a big upload gets time in proportion to its size
+                self._deadline += n / 2**20 * RESULT_SECONDS_PER_MIB
             try:
                 body = bytearray()
                 while len(body) < n:       # chunks, each read armed with the request's total deadline
@@ -298,33 +381,72 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 class _Server(ThreadingHTTPServer):
+    def _admit(self, addr):
+        """None when this connection may proceed (and is counted), else why it is refused."""
+        with self.count_lock:
+            exempt = addr in self.exempt
+            if self.per_addr and not exempt and self.by_addr.get(addr, 0) >= self.per_addr:
+                return "%d connections from this address" % self.per_addr
+            if self.active >= self.max_conn + (self.reserve if exempt else 0):
+                return "%d connections in use" % self.max_conn
+            self.active += 1
+            self.by_addr[addr] = self.by_addr.get(addr, 0) + 1
+        return None
+
+    def _release(self, addr):
+        with self.count_lock:
+            self.active -= 1
+            left = self.by_addr.get(addr, 1) - 1
+            if left > 0:
+                self.by_addr[addr] = left
+            else:
+                self.by_addr.pop(addr, None)
+
     def process_request(self, request, client_address):
-        if not self.conn_sem.acquire(blocking=False):
-            LOG.info("HTTP  | connection from %s refused: %d connections in use", client_address[0], self.max_conn)
+        why = self._admit(client_address[0])
+        if why:
+            LOG.info("HTTP  | connection from %s refused: %s", client_address[0], why)
             self._busy(request)
             return
         try:
             super().process_request(request, client_address)
         except BaseException:
-            self.conn_sem.release()
+            self._release(client_address[0])
             raise
 
     def process_request_thread(self, request, client_address):
         try:
             super().process_request_thread(request, client_address)
         finally:
-            self.conn_sem.release()
+            self._release(client_address[0])
 
     def _busy(self, request):
+        """Plain HTTP: a short thread sends 503, closes its side and reads what the client already sent, so the answer
+        is not lost to a connection reset. TLS: closed without a handshake (the client could not read a plain answer)."""
+        if self.tls_ctx is not None or not self.refusals.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        threading.Thread(target=self._refuse_plain, args=(request,), daemon=True).start()
+
+    def _refuse_plain(self, request):
         try:
-            if self.tls_ctx is None:         # a TLS client could not read a plain answer: just close
-                body = b'{"error": "too many connections"}'
-                request.settimeout(1)
-                request.sendall(b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\n"
-                                b"Connection: close\r\nContent-Length: %d\r\n\r\n" % len(body) + body)
+            body = b'{"error": "too many connections"}'
+            request.settimeout(1)
+            request.sendall(b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\n"
+                            b"Connection: close\r\nContent-Length: %d\r\n\r\n" % len(body) + body)
+            request.shutdown(socket.SHUT_WR)
+            request.settimeout(0.3)
+            left = 65536
+            while left > 0:
+                chunk = request.recv(4096)
+                if not chunk:
+                    break
+                left -= len(chunk)
         except OSError:
             pass
-        self.shutdown_request(request)
+        finally:
+            self.shutdown_request(request)
+            self.refusals.release()
 
     def handle_error(self, request, client_address):
         # failed TLS handshakes, resets and timeouts are routine on a LAN: one log line, no traceback on the console
@@ -333,17 +455,24 @@ class _Server(ThreadingHTTPServer):
                  client_address[0], e)
 
 
-def _http_server(app, host, port, certfile=None, keyfile=None, vet=None, max_conn=None, deadline=None):
+def _http_server(app, host, port, certfile=None, keyfile=None, vet=None, max_conn=None, deadline=None,
+                 per_addr=None, exempt=None, reserve=None):
     srv = _Server((host, port), _Handler)
     srv.daemon_threads = True
     srv.app = app
     srv.vet = vet                       # vet(method, path, headers, content_length) -> None or (status, message)
     srv.max_conn = max_conn or MAX_CONNECTIONS
-    srv.conn_sem = threading.BoundedSemaphore(srv.max_conn)
+    srv.per_addr = PER_ADDRESS_CONNECTIONS if per_addr is None else per_addr      # 0 = no per-address limit
+    srv.exempt = frozenset(LOOPBACK_ADDRS if exempt is None else exempt)          # no per-address limit; may use the reserve
+    srv.reserve = LOOPBACK_RESERVE if reserve is None else reserve
+    srv.count_lock = threading.Lock()
+    srv.active, srv.by_addr = 0, {}
+    srv.refusals = threading.BoundedSemaphore(32)       # at most this many 503 answers are being delivered at once
     srv.request_deadline = deadline or REQUEST_DEADLINE
     srv.tls_ctx = None
     if certfile and keyfile:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.options |= getattr(ssl, "OP_NO_RENEGOTIATION", 0)
         ctx.load_cert_chain(certfile, keyfile)
         srv.tls_ctx = ctx                # each accepted socket is wrapped in its handler thread
     return srv
@@ -510,8 +639,35 @@ class Server:
                 return [tok]
             return [sk] if a.get("switched") else [sk, tok]
 
+    def _bad_mac(self, aid, path):
+        """A message for an agent id that EXISTS failed its MAC. After BAD_MAC_LIMIT of them the agent is revoked. Ids
+        that do not exist are not counted, so only someone who can see an id (plain HTTP, or the agent token) can
+        use this to end a session."""
+        if aid is None:
+            return
+        revoked = False
+        with self.lock:
+            a = self.agents.get(aid)
+            if a is None or a["revoked"]:
+                return
+            a["bad_macs"] = a.get("bad_macs", 0) + 1
+            if a["bad_macs"] >= BAD_MAC_LIMIT:
+                a["revoked"], a["paired"] = True, False
+                a["revoked_reason"] = "too many invalid signatures"
+                a["jobs"].put(None)              # wake a held poll so the agent learns it at once
+                revoked = True
+        if revoked:
+            LOG.warning("SERVER| agent %s revoked: %d invalid signatures (last on %s)", aid, BAD_MAC_LIMIT, path)
+            self.say("Agent %s revoked: too many invalid signatures. Its session has to be started again on the "
+                     "target." % aid)
+
     def vet(self, method, path, headers, n):
-        """Called before the body is read: None to go on, or (status, message). Agent routes only."""
+        """Called before the body is read: None to go on, or (status, message). Operator routes need the bearer token
+        here; agent routes need a valid X-RK-Head."""
+        if path.startswith(API + "/"):
+            if not self._operator_ok(headers):
+                return 401, "missing or wrong bearer token"
+            return None
         if not (path.startswith("/agent/v1/") and method == "POST"):
             return None
         meta_b64 = headers.get("X-RK-Meta") or ""
@@ -520,6 +676,7 @@ class Server:
         keys = self._keys_for(peek[0]) if peek else [self.tokens["agent_token"]]
         if not meta_b64 or not any(_same(head, _head_sig(k, path, meta_b64, n)) for k in keys):
             LOG.info("SERVER| agent call %s refused before the body: bad or missing X-RK-Head", path)
+            self._bad_mac(peek[0] if peek else None, path)
             return 401, "bad or missing X-RK-Head"
         limit = MAX_BODY
         if path == RESULT_PATH:
@@ -540,6 +697,7 @@ class Server:
         key = next((k for k in keys if meta_b64 and _same(sig, _sig(k, path, meta_b64, body))), None)
         if key is None:                    # nothing below this line runs, and no state is touched, without a valid MAC
             LOG.info("SERVER| agent call %s rejected: bad signature", path)
+            self._bad_mac(peek[0] if peek else None, path)
             return 401, {}, b'{"error": "bad signature"}'
         try:
             meta = _unpack(meta_b64)
@@ -642,7 +800,7 @@ class Server:
     def _agent_reply(self, status, obj, nonce, path, key):
         body = json.dumps(obj).encode("utf-8")
         meta_b64 = _pack({"nonce": nonce})
-        return status, {"X-RK-Meta": meta_b64, "X-RK-Sig": _sig(key, path, meta_b64, body)}, body
+        return status, {"X-RK-Meta": meta_b64, "X-RK-Sig": _sig(key, path, meta_b64, body, "resp")}, body
 
     # ---- operator side
     def _cancel(self, a, job_id):
@@ -674,9 +832,12 @@ class Server:
             a["results"].pop(job_id, None)
         return slot["status"], slot["ctype"], slot["body"]
 
-    def _operator_call(self, method, path, q, headers, body):
+    def _operator_ok(self, headers):
         auth = headers.get("Authorization") or ""
-        if not hmac.compare_digest(auth.encode(), ("Bearer " + self.tokens["operator_token"]).encode()):
+        return hmac.compare_digest(auth.encode("utf-8", "replace"), ("Bearer " + self.tokens["operator_token"]).encode())
+
+    def _operator_call(self, method, path, q, headers, body):
+        if not self._operator_ok(headers):
             return 401, {"WWW-Authenticate": "Bearer"}, b'{"error": "missing or wrong bearer token"}'
         operator = "".join(c for c in (headers.get("X-RK-Operator") or "") if c.isprintable())[:40] or "operator"
         try:
@@ -697,7 +858,8 @@ class Server:
             with self.lock:
                 self._prune(now)
             return js(200, [{"id": a["id"], "name": a.get("name"), "version": a.get("version"), "paired": a["paired"],
-                             "revoked": a["revoked"], "repairs_enabled_on_target": a.get("repairs"),
+                             "revoked": a["revoked"], "revoked_reason": a.get("revoked_reason"),
+                             "repairs_enabled_on_target": a.get("repairs"),
                              "seconds_since_seen": round(now - a.get("last_seen", now))} for a in list(self.agents.values())])
         if p == "/bundles" and method == "GET":
             out = []
@@ -714,7 +876,8 @@ class Server:
             if a is None:
                 return js(404, {"error": "unknown agent"})
             if verb == "pair" and method == "POST":
-                want = hashlib.sha256(("%s|%s" % (str(b.get("code", "")).strip(), aid)).encode()).hexdigest()
+                code = _normalize_code(b.get("code", ""))
+                want = _code_hash(code, aid)
                 with self.lock:                  # check and increment as one step
                     if a["pair_failures"] >= 5:
                         return js(429, {"error": "too many wrong codes; restart the session on the target"})
@@ -723,7 +886,7 @@ class Server:
                         LOG.info("SERVER| wrong pairing code for agent %s by %s", aid, operator)
                         return js(403, {"error": "wrong pairing code"})
                     if a.get("skey") is None:    # from now on both sides sign with the session key
-                        a["skey"] = _session_key(self.tokens["agent_token"], aid, str(b.get("code", "")).strip())
+                        a["skey"] = _session_key(self.tokens["agent_token"], aid, code)
                         a["switched"] = False
                     a["paired"] = True
                 LOG.info("SERVER| agent %s paired by %s", aid, operator)
@@ -871,10 +1034,13 @@ class Server:
             return self._operator_call(method, path, q, headers, body)
         return 404, {}, b'{"error": "unknown path"}'
 
-    def start(self, host="127.0.0.1", port=8765, cert=None, key=None, tls=None, max_conn=None, deadline=None):
+    def start(self, host="127.0.0.1", port=8765, cert=None, key=None, tls=None, max_conn=None, deadline=None,
+              per_addr=None, exempt=None, reserve=None):
         """cert/key: PEM paths (default <kit>/config/server-cert.pem and server-key.pem). tls: None = use TLS when
         both files exist, True = require them, False = plain HTTP whatever files exist. max_conn / deadline:
-        concurrent connection cap (default 64) and total seconds per request (default 120)."""
+        concurrent connection cap (default 64) and total seconds per request (default 120). per_addr: concurrent
+        connections per remote address (default 8, 0 = no limit); exempt: addresses without that limit (default
+        127.0.0.1 and ::1) which may also use `reserve` (default 8) slots above max_conn."""
         cert = cert or os.path.join(self.kit_root, "config", "server-cert.pem")
         key = key or os.path.join(self.kit_root, "config", "server-key.pem")
         have = os.path.isfile(cert) and os.path.isfile(key)
@@ -882,7 +1048,8 @@ class Server:
             raise FileNotFoundError("TLS was requested but %s or %s is missing" % (cert, key))
         tls = have if tls is None else bool(tls)
         self.httpd = _http_server(self.app, host, port, cert if tls else None, key if tls else None,
-                                 vet=self.vet, max_conn=max_conn, deadline=deadline)
+                                 vet=self.vet, max_conn=max_conn, deadline=deadline,
+                                 per_addr=per_addr, exempt=exempt, reserve=reserve)
         self.url = "%s://%s:%d" % ("https" if tls else "http", host, self.httpd.server_address[1])
         self.tls = tls
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
@@ -907,8 +1074,14 @@ def run_server(kit_root, host, port, store, intake, ca_dir=None, no_tls=False):
             return 2
         print(msg)
     log.add_file(os.path.join(store, "_server-logs", "server-%s.log" % log.stamp()))
-    srv = Server(kit_root, store, intake)
-    url = srv.start(host, port, cert, key, tls=not no_tls)
+    try:
+        srv = Server(kit_root, store, intake)
+        url = srv.start(host, port, cert, key, tls=not no_tls)
+    except (ssl.SSLError, OSError) as e:       # port in use, address not on this PC, certificate or key unusable
+        what = ("the server certificate or key cannot be used (delete config\\server-cert.pem and server-key.pem so "
+                "they are issued again)") if isinstance(e, ssl.SSLError) else "cannot listen on %s:%s" % (host, port)
+        print("Cannot start the server: %s: %s" % (what, " ".join(str(e).split())))
+        return 2
     print("RecoveryKit control server %s on %s  (%s)" % (__version__, url,
           "TLS" if srv.tls else "NO TLS: traffic is authenticated but not encrypted, use on a trusted LAN only"))
     if srv.tls:
@@ -944,12 +1117,14 @@ def connect(engine, url, token, pin=None, minutes=60, name="", stop=None, on_cod
     """Dial out to the control server and serve relayed agent-API calls until a key is pressed on the
     target, the session times out, or the server revokes it. Returns the reason it ended."""
     ui = engine.ctx.ui
-    url = url.rstrip("/")
+    url = normalize_url(url)
+    if pin and ca_file and url.startswith("https://"):
+        ui.say("--pin and --ca were both given: the pin is used and --ca is ignored.")
     if ca_file is None and url.startswith("https://") and getattr(engine, "kit_root", None):
         ca_file = os.path.join(engine.kit_root, "config", "ca-cert.pem")
     client_context(url, pin, ca_file)          # https:// with neither pin nor CA file is refused before anything is sent
     agent_id = secrets.token_hex(4)
-    code = "%06d" % secrets.randbelow(10 ** 6)
+    code = _new_code()
     counter = [0]
     key = [token]            # the agent token until the server says "paired", then the session key
 
@@ -963,36 +1138,34 @@ def connect(engine, url, token, pin=None, minutes=60, name="", stop=None, on_cod
                                          timeout, pin, ca_file)
         if status == 413:
             raise _TooLarge()
-        rmeta = headers.get("X-RK-Meta") or ""
-        if not rmeta or not hmac.compare_digest((headers.get("X-RK-Sig") or "").encode("utf-8", "replace"),
-                                                _sig(k, path, rmeta, data).encode()) \
-                or _unpack(rmeta).get("nonce") != nonce:
-            raise ConnectionError("the server's answer is not signed with the shared token (HTTP %s): wrong token, "
-                                  "or this is not the RecoveryKit server" % status)
+        if not _reply_ok(k, path, headers, data, nonce):
+            raise ProtocolError("the server's answer is not signed with the shared token (HTTP %s): wrong token, "
+                                "or this is not the RecoveryKit server" % status)
         obj = _json_dict(data)
         if obj is None:
-            raise ConnectionError("the server's answer is not a JSON object")
+            raise ProtocolError("the server's answer is not a JSON object")
         return status, obj
 
     if url.startswith("http://"):
         ui.say("WARNING: no TLS. Traffic is authenticated but NOT encrypted. Use on a trusted LAN only.")
         if pin:
             ui.say("WARNING: --pin is ignored with an http:// URL (there is no certificate to pin). Use https://.")
-    code_hash = hashlib.sha256(("%s|%s" % (code, agent_id)).encode()).hexdigest()
+    code_hash = _code_hash(code, agent_id)
     st, hello = call("/agent/v1/hello", {"name": name or engine.ctx.case.data.get("case_id")
                                          or "%s (%s)" % (os.environ.get("COMPUTERNAME") or "agent",
                                                          (getattr(engine.ctx, "env", None) or {}).get("kind", "?")),
                                          "version": __version__, "code_hash": code_hash,
                                          "allow_remote_repairs": engine.allow_remote_repairs})
     if st != 200:
-        raise ConnectionError("the server refused this session (HTTP %s): %s" % (st, hello.get("error", "")))
+        raise ProtocolError("the server refused this session (HTTP %s): %s" % (st, hello.get("error", "")))
     ui.say("Connected to %s as agent %s." % (url, agent_id))
-    _say_secret("PAIRING CODE: %s   (tell it to the operator at the server; nothing is relayed before pairing)" % code)
+    shown = _show_code(code)
+    _say_secret("PAIRING CODE: %s   (tell it to the operator at the server; nothing is relayed before pairing)" % shown)
     LOG.info("AGENT | pairing code shown on the console (not logged)")
     ui.say("Session: %s; ends after %d minutes or when a key is pressed here." % (
         "read-only + REPAIRS ENABLED (--allow-remote-repairs)" if engine.allow_remote_repairs else "read-only", minutes))
     if on_code:
-        on_code(agent_id, code)
+        on_code(agent_id, shown)
     deadline = time.monotonic() + minutes * 60
     failures, reason, paired = 0, "", False
     while not reason:
@@ -1047,20 +1220,32 @@ def connect(engine, url, token, pin=None, minutes=60, name="", stop=None, on_cod
                                    remote=True, operator=operator)
             data, ctype = _payload(result)
         meta = {"job_id": job.get("id"), "status": status, "ctype": ctype}
+
+        def deliver_error(code_, text):
+            """A small JSON error as the job's result, so the operator is answered at once."""
+            err = json.dumps({"error": text}).encode()
+            try:
+                st_, _ = call(RESULT_PATH, dict(meta, status=code_, ctype="application/json"), err, timeout=60)
+                if st_ != 200:
+                    raise ConnectionError("the server answered HTTP %s" % st_)
+            except (OSError, ValueError, http.client.HTTPException, _TooLarge) as e2:
+                LOG.error("AGENT | could not deliver the error result of job %s: %s", job.get("id"), e2)
         try:
             if len(data) > MAX_RESULT:
                 raise _TooLarge()
-            call(RESULT_PATH, meta, data, timeout=300)
+            st_, _ = call(RESULT_PATH, meta, data, timeout=300)
+            if st_ != 200:
+                raise ConnectionError("the server answered HTTP %s" % st_)
         except _TooLarge:
             LOG.error("AGENT | result of job %s is too large for the server (%d bytes)", job.get("id"), len(data))
-            err = json.dumps({"error": "the result (%d bytes) is larger than the server accepts" % len(data)}).encode()
-            try:
-                call(RESULT_PATH, dict(meta, status=413, ctype="application/json"), err, timeout=60)
-            except (OSError, ValueError, http.client.HTTPException, _TooLarge) as e:
-                LOG.error("AGENT | could not deliver the error result of job %s: %s", job.get("id"), e)
+            deliver_error(413, "the result (%d bytes) is larger than the server accepts" % len(data))
         except (OSError, ValueError, http.client.HTTPException) as e:
             LOG.error("AGENT | could not deliver the result of job %s: %s", job.get("id"), e)
+            deliver_error(502, "result upload failed: %s" % _printable(" ".join(str(e).split()) or type(e).__name__, 200))
     ui.say("Remote session ended: %s." % reason)
+    if reason == "revoked by the server":
+        ui.say("A revoked session cannot be resumed (an operator revoked it, or the server counted %d invalid signatures "
+               "for this agent): run --connect again to start a new session with a new pairing code." % BAD_MAC_LIMIT)
     LOG.info("AGENT | session ended: %s", reason)
     return reason
 
@@ -1081,6 +1266,13 @@ def ctl(kit_root, argv, out=print, pin=None, ca_file=None, ca_dir=None):
             ca_file = val
         else:
             pin = val
+    explicit_ca = ca_file is not None
+    if url is not None:
+        try:
+            url = normalize_url(url)
+        except UrlError as e:
+            out(str(e))
+            return 2
     if ca_file is None:                     # on the server PC the CA certificate is in the CA folder
         for cand in (os.path.join(ca_dir or tlsca.default_ca_dir(), "ca-cert.pem"),
                      os.path.join(kit_root, "config", "ca-cert.pem")):
@@ -1091,6 +1283,14 @@ def ctl(kit_root, argv, out=print, pin=None, ca_file=None, ca_dir=None):
         url = "https://127.0.0.1:8765" if ca_file else "http://127.0.0.1:8765"
     if pin and url.startswith("http://"):
         out("WARNING: --pin is ignored with an http:// URL (there is no certificate to pin). Use https://.")
+    elif pin:
+        try:
+            pin = normalize_pin(pin)
+        except ValueError as e:
+            out(str(e))
+            return 2
+        if explicit_ca:
+            out("--pin and --ca were both given: the pin is used and --ca is ignored.")
     if token is None:
         try:
             with open(os.path.join(kit_root, "config", "token-server.json"), encoding="utf-8") as f:
@@ -1108,7 +1308,7 @@ def ctl(kit_root, argv, out=print, pin=None, ca_file=None, ca_dir=None):
     elif verb == "bundles":
         path = "/bundles"
     elif verb == "pair" and len(rest) == 2:
-        method, path, body = "POST", "/agents/%s/pair" % rest[0], json.dumps({"code": rest[1]}).encode()
+        method, path, body = "POST", "/agents/%s/pair" % rest[0], json.dumps({"code": _normalize_code(rest[1])}).encode()
     elif verb in ("revoke", "fetch-bundle") and len(rest) == 1:
         method, path = "POST", "/agents/%s/%s" % (rest[0], verb)
     elif verb == "get" and len(rest) == 2:
@@ -1131,8 +1331,8 @@ def ctl(kit_root, argv, out=print, pin=None, ca_file=None, ca_dir=None):
         out(str(e))
         return 1
     except (OSError, http.client.HTTPException) as e:
-        out("Cannot reach the server at %s: %s: %s" % (url, type(e).__name__, e))
-        return 1
+        out(unreachable(url, e if str(e) else type(e).__name__, "--url"))
+        return 2
     ctype = headers.get("Content-Type", "")
     if ctype.startswith("application/json"):
         try:

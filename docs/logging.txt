@@ -59,7 +59,7 @@ BitLocker recovery keys and other secrets are never logged. They are shown as <h
 and <redacted> in the logs. This also holds for the repair record in case.json.
 
 The API bearer token (--serve) and the pairing code (--connect) are deliberately NOT logged: they
-are printed on the console only, and the start line in debug.log shows --token and --pin masked.
+are printed on the console only, and the start line (START |, written to debug.log once the case log exists, and also to the copy in %TEMP% where there is one) shows --token and --pin masked.
 (--serve also writes its token to cases\_api-token.txt for local programs; the file is deleted
 when it exits.)
 

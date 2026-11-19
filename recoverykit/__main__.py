@@ -5,6 +5,7 @@ Front ends over the engine (ADR 0010): text menu (default), headless scan
 (--connect), control server (--server) and its operator client (--ctl).
 """
 import argparse
+import http.client
 import os
 import shutil
 import sys
@@ -42,10 +43,10 @@ def parse_args(argv):
     g.add_argument("--port", type=int, default=None, help="port for --serve (default 8766) or --server (default 8765)")
     g.add_argument("--allow-repairs", action="store_true", help="let loopback API clients run confirmed repair steps")
     g = p.add_argument_group("remote session (agent connects out; no port is opened on the target)")
-    g.add_argument("--connect", metavar="URL", help="control server URL, e.g. http://192.168.1.10:8765")
+    g.add_argument("--connect", metavar="URL", help="control server URL, e.g. https://192.168.1.10:8765 (http:// only for a server run with --no-tls)")
     g.add_argument("--token", metavar="T", help="agent token of the server (from its config/token-server.json)")
-    g.add_argument("--pin", metavar="SHA256", help="expected SHA-256 fingerprint of the server's TLS certificate "
-                   "(for a server whose CA is not on this stick)")
+    g.add_argument("--pin", metavar="SHA256", help="expected SHA-256 fingerprint of the server's TLS certificate, "
+                   "64 hex characters (for a server whose CA is not on this stick; used instead of --ca)")
     g.add_argument("--ca", metavar="FILE", help="CA certificate that signed the server (default: config/ca-cert.pem "
                    "on the stick, put there by Install-ToUsb.ps1)")
     g.add_argument("--session-minutes", type=int, default=60, help="remote session length (default 60)")
@@ -214,11 +215,20 @@ def main(argv=None):
             print("%-4s %s  %s" % (seg["segment"], seg["code"], seg["detail"] or seg["value"] or
                                    ("not readable" if seg["code"] == device.UNKNOWN else "code not in components.json")))
         return 0
+    from . import net
+    if args.no_tls and not args.server:
+        print("--no-tls only applies to --server (a connecting agent or --ctl follows the scheme of its URL): ignored.")
+    if args.connect:
+        try:
+            args.connect = net.normalize_url(args.connect)
+            if args.pin and args.connect.startswith("https://"):
+                args.pin = net.normalize_pin(args.pin)
+        except (net.UrlError, ValueError) as e:
+            print(e)
+            return 2
     if args.ctl is not None:
-        from . import net
         return net.ctl(KIT_ROOT, args.ctl, pin=args.pin, ca_file=args.ca, ca_dir=args.ca_dir)
     if args.server:
-        from . import net
         store = os.path.abspath(args.store) if args.store else os.path.join(KIT_ROOT, "cases", "_server")
         return net.run_server(KIT_ROOT, args.bind, args.port or 8765, store, args.intake,
                               ca_dir=args.ca_dir, no_tls=args.no_tls)
@@ -249,6 +259,7 @@ def main(argv=None):
     engine = Engine(KIT_ROOT, out_root, ui, dry_run=args.dry_run, options={
         "chkdsk": args.chkdsk, "ticket": args.ticket if args.ticket is not None else ("" if headless else None),
         "target": args.target, "target_path": args.target_path, "answers": answers})
+    LOG.info("%s", start_line(args))              # again: the first one was logged before this case's debug.log existed
     engine.allow_repairs = args.allow_repairs
     engine.allow_remote_repairs = args.allow_remote_repairs
     env, case = engine.ctx.env, engine.ctx.case
@@ -275,7 +286,6 @@ def main(argv=None):
             from . import net
             net.serve_local(engine, args.port or 8766)
         elif args.connect:
-            from . import net
             net.connect(engine, args.connect, args.token, pin=args.pin, minutes=args.session_minutes, ca_file=args.ca)
         elif not (args.scan or args.auto):
             menu(engine)
@@ -285,10 +295,13 @@ def main(argv=None):
         ui.say("Interrupted by the operator.")
         rc = 130
     except Exception as e:  # noqa: BLE001
-        from . import net
-        if isinstance(e, net.TlsError):          # a refused or failed TLS connection: one clear line, no traceback
+        if isinstance(e, (net.TlsError, net.ProtocolError)):    # a refused or failed connection: one line, no traceback
             LOG.error("AGENT | %s", e)
             ui.say(str(e))
+            rc = 2
+        elif args.connect and isinstance(e, (OSError, http.client.HTTPException)):    # server down, no route, reset
+            LOG.error("AGENT | %s: %s", type(e).__name__, e)
+            ui.say(net.unreachable(args.connect, e if str(e) else type(e).__name__, "--connect"))
             rc = 2
         else:
             LOG.critical("FATAL |\n%s", traceback.format_exc())

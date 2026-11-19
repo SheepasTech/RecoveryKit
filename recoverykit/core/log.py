@@ -17,7 +17,7 @@ _FMT = logging.Formatter("%(asctime)s.%(msecs)03d %(levelname)-7s %(message)s", 
 
 def add_file(path):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    h = logging.FileHandler(path, encoding="utf-8")
+    h = logging.FileHandler(path, encoding="utf-8", errors="backslashreplace")
     h.setFormatter(_FMT)
     LOG.addHandler(h)
     return h

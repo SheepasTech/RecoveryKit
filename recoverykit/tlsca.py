@@ -84,6 +84,15 @@ def cert_info(pem_path):
     return info
 
 
+def pair_matches(cert_path, key_path):
+    """Can a TLS server context be made from this certificate and key (they belong together)?"""
+    try:
+        ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER).load_cert_chain(cert_path, key_path)
+        return True
+    except (ssl.SSLError, OSError, ValueError):
+        return False
+
+
 def needs_issue(cert_path, key_path, names, ips, min_days=30, ca_cert_path=None):
     """(True, reason) when the server certificate must be issued again, else (False, "")."""
     if not (os.path.isfile(cert_path) and os.path.isfile(key_path)):
@@ -92,6 +101,8 @@ def needs_issue(cert_path, key_path, names, ips, min_days=30, ca_cert_path=None)
         info = cert_info(cert_path)
     except (OSError, TlsError, ValueError, ssl.SSLError) as e:
         return True, "the server certificate is unreadable (%s)" % e
+    if not pair_matches(cert_path, key_path):
+        return True, "the server certificate and key do not belong together (or cannot be loaded)"
     if info["not_after"] is None:
         return True, "cannot read the certificate's expiry on this Python"
     left = info["not_after"] - datetime.datetime.now(datetime.timezone.utc)
@@ -150,12 +161,23 @@ def ensure_server_cert(kit_root, ca_dir=None, bind_ip=None):
     os.makedirs(out_dir, exist_ok=True)
     cmd = [ps, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", script,
            "-CaDir", ca_dir, "-OutDir", out_dir, "-DnsName", ",".join(names), "-IpAddress", ",".join(ips), "-Force"]
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=ISSUE_TIMEOUT, stdin=subprocess.DEVNULL)
+    try:      # the console's own code page: file names and messages from the script may not be ASCII
+        r = subprocess.run(cmd, capture_output=True, encoding="oem" if os.name == "nt" else "utf-8", errors="replace",
+                           timeout=ISSUE_TIMEOUT, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError) as e:
         raise TlsError("could not run PowerShell (%s): %s" % (ps, e))
+    lines = [l.strip() for l in ((r.stderr or "") + "\n" + (r.stdout or "")).splitlines() if l.strip()]
     if r.returncode != 0:
-        raise TlsError("%s failed (exit %d): %s" % (SCRIPT, r.returncode, (r.stderr or r.stdout).strip()[:500]))
+        errors = [l for l in ((r.stderr or "").splitlines()) if l.strip().startswith("ERROR:")]
+        last = (errors[-1] if errors else (lines[0] if lines else "no output")).strip()
+        raise TlsError("%s failed (exit %d): %s" % (SCRIPT, r.returncode, last[:500]))
     if not (os.path.isfile(cert) and os.path.isfile(key) and os.path.isfile(ca_cert)):
         raise TlsError("%s finished but did not write the expected files" % SCRIPT)
-    return cert, key, ca_cert, "Issued a new server certificate (%s)." % reason
+    if not pair_matches(cert, key):
+        raise TlsError("%s wrote a certificate and key that do not belong together" % SCRIPT)
+    msg = "Issued a new server certificate (%s)." % reason
+    warnings = []
+    for l in lines:
+        if l.startswith("WARNING:") and l not in warnings:
+            warnings.append(l)
+    return cert, key, ca_cert, msg + "".join("\n" + w for w in warnings)

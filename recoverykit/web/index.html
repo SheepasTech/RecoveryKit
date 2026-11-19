@@ -192,7 +192,7 @@ function planRows(shownIds, list) {
     add: list.filter(function (a) { return !have[a.id]; }).map(function (a) { return a.id; })
   };
 }
-function agentState(a) { return a.revoked ? "revoked" : (a.paired ? "paired" : "waiting for pairing"); }
+function agentState(a) { return a.revoked ? "revoked" + (a.revoked_reason ? ": " + a.revoked_reason : "") : (a.paired ? "paired" : "waiting for pairing"); }
 function needsPairing(a) { return !a.paired && !a.revoked; }
 function strList(v) {
   return Array.isArray(v) ? v.map(function (x) { return (x !== null && typeof x === "object") ? JSON.stringify(x) : String(x); }) : null;
@@ -282,7 +282,8 @@ function addPairing(row) {
   var id = row.a.id;
   var box = el("span", null, "row");
   var lab = el("label", "Pairing code for " + id, "sr"); lab.htmlFor = "pc-" + id;
-  var code = el("input"); code.type = "text"; code.size = 8; code.maxLength = 6; code.id = "pc-" + id; code.autocomplete = "off";
+  var code = el("input"); code.type = "text"; code.size = 13; code.maxLength = 11; code.id = "pc-" + id; code.autocomplete = "off";
+  code.setAttribute("autocapitalize", "characters"); code.spellcheck = false; code.placeholder = "XXXXX-XXXXX";
   var msg = el("span", "", "err");
   var pb = el("button", "Pair"); pb.type = "button";
   pb.addEventListener("click", function () {

@@ -8,8 +8,13 @@
     2. Copy the kit to the destination with robocopy. cases\ on the destination is
        never deleted or overwritten (customer data).
     3. Copy the CA certificate of this PC (ADR 0020) to <dest>\config\ca-cert.pem, creating the CA first when
-       there is none. Only the certificate: never ca-key.pem, server-key.pem or token files. The install fails
-       if one of those exists under the destination.
+       there is none. Only the certificate: a ca-cert.pem that contains a PRIVATE KEY block is refused. From the
+       project's config\ folder only kit.toml and assistant.toml are copied (an allowlist: a token file, a key or a
+       backup that happens to lie there stays behind).
+       The final check looks at CONTENT: any file under the destination smaller than 64 KB, outside cases\,
+       devices\ and python\, that contains "PRIVATE KEY-----", "operator_token" or "agent_token" (also inside a
+       small .zip) fails the install and is named; files called ca-key.pem, server-key.pem or token-server.json
+       fail it wherever they are.
     4. Write kit-version.txt and run <dest>\run.cmd --version.
 .PARAMETER Destination
   Target folder. Default D:\ITWORK\RecoveryKit. The drive must exist and the folder
@@ -18,6 +23,8 @@
   Download and extract the embedded Python again even if python\python.exe exists.
 .PARAMETER CaDir
   Folder of this PC's certificate authority. Default %LOCALAPPDATA%\ITwork\CA.
+.PARAMETER CheckOnly
+  A folder: run ONLY the final secret check on it (no install, no download) and exit 0 (clean) or 1 (names the files).
 .PARAMETER WhatIf
   Show what would be copied (robocopy /L), change nothing.
 #>
@@ -25,7 +32,8 @@
 param(
     [string]$Destination = 'D:\ITWORK\RecoveryKit',
     [switch]$RefreshPython,
-    [string]$CaDir = (Join-Path $env:LOCALAPPDATA 'ITwork\CA')
+    [string]$CaDir = (Join-Path $env:LOCALAPPDATA 'ITwork\CA'),
+    [string]$CheckOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -128,6 +136,60 @@ function Invoke-Robo {
     if ($LASTEXITCODE -ge 8) { throw "robocopy failed (exit $LASTEXITCODE): $Src -> $Dst" }
 }
 
+# Files under $Root that must not be on a stick (see the header). Returns the reasons, one per file.
+function Find-SecretFiles {
+    param([string]$Root)
+    $found = New-Object System.Collections.Generic.List[string]
+    $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd('\')
+    $latin1 = [Text.Encoding]::GetEncoding(28591)
+    # Real key material or a real token value, not a mere mention of the words in source code or documentation.
+    $pattern = '-----BEGIN [A-Z ]*PRIVATE KEY-----\s*[A-Za-z0-9+/=]{20}|"(operator|agent)_token"\s*:\s*"[A-Za-z0-9_\-]{3,}"'
+    $hasSecret = {
+        param([byte[]]$Bytes)
+        $t = $latin1.GetString($Bytes)
+        return (($t -match $pattern) -or (($t.Replace([string][char]0, '')) -match $pattern))
+    }
+    foreach ($f in @(Get-ChildItem -LiteralPath $rootFull -Recurse -Force -File -ErrorAction SilentlyContinue)) {
+        $rel = $f.FullName.Substring($rootFull.Length).TrimStart('\')
+        $parts = $rel -split '\\'
+        $skip = ($parts.Count -gt 1) -and ($parts[0] -in 'cases', 'devices', 'python')
+        if ($f.Name -in 'ca-key.pem', 'server-key.pem', 'token-server.json') { $found.Add("$($f.FullName) (secret file name)"); continue }
+        if ($skip -or $f.Length -ge 65536) { continue }
+        try {
+            $bytes = [IO.File]::ReadAllBytes($f.FullName)
+            if (& $hasSecret $bytes) { $found.Add("$($f.FullName) (contains a private key or a token)"); continue }
+            if ($f.Extension -ieq '.zip') {
+                Add-Type -AssemblyName System.IO.Compression.FileSystem
+                $z = [IO.Compression.ZipFile]::OpenRead($f.FullName)
+                try {
+                    foreach ($e in $z.Entries) {
+                        if ($e.Name -in 'ca-key.pem', 'server-key.pem', 'token-server.json') { $found.Add("$($f.FullName) (zip holds $($e.Name))"); break }
+                        if ($e.Length -gt 0 -and $e.Length -lt 65536) {
+                            $ms = New-Object IO.MemoryStream
+                            $s = $e.Open()
+                            try { $s.CopyTo($ms) } finally { $s.Dispose() }
+                            if (& $hasSecret $ms.ToArray()) { $found.Add("$($f.FullName) (zip member $($e.FullName) holds a private key or a token)"); break }
+                        }
+                    }
+                } finally { $z.Dispose() }
+            }
+        } catch { }
+    }
+    return $found.ToArray()
+}
+
+if ($CheckOnly) {
+    if (-not (Test-Path -LiteralPath $CheckOnly -PathType Container)) { Write-Host "Not a folder: $CheckOnly"; exit 2 }
+    $bad = @(Find-SecretFiles $CheckOnly)
+    if ($bad.Count -gt 0) {
+        Write-Host 'Secret files found:'
+        $bad | ForEach-Object { Write-Host "  $_" }
+        exit 1
+    }
+    Write-Host "No secret files found in $CheckOnly"
+    exit 0
+}
+
 # --- destination checks ------------------------------------------------------
 $destFull = [IO.Path]::GetFullPath($Destination)
 $root = [IO.Path]::GetPathRoot($destFull)          # always ends with a backslash, e.g. D:\
@@ -173,10 +235,14 @@ foreach ($d in 'recoverykit', 'python') {
         Invoke-Robo (Join-Path $Project $d) (Join-Path $destFull $d) -Purge:$allowPurge
     }
 }
-foreach ($d in 'lib', 'config', 'tools', 'docs', 'plugins') {
+foreach ($d in 'lib', 'tools', 'docs', 'plugins') {
     if (Test-Path -LiteralPath (Join-Path $Project $d)) {
         Invoke-Robo (Join-Path $Project $d) (Join-Path $destFull $d)
     }
+}
+# config\ by allowlist: only these files; the CA certificate comes from step 3
+if (Test-Path -LiteralPath (Join-Path $Project 'config')) {
+    Invoke-Robo (Join-Path $Project 'config') (Join-Path $destFull 'config') -Files @('kit.toml', 'assistant.toml')
 }
 
 if ($WhatIfPreference) { Write-Host 'WhatIf: nothing changed.'; return }
@@ -193,17 +259,17 @@ if (-not (Test-Path -LiteralPath $caCertSrc)) {
     if ($LASTEXITCODE -ne 0) { throw "New-ItworkCertificates.ps1 -CaOnly failed (exit $LASTEXITCODE)" }
 }
 if (-not (Test-Path -LiteralPath $caCertSrc)) { throw "No CA certificate at $caCertSrc" }
+if ([IO.File]::ReadAllText($caCertSrc) -match 'PRIVATE KEY') { throw "$caCertSrc contains a PRIVATE KEY block: refusing to put it on a stick. It must hold the CA certificate only." }
 $cfgDest = Join-Path $destFull 'config'
 New-Item -ItemType Directory -Force -Path $cfgDest | Out-Null
 Copy-Item -LiteralPath $caCertSrc -Destination (Join-Path $cfgDest 'ca-cert.pem') -Force
 $caFp = (Get-FileHash -LiteralPath (Join-Path $cfgDest 'ca-cert.pem') -Algorithm SHA256).Hash.ToLowerInvariant()
 Write-Host "CA certificate copied to $cfgDest\ca-cert.pem (file SHA-256 $caFp)"
 
-# Final check: no private key and no token file may be on the stick.
-$secretFiles = @(Get-ChildItem -LiteralPath $destFull -Recurse -Force -File -ErrorAction SilentlyContinue |
-    Where-Object { $_.Name -in 'ca-key.pem', 'server-key.pem', 'token-server.json' })
+# Final check, by content (and by name): no private key and no token may be on the stick.
+$secretFiles = @(Find-SecretFiles $destFull)
 if ($secretFiles.Count -gt 0) {
-    throw ("Secret files found on the stick, remove them: " + (($secretFiles | ForEach-Object { $_.FullName }) -join '; '))
+    throw ("Secret files found on the stick, remove them: " + ($secretFiles -join '; '))
 }
 
 # --- 4. version stamp --------------------------------------------------------

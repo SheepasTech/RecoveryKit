@@ -181,6 +181,8 @@ def _event_logs(ctx, sec):
                         st["records_matched"], st["records_seen"], why)
                     if st["errors"] or st["chunks_bad"]:
                         exp_txt += "; %d damaged chunk(s), %d error(s)" % (st["chunks_bad"], len(st["errors"]))
+                    if st.get("truncated"):
+                        exp_txt += "; stopped early: %s" % st["truncated"]
                 except (evtx.EvtxError, OSError) as ex:
                     exp_txt += "; built-in reader failed: %s" % ex
         if e["status"] == "ok" or exp_ok:

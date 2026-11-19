@@ -180,8 +180,16 @@ async function main() {
   });
 
   await step("c. pairing input survives auto-refresh; Pair", async () => {
-    const half = fx.pairing_code.slice(0, 3), rest = fx.pairing_code.slice(3);
+    check(/^[A-HJ-NP-Z2-9]{5}-[A-HJ-NP-Z2-9]{5}$/.test(fx.pairing_code), "pairing code format: " + fx.pairing_code);
+    // typed the way people do: lower case, no dash (the input also takes the dashed form: 11 characters)
+    const typed = fx.pairing_code.replace("-", "").toLowerCase();
+    const half = typed.slice(0, 3), rest = typed.slice(3);
     const inp = "document.getElementById('pc-" + aid + "')";
+    const attrs = await ev("(function(){var i=" + inp + ";return [i.maxLength,i.autocomplete,i.getAttribute('autocapitalize'),i.spellcheck];})()");
+    check(attrs[0] === 11 && attrs[1] === "off" && attrs[2] === "characters" && attrs[3] === false, "pairing input attributes: " + q(attrs));
+    await ev("(function(){var i=" + inp + ";i.value=" + q(fx.pairing_code) + ";})()");
+    check((await ev(inp + ".value")) === fx.pairing_code, "the dashed code (11 characters) was cut: " + await ev(inp + ".value"));
+    await ev("(function(){var i=" + inp + ";i.value='';})()");
     await ev("(function(){var i=" + inp + ";i.focus();i.value=" + q(half) + ";i.dispatchEvent(new Event('input',{bubbles:true}));})()");
     const before = reqLog.filter((u) => u.endsWith("/api/v1/agents")).length;
     await sleep(6000);

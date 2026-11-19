@@ -9,6 +9,7 @@ skipped. `EvtxError` is raised only when the file cannot be opened or is not an 
 import heapq
 import mmap
 import struct
+import time
 from datetime import datetime, timedelta, timezone
 
 FILE_MAGIC = b"ElfFile\x00"
@@ -22,6 +23,10 @@ MAX_RECORDS = 2000000
 MAX_DATA = 10
 MAX_STEPS = 100000      # per-record work budget (tokens, elements, attributes, substitutions)
 MAX_DATA_LEN = 300
+MAX_TEXT = 64 * 1024        # characters materialised for one element's text
+MAX_RECORD_CHARS = 1000000  # characters one record may build while substitutions are resolved
+MAX_FILE_STEPS = 20000000   # work budget of a whole file (all records of all chunks)
+MAX_FILE_SECONDS = 60.0     # wall clock budget of a whole file
 LEVEL_NAMES = {0: "LogAlways", 1: "Critical", 2: "Error", 3: "Warning", 4: "Information", 5: "Verbose"}
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
@@ -38,6 +43,29 @@ class _BinXmlError(Exception):
     pass
 
 
+class _RecordBudget(_BinXmlError):
+    """One record used up its own work or size budget."""
+
+
+class _FileBudget(Exception):
+    """The per-file budget (steps or wall clock) is used up: stop reading the file."""
+
+
+class _Budget:
+    """Work done for one file; shared by all of its chunks."""
+
+    def __init__(self):
+        self.steps = 0
+        self.deadline = time.monotonic() + MAX_FILE_SECONDS
+        self.calls = 0
+
+    def check(self):
+        if self.steps > MAX_FILE_STEPS:
+            raise _FileBudget("work budget of %d steps for the file used up" % MAX_FILE_STEPS)
+        if time.monotonic() > self.deadline:
+            raise _FileBudget("time budget of %d s for the file used up" % MAX_FILE_SECONDS)
+
+
 def _filetime(v):
     try:
         return (_EPOCH + timedelta(seconds=v // 10000000 - 11644473600)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -52,8 +80,24 @@ class _El:
         self.name, self.attrs, self.kids = name, {}, []
 
 
-def _text(el):
-    return "".join(k if isinstance(k, str) else _text(k) for k in el.kids)
+def _text(el, limit=MAX_TEXT):
+    """Text of an element, at most `limit` characters."""
+    out, n = [], 0
+
+    def walk(e):
+        nonlocal n
+        for k in e.kids:
+            if n >= limit:
+                return
+            if isinstance(k, str):
+                k = k[:limit - n]
+                out.append(k)
+                n += len(k)
+            else:
+                walk(k)
+
+    walk(el)
+    return "".join(out)
 
 
 def _hex(b):
@@ -120,16 +164,30 @@ def _value_text(vt, b):
 class _Chunk:
     """Parser state for one 64 KiB chunk (offsets in BinXml are relative to the chunk start)."""
 
-    def __init__(self, buf):
+    def __init__(self, buf, budget=None):
         self.buf = buf
         self.names = {}
         self.defs = {}
+        self.bad_defs = set()   # template definitions that used up a record's budget: later uses fail fast
         self.steps = 0
+        self.chars = 0
+        self.budget = budget
 
     def tick(self, n=1):
         self.steps += n
+        b = self.budget
+        if b is not None:
+            b.steps += n
+            b.calls += 1
+            if not b.calls & 1023:
+                b.check()
         if self.steps > MAX_STEPS:
-            raise _BinXmlError("record exceeds the work budget (%d steps)" % MAX_STEPS)
+            raise _RecordBudget("record exceeds the work budget (%d steps)" % MAX_STEPS)
+
+    def add_chars(self, n):
+        self.chars += n
+        if self.chars > MAX_RECORD_CHARS:
+            raise _RecordBudget("record builds more than %d characters" % MAX_RECORD_CHARS)
 
     # -- names
     def _name(self, ref, pos):
@@ -251,9 +309,15 @@ class _Chunk:
                 raise _BinXmlError("template definition outside chunk")
             size = struct.unpack_from("<I", buf, def_off + 20)[0]
             nxt = pos
+        if def_off in self.bad_defs:
+            raise _RecordBudget("template definition at 0x%x already exceeded the work budget" % def_off)
         defn = self.defs.get(def_off)
         if defn is None:
-            defn = self.parse_stream(def_off + 24, def_off + 24 + size, depth + 1)
+            try:
+                defn = self.parse_stream(def_off + 24, def_off + 24 + size, depth + 1)
+            except _RecordBudget:
+                self.bad_defs.add(def_off)
+                raise
             self.defs[def_off] = defn
         pos = nxt
         cnt = struct.unpack_from("<I", buf, pos)[0]
@@ -268,7 +332,7 @@ class _Chunk:
             pos += size
         if pos > len(buf):
             raise _BinXmlError("substitution values outside chunk")
-        return ("i", defn, vals), pos
+        return ("i", defn, vals, def_off), pos
 
     # -- resolving substitutions into elements
     def resolve(self, nodes, subs, depth, out):
@@ -278,6 +342,7 @@ class _Chunk:
             self.tick()
             k = n[0]
             if k == "t":
+                self.add_chars(len(n[1]))
                 out.append(n[1])
             elif k == "e":
                 el = _El(n[1])
@@ -295,9 +360,17 @@ class _Chunk:
                     self.tick(max(1, size // 8))
                     self.resolve(self.parse_stream(off, off + size, depth + 1), None, depth + 1, out)
                 elif vt != 0 and size:
-                    out.append(_value_text(vt, bytes(self.buf[off:off + size])))
+                    txt = _value_text(vt, bytes(self.buf[off:off + size]))
+                    self.add_chars(len(txt))
+                    out.append(txt)
             else:
-                self.resolve(n[1], n[2], depth + 1, out)
+                if n[3] in self.bad_defs:
+                    raise _RecordBudget("template definition at 0x%x already exceeded the work budget" % n[3])
+                try:
+                    self.resolve(n[1], n[2], depth + 1, out)
+                except _RecordBudget:
+                    self.bad_defs.add(n[3])
+                    raise
 
 
 def _collect(el, out):
@@ -331,16 +404,16 @@ def _event_from(tree, record_id, ft):
                     except ValueError:
                         pass
                 elif s.name == "Provider":
-                    ev["provider"] = s.attrs.get("Name", "")
+                    ev["provider"] = s.attrs.get("Name", "")[:MAX_DATA_LEN]
                 elif s.name in ("EventID", "Level"):
                     try:
                         ev["event_id" if s.name == "EventID" else "level"] = int(_text(s).strip() or 0)
                     except ValueError:
                         pass
                 elif s.name == "Channel":
-                    ev["channel"] = _text(s).strip()
+                    ev["channel"] = _text(s).strip()[:MAX_DATA_LEN]
                 elif s.name == "Computer":
-                    ev["computer"] = _text(s).strip()
+                    ev["computer"] = _text(s).strip()[:MAX_DATA_LEN]
         elif k.name in ("EventData", "UserData"):
             _collect(k, ev["data"])
     return ev
@@ -395,6 +468,7 @@ def read_events(path, levels=(1, 2, 3), limit=200, newest_first=True):
             hdr_chunks = struct.unpack_from("<H", m, 0x2A)[0]
             levels = set(levels)
             found = _Keep(limit, newest_first)
+            budget = _Budget()
             pos, idx = HEADER_SIZE, 0
             while pos < len(m) and stats["records_seen"] < MAX_RECORDS:
                 buf = m[pos:pos + CHUNK_SIZE]
@@ -409,7 +483,13 @@ def read_events(path, levels=(1, 2, 3), limit=200, newest_first=True):
                     continue
                 stats["chunks"] += 1
                 try:
-                    bad = _read_chunk(buf, idx - 1, levels, found, stats, err)
+                    budget.check()
+                    bad = _read_chunk(buf, idx - 1, levels, found, stats, err, budget)
+                except _FileBudget as e:
+                    stats["truncated"] = str(e)
+                    stats["chunks_bad"] += 1
+                    err("chunk %d: stopped, %s" % (idx - 1, e))
+                    break
                 except Exception as e:
                     bad = True
                     err("chunk %d: %s: %s" % (idx - 1, type(e).__name__, e))
@@ -423,10 +503,10 @@ def read_events(path, levels=(1, 2, 3), limit=200, newest_first=True):
     return events, stats
 
 
-def _read_chunk(buf, idx, levels, found, stats, err):
+def _read_chunk(buf, idx, levels, found, stats, err, budget=None):
     """Parse the records of one chunk. Returns True when something in it was damaged."""
     bad = False
-    chunk = _Chunk(buf)
+    chunk = _Chunk(buf, budget)
     free = struct.unpack_from("<I", buf, 0x30)[0] if len(buf) >= 0x34 else 0
     if free < FIRST_REC or free > len(buf):
         free = len(buf)
@@ -450,12 +530,17 @@ def _read_chunk(buf, idx, levels, found, stats, err):
         stats["records_seen"] += 1
         try:
             chunk.steps = 0
+            chunk.chars = 0
+            if budget is not None:
+                budget.check()
             nodes = chunk.parse_stream(off + 24, off + size - 4, 0)
             tree = []
             chunk.resolve(nodes, None, 0, tree)
             ev = _event_from(tree, rid, ft)
             if ev["level"] in levels:
                 found.append(ev)
+        except _FileBudget:
+            raise
         except Exception as e:
             bad = True
             err("chunk %d record %d: %s: %s" % (idx, rid, type(e).__name__, e))

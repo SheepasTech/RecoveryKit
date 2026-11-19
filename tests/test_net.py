@@ -284,7 +284,7 @@ class ServerAndAgent(Base):
         status, headers, data = post("/agent/v1/poll", {"agent_id": "aaaa1111", "n": 2, "nonce": "n2", "wait": 0})
         self.assertEqual(status, 200)
         self.assertEqual(net._unpack(headers["X-RK-Meta"])["nonce"], "n2")            # answer bound to our nonce
-        self.assertEqual(headers["X-RK-Sig"], net._sig(token, "/agent/v1/poll", headers["X-RK-Meta"], data))
+        self.assertEqual(headers["X-RK-Sig"], net._sig(token, "/agent/v1/poll", headers["X-RK-Meta"], data, "resp"))
         for _ in range(5):                                                            # pairing code guessing is capped
             self.assertEqual(self.api("POST", "/agents/aaaa1111/pair", {"code": "123456"})[0], 403)
         self.assertEqual(self.api("POST", "/agents/aaaa1111/pair", {"code": "123456"})[0], 429)

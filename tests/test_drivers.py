@@ -134,11 +134,12 @@ class InventoryTests(Base):
         self.assertIn("Access is denied", d["error"])
         self.assertIsNotNone(d["installed"])
 
-    def test_oversized_file_is_an_error_entry(self):
+    def test_oversized_file_is_skipped_not_an_error_entry(self):
         with open(os.path.join(self.infdir, "oem9.inf"), "wb") as f:
             f.write(b"x" * (drivers.MAX_INF_BYTES + 10))
         d = next(x for x in drivers.inventory(self.windir) if x["inf"] == "oem9.inf")
-        self.assertIn("larger", d["error"])
+        self.assertEqual(d["skipped"], "larger than 2 MB")
+        self.assertNotIn("error", d)
 
     def test_missing_folder_raises(self):
         with self.assertRaises(OSError):

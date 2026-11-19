@@ -167,7 +167,7 @@ class ReportSafety(unittest.TestCase, Structure):
                                     "exit_code": 0}])
         for fact in ("Windows 11 Home", "10.0.26100.8875", "Samsung SSD 970 EVO 500GB", "en-US, lt-LT",
                      "Intel Core i5-12400", "`C:\\`", "`C:\\Windows\\System32\\sfc.exe /scannow`",
-                     "`D:\\sources\\install.wim`", "`AAAA-BBBB`", "40.0 GB free of 100.0 GB \\(40%\\)".replace("\\(", "(").replace("\\)", ")")):
+                     "`D:\\sources\\install.wim`", "`AAAA-BBBB`", "40.0 GB free of 100.0 GB (40\\%)"):
             self.assertIn(fact, out)
         self.assertIn("# RecoveryKit case ITW-4242-ab12cd34", out)
 
@@ -186,7 +186,8 @@ class MdsafeUnits(unittest.TestCase):
         self.assertEqual(mdsafe.text("", empty="-"), "-")
 
     def test_code(self):
-        self.assertEqual(mdsafe.code("a`b|c\nd"), "`a'b/c d`")
+        self.assertEqual(mdsafe.code("a`b|c\nd"), "`a'b|c d`")
+        self.assertEqual(mdsafe.code("a`b|c\nd", table=True), "`a'b\\|c d`")
         self.assertEqual(mdsafe.code("C:\\Windows"), "`C:\\Windows`")
         self.assertEqual(mdsafe.code(None, empty="-"), "-")
         self.assertEqual(mdsafe.code("y" * 50, 10), "`" + "y" * 7 + "...`")
@@ -304,7 +305,9 @@ class EngineHardening(Base):
         self.assertIn("<hidden>", res["output"])
 
     def test_relayed_repair_source_path_rules(self):
-        for path in (chr(92) * 2 + 'host' + chr(92) + 'share' + chr(92) + 'install.wim', '//host/share/install.wim'):
+        for path in (chr(92) * 2 + 'host' + chr(92) + 'share' + chr(92) + 'install.wim', '//host/share/install.wim',
+                     chr(92) + '/host' + chr(92) + 'share' + chr(92) + 'install.wim',
+                     '/' + chr(92) + 'host/share/install.wim', chr(92) * 2 + '?' + chr(92) + 'UNC' + chr(92) + 'h' + chr(92) + 's' + chr(92) + 'x.wim'):
             self.assertEqual(self.call('POST', '/repair/source', {'path': path}, remote=True)[0], 403, path)
         for path in ('D:/a' + chr(10) + 'b.wim', 'D:/a' + chr(27) + '[2J.wim', 'D:/a' + chr(0) + '.wim', 'D:/a' + chr(13) + 'b.wim'):
             self.assertEqual(self.call('POST', '/repair/source', {'path': path}, remote=True)[0], 400, repr(path))
@@ -338,6 +341,86 @@ class EngineHardening(Base):
             t.join(30)
         self.assertEqual(bad, [])
         self.assertGreater(self.reads, 10)
+
+
+class ThirdReviewMarkdown(unittest.TestCase):
+    """Third review 2026-11-19: S1, S2, S3, N13, N14 (report part)."""
+
+    @staticmethod
+    def unescaped_pipes(line):
+        return len(re.findall(r"(?<!\\)\|", line))
+
+    def test_percent_comments_cannot_hide_text_between_two_fields(self):       # S1
+        out = report.render(case("%%hidden%%"), audit("%%hidden%%"))
+        for ln in out.split("\n"):
+            self.assertIsNone(re.search(r"(?<!\\)%", outside_code(ln)), ln)    # every % in prose/cells is escaped
+        self.assertIn("- hidden: hidden", out.replace("\\%\\%hidden\\%\\%", "hidden"))
+        self.assertEqual(mdsafe.text("a %%b%% c"), "a \\%\\%b\\%\\% c")
+        self.assertEqual(mdsafe.text("40%"), "40\\%")
+
+    def test_dataview_and_templater_in_code_spans(self):                       # S2
+        for v in ("= this.file.path", "$= dv.current()", "  = x"):
+            self.assertTrue(mdsafe.code(v).startswith("`'"), mdsafe.code(v))
+        self.assertEqual(mdsafe.code("= this.file.path"), "`'= this.file.path`")
+        self.assertEqual(mdsafe.code("<% tp.file.title %>"), "`< % tp.file.title %>`")
+        out = report.render(case("= this.file.path"), audit("$= dv.current()"))
+        self.assertNotIn("`=", out)
+        self.assertNotIn("`$=", out)
+        out = report.render(case("<% tp.file.title %>"), audit("<% tp.file.title %>"))
+        self.assertNotIn("<%", out)
+
+    def test_bidi_zero_width_bom_and_surrogates_are_dropped(self):             # S3
+        for ch in ("‮", "​", "‍", "﻿", "⁦", ""):
+            self.assertEqual(mdsafe.text("a%sb" % ch), "ab", hex(ord(ch)))
+            self.assertEqual(mdsafe.code("a%sb" % ch), "`ab`", hex(ord(ch)))
+        self.assertEqual(mdsafe.text("a\ud800b"), "a�b")
+        self.assertEqual(mdsafe.code("a\udfffb"), "`a�b`")
+        v = "x‮​﻿\ud800y"
+        out = report.render(case(v), audit(v))
+        for ch in ("‮", "​", "﻿", "\ud800"):
+            self.assertNotIn(ch, out)
+        out.encode("utf-8")                                                    # writable as strict UTF-8
+
+    def test_horizontal_rule_value_in_a_list_item(self):
+        for v in ("---", "***", "___", "----", "---x"):
+            t = mdsafe.text(v)
+            self.assertNotIn(t[:3], ("---", "***", "___"), v)
+            self.assertTrue(t.startswith("\\"), t)
+        data = case("X")
+        data["operator_answers"] = {"symptom": "---"}
+        out = report.render(data, [])
+        self.assertIn("- What happens at boot: \\---", out)
+
+    def test_pipe_in_a_command_keeps_the_table_and_the_pipe(self):             # N13
+        cmd = "Get-PhysicalDisk | Select-Object FriendlyName"
+        out = report.render(case("X"), [{"seq": 1, "kind": "read", "command": cmd, "exit_code": 0}])
+        lines = out.split("\n")
+        i = next(n for n, ln in enumerate(lines) if ln.startswith("| # | Kind | Command"))
+        header, row = lines[i], lines[i + 2]
+        self.assertIn("Get-PhysicalDisk \\| Select-Object FriendlyName", row)   # shown with its pipe, not a slash
+        self.assertNotIn("Get-PhysicalDisk / Select-Object", row)
+        self.assertEqual(self.unescaped_pipes(row), self.unescaped_pipes(header))
+        self.assertEqual(mdsafe.code(cmd), "`%s`" % cmd)                      # outside a table the pipe is as typed
+
+    def test_device_index_pipe_in_id_keeps_the_table(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = os.path.join(tmp, "A_B")
+            os.makedirs(d)
+            with open(os.path.join(d, "device.json"), "w", encoding="utf-8") as f:
+                json.dump({"id": "A|B", "segments": [], "runs": []}, f)
+            device._write_index(tmp)
+            with open(os.path.join(tmp, "index.md"), encoding="utf-8") as f:
+                lines = f.read().split("\n")
+        rows = [ln for ln in lines if ln.startswith("|")]
+        self.assertGreater(len(rows), 2)
+        self.assertEqual(len({self.unescaped_pipes(r) for r in rows}), 1, rows)
+        self.assertIn("A\\|B", rows[-1])
+
+    def test_none_evidence_prints_absent(self):                                # N14
+        data = case("X")
+        data["sections"]["assistant"]["data"]["suggestions"][0]["evidence"] = {"booted": None}
+        out = report.render(data, [])
+        self.assertIn("booted = absent", out)
 
 
 if __name__ == "__main__":

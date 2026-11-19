@@ -80,7 +80,7 @@ class ServerCase(unittest.TestCase):
 class FakeAgent:
     """An agent speaking the wire protocol by hand; answers relayed jobs from a table path -> (status, ctype, bytes)."""
 
-    code = "123456"
+    code = "K7QF4-M2XWP"
 
     def __init__(self, t, answers=None, aid=None):
         self.t, self.answers, self.aid, self.n = t, answers or {}, aid or secrets.token_hex(4), 0
@@ -99,7 +99,7 @@ class FakeAgent:
 
     def hello(self):
         return self.call(HELLO, {"name": "fake", "code_hash": hashlib.sha256(
-            ("%s|%s" % (self.code, self.aid)).encode()).hexdigest()})
+            ("%s|%s" % (self.code.replace("-", ""), self.aid)).encode()).hexdigest()})
 
     def pair(self):
         """hello, the operator's pairing, and the first poll that tells this agent to switch to the session key."""
@@ -164,7 +164,8 @@ class HttpFraming(ServerCase):
         with mock.patch.object(net._Handler, "timeout", 0.5):
             s = socket.create_connection(("127.0.0.1", self.port), timeout=10)
             try:
-                s.sendall(b"POST /api/v1/agents HTTP/1.1\r\nContent-Length: 100\r\n\r\nabc")   # then silence
+                s.sendall(b"POST /api/v1/agents HTTP/1.1\r\nAuthorization: Bearer " +
+                          self.server.tokens["operator_token"].encode() + b"\r\nContent-Length: 100\r\n\r\nabc")   # then silence
                 t0 = time.monotonic()
                 self.assertEqual(s.recv(100), b"")                  # the server closed it
                 self.assertLess(time.monotonic() - t0, 8)
@@ -187,7 +188,7 @@ class AgentProtocol(ServerCase):
             self.assertEqual(self.post(HELLO, dict(meta, n=n), tok=victim.key)[0], want, n)
         status, headers, data = self.post(HELLO, dict(meta, n=50), tok=victim.key)
         self.assertEqual(status, 409)
-        self.assertEqual(headers["X-RK-Sig"], net._sig(victim.key, HELLO, headers["X-RK-Meta"], data))   # signed reply
+        self.assertEqual(headers["X-RK-Sig"], net._sig(victim.key, HELLO, headers["X-RK-Meta"], data, "resp"))   # signed reply
         a = self.server.agents[victim.aid]
         self.assertTrue(a["paired"])
         self.assertEqual((a["n"], a["name"]), (before["n"], "fake"))
@@ -285,7 +286,7 @@ class SessionKey(ServerCase):
         before = self.snapshot(ag)
         status, headers, data = self.post(POLL, {"agent_id": victim.aid, "n": 99999, "nonce": "z", "wait": 0})
         self.assertEqual((status, json.loads(data)), (200, {"paired": True, "switch": True}))   # no job, signed with the token
-        self.assertEqual(headers["X-RK-Sig"], net._sig(self.token, POLL, headers["X-RK-Meta"], data))
+        self.assertEqual(headers["X-RK-Sig"], net._sig(self.token, POLL, headers["X-RK-Meta"], data, "resp"))
         self.assertEqual(self.snapshot(ag), before)
         self.assertEqual(self.post(RESULT, {"agent_id": victim.aid, "n": 99999, "nonce": "z", "job_id": "j1"}, b"{}")[0], 401)
         self.assertEqual(self.post(HELLO, {"agent_id": victim.aid, "n": 99999, "nonce": "z"})[0], 401)
@@ -341,7 +342,7 @@ class AgentTable(ServerCase):
         extra = FakeAgent(self, aid="eeeeeeee")
         status, headers, data = self.post(HELLO, {"agent_id": "eeeeeeee", "n": 1, "nonce": "q", "name": "x"})
         self.assertEqual(status, 429)
-        self.assertEqual(headers["X-RK-Sig"], net._sig(self.token, HELLO, headers["X-RK-Meta"], data))
+        self.assertEqual(headers["X-RK-Sig"], net._sig(self.token, HELLO, headers["X-RK-Meta"], data, "resp"))
         self.assertEqual(len(self.server.agents), 64)
         self.assertIn(ids[0], self.server.agents)                      # nobody was evicted
         self.server.agents[ids[5]]["last_seen"] -= net.STALE_UNPAIRED + 1
@@ -497,7 +498,7 @@ class HeadAuth(ServerCase):
 
     def test_connection_cap_gives_503_at_once_and_frees_up(self):
         srv = net.Server(self.kit, os.path.join(self.tmp, "store3"), None, say=lambda m: None)
-        url = srv.start("127.0.0.1", 0, max_conn=3)
+        url = srv.start("127.0.0.1", 0, max_conn=3, reserve=0)
         self.addCleanup(srv.stop)
         port = srv.httpd.server_address[1]
         idle = [socket.create_connection(("127.0.0.1", port), timeout=5) for _ in range(3)]
@@ -982,6 +983,496 @@ class SecretsStayOutOfLogs(Base):
         self.assertNotIn(server.tokens["agent_token"], log)
         self.assertIn("pairing code shown on the console", log)
         self.assertTrue(any("--pin is ignored" in l for l in self.engine.ctx.ui.lines))
+
+
+# ------------------------------------------------------------------ round 3: pairing code, MAC labels, operator API, results
+def agent_engine():
+    return types.SimpleNamespace(ctx=types.SimpleNamespace(ui=QuietUI(), case=types.SimpleNamespace(data={})),
+                                 allow_remote_repairs=False)
+
+
+def start_connect(t, eng, **kw):
+    """net.connect in a thread; returns (got, stop, thread, result)."""
+    got, stop, result = {}, threading.Event(), {}
+
+    def run():
+        try:
+            result["reason"] = net.connect(eng, t.url, t.token, minutes=1, stop=stop,
+                                           on_code=lambda i, c: got.update(id=i, code=c), **kw)
+        except Exception as e:  # noqa: BLE001
+            result["error"] = e
+    th = threading.Thread(target=run)
+    th.start()
+    t.addCleanup(lambda: (stop.set(), th.join(15)))
+    for _ in range(100):
+        if got or result:
+            break
+        time.sleep(0.05)
+    return got, stop, th, result
+
+
+class PairingCode(ServerCase):
+    ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+    def test_generated_codes_use_the_unambiguous_alphabet(self):
+        self.assertEqual(net.PAIR_ALPHABET, self.ALPHABET)
+        for ch in "IO01":
+            self.assertNotIn(ch, net.PAIR_ALPHABET)
+        seen = set()
+        for _ in range(300):
+            c = net._new_code()
+            self.assertRegex(c, r"^[A-HJ-NP-Z2-9]{10}$")
+            self.assertRegex(net._show_code(c), r"^[A-HJ-NP-Z2-9]{5}-[A-HJ-NP-Z2-9]{5}$")
+            seen.add(c)
+        self.assertGreater(len(seen), 290)                       # random, not a counter or a constant
+
+    def test_connect_shows_the_grouped_code_and_it_pairs(self):
+        got, stop, th, result = start_connect(self, agent_engine())
+        self.assertRegex(got["code"], r"^[A-HJ-NP-Z2-9]{5}-[A-HJ-NP-Z2-9]{5}$")
+        self.assertEqual(self.api("POST", "/agents/%s/pair" % got["id"], {"code": got["code"]})[0], 200)
+
+    def test_every_spelling_of_the_code_pairs_and_nothing_else_is_mapped(self):
+        for typed in ("k7qf4-m2xwp", "K7QF4M2XWP", " k7qf4 m2xwp ", "K7QF4-M2XWP", "k7Qf4 - m2xWp"):
+            a = FakeAgent(self)
+            a.hello()
+            self.assertEqual(self.api("POST", "/agents/%s/pair" % a.aid, {"code": typed})[0], 200, typed)
+        a = FakeAgent(self)
+        a.hello()
+        for wrong in ("K7QF4-M2XWO", "K7QF4-M2XW0", "K7QF4-M2XWP1", "K7QF4", ""):   # O/0 are not mapped to anything
+            self.assertEqual(self.api("POST", "/agents/%s/pair" % a.aid, {"code": wrong})[0], 403, wrong)
+
+    def test_key_derivations_use_the_normalised_ten_characters(self):
+        k = net._session_key(self.token, "aabbccdd", "K7QF4M2XWP")
+        for typed in ("k7qf4-m2xwp", "K7QF4-M2XWP", " k7qf4 m2xwp"):
+            self.assertEqual(net._session_key(self.token, "aabbccdd", typed), k)
+            self.assertEqual(net._code_hash(typed, "aabbccdd"), net._code_hash("K7QF4M2XWP", "aabbccdd"))
+        self.assertEqual(net._code_hash("K7QF4M2XWP", "aabbccdd"),
+                         hashlib.sha256(b"K7QF4M2XWP|aabbccdd").hexdigest())
+        self.assertNotEqual(net._session_key(self.token, "aabbccdd", "K7QF4M2XWQ"), k)
+
+    def test_ctl_pair_normalises_the_code(self):
+        sent = []
+
+        def fake(url, method="GET", body=b"", headers=None, **kw):
+            sent.append(json.loads(body))
+            return 200, {"Content-Type": "application/json"}, b'{"paired": true}'
+        with mock.patch.object(net, "_request", fake):
+            net.ctl(self.tmp, ["--url", "http://127.0.0.1:1", "--token", "t", "pair", "aabbccdd", "k7qf4-m2xwp"], lambda m: None)
+        self.assertEqual(sent, [{"code": "K7QF4M2XWP"}])
+
+
+class BadMacRevocation(ServerCase):
+    def bad(self, aid, n, kind):
+        """One message for agent id `aid` with a wrong MAC. kind: head (wrong X-RK-Head) or sig (right head, wrong sig)."""
+        meta = {"agent_id": aid, "n": n, "nonce": "z", "wait": 0}
+        m = net._pack(meta)
+        hdr = net._signed_headers("not-the-key", POLL, m, b"")
+        if kind == "sig":                                     # valid head needs the token while unpaired
+            hdr["X-RK-Head"] = net._head_sig(self.token, POLL, m, 0)
+        return net._request(self.url + POLL, "POST", b"", hdr)[0]
+
+    def test_twenty_bad_macs_revoke_an_existing_agent_with_a_reason(self):
+        a = FakeAgent(self)
+        a.pair()
+        for i in range(19):
+            self.assertEqual(self.bad(a.aid, 100 + i, "head" if i % 2 else "sig"), 401)
+        entry = self.server.agents[a.aid]
+        self.assertFalse(entry["revoked"])
+        self.assertTrue(entry["paired"])
+        self.assertEqual(a.call(POLL, {"wait": 0})[0], 200)       # the real agent is still served at 19
+        self.assertEqual(self.bad(a.aid, 200, "head"), 401)       # a counted bad MAC again: 20
+        listing = {x["id"]: x for x in self.api("GET", "/agents")[1]}[a.aid]
+        self.assertTrue(listing["revoked"])
+        self.assertEqual(listing["revoked_reason"], "too many invalid signatures")
+        self.assertFalse(listing["paired"])
+        self.assertEqual(a.call(POLL, {"wait": 0}), (200, {"revoked": True}))     # the agent is told, signed
+        self.assertEqual(self.api("GET", "/agents/%s/api/status" % a.aid)[0], 409)
+
+    def test_ids_that_do_not_exist_are_not_counted_and_create_nothing(self):
+        for i in range(60):
+            self.assertEqual(self.bad("deadbeef", 1 + i, "head"), 401)
+        self.assertEqual(self.server.agents, {})
+        a = FakeAgent(self)
+        a.hello()
+        self.assertEqual(self.server.agents[a.aid].get("bad_macs", 0), 0)
+
+    def test_good_traffic_never_counts_and_other_agents_are_not_affected(self):
+        a, b = FakeAgent(self), FakeAgent(self)
+        a.pair()
+        b.pair()
+        for i in range(30):
+            self.assertEqual(a.call(POLL, {"wait": 0})[0], 200)
+        for i in range(19):
+            self.bad(b.aid, 100 + i, "head")
+        self.assertFalse(self.server.agents[a.aid]["revoked"])
+        self.assertFalse(self.server.agents[b.aid]["revoked"])
+
+    def test_the_agent_is_told_to_start_a_new_session(self):
+        eng = agent_engine()
+        got, stop, th, result = start_connect(self, eng)
+        self.assertEqual(self.api("POST", "/agents/%s/pair" % got["id"], {"code": got["code"]})[0], 200)
+        for i in range(20):
+            self.bad(got["id"], 5000 + i, "head")
+        th.join(20)
+        self.assertEqual(result.get("reason"), "revoked by the server")
+        self.assertTrue(any("start a new session" in l for l in eng.ctx.ui.lines), eng.ctx.ui.lines)
+
+
+class DirectionLabels(ServerCase):
+    def test_request_and_response_macs_differ_by_label(self):
+        k, m = "key", net._pack({"nonce": "x"})
+        self.assertNotEqual(net._sig(k, POLL, m, b"b"), net._sig(k, POLL, m, b"b", "resp"))
+        self.assertEqual(net._sig(k, POLL, m, b"b"), net._sig(k, POLL, m, b"b", "req"))
+
+    def test_a_reflected_request_is_not_accepted_as_a_response(self):
+        key, nonce = self.token, "n-reflect"
+        meta = net._pack({"agent_id": "aabbccdd", "n": 1, "nonce": nonce})
+        req = net._signed_headers(key, POLL, meta, b"{}")
+        # an attacker answers with the request's own meta, signature and body
+        self.assertFalse(net._reply_ok(key, POLL, req, b"{}", nonce))
+        # a real answer from the server is accepted
+        a = FakeAgent(self)
+        a.hello()
+        m = net._pack({"agent_id": a.aid, "n": 9, "nonce": "n2", "wait": 0})
+        status, headers, data = net._request(self.url + POLL, "POST", b"", net._signed_headers(self.token, POLL, m, b""))
+        self.assertEqual(status, 200)
+        self.assertTrue(net._reply_ok(self.token, POLL, headers, data, "n2"))
+        self.assertFalse(net._reply_ok(self.token, POLL, headers, data, "other-nonce"))
+        self.assertFalse(net._reply_ok("wrong", POLL, headers, data, "n2"))
+        self.assertFalse(net._reply_ok(self.token, HELLO, headers, data, "n2"))            # nor on another path
+        self.assertEqual(headers["X-RK-Sig"], net._sig(self.token, POLL, headers["X-RK-Meta"], data, "resp"))
+        self.assertNotEqual(headers["X-RK-Sig"], net._sig(self.token, POLL, headers["X-RK-Meta"], data, "req"))
+
+    def test_a_server_that_reflects_the_agents_request_is_refused_by_connect(self):
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        class Reflect(BaseHTTPRequestHandler):
+            def do_POST(self):
+                n = int(self.headers.get("Content-Length") or 0)
+                body = self.rfile.read(n)
+                self.send_response(200)
+                for h in ("X-RK-Meta", "X-RK-Sig"):
+                    self.send_header(h, self.headers[h])
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+        httpd = HTTPServer(("127.0.0.1", 0), Reflect)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        eng = agent_engine()
+        with self.assertRaises(net.ProtocolError) as cm:
+            net.connect(eng, "http://127.0.0.1:%d" % httpd.server_address[1], self.token, minutes=1, stop=threading.Event())
+        self.assertIn("not signed", str(cm.exception))
+
+
+class OperatorApiBeforeBody(ServerCase):
+    def head(self, path, cl, token=None, method="POST"):
+        lines = ["%s %s HTTP/1.1" % (method, path), "Host: x", "Content-Length: %d" % cl]
+        if token:
+            lines.append("Authorization: Bearer " + token)
+        return ("\r\n".join(lines) + "\r\n\r\n").encode()
+
+    def test_unauthenticated_posts_announcing_64_mib_get_401_without_a_body_byte(self):
+        import tracemalloc
+        tracemalloc.start()
+        socks = []
+        try:
+            for i in range(8):
+                s = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+                s.sendall(self.head("/api/v1/agents/aabbccdd/pair", net.MAX_BODY, "wrong-token" if i % 2 else None))
+                socks.append(s)                                      # the body is never sent
+            t0 = time.monotonic()
+            for s in socks:
+                buf = b""
+                while b"\r\n\r\n" not in buf:
+                    chunk = s.recv(4096)
+                    self.assertTrue(chunk, "closed without an answer")
+                    buf += chunk
+                self.assertTrue(buf.startswith(b"HTTP/1.1 401"), buf[:40])
+            self.assertLess(time.monotonic() - t0, 3)
+            grown = tracemalloc.get_traced_memory()[1]
+            self.assertLess(grown, 50 * 2**20)
+        finally:
+            tracemalloc.stop()
+            for s in socks:
+                s.close()
+
+    def test_a_valid_token_is_waited_for_and_the_route_still_works(self):
+        s = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        try:
+            s.sendall(self.head("/api/v1/agents/aabbccdd/pair", 100, self.server.tokens["operator_token"]))
+            s.settimeout(1)
+            with self.assertRaises(socket.timeout):               # accepted: the server now waits for the body
+                s.recv(100)
+        finally:
+            s.close()
+        self.assertEqual(self.api("GET", "/status")[0], 200)
+
+    def test_a_get_or_head_with_a_body_is_refused_400(self):
+        tok = self.server.tokens["operator_token"]
+        req = self.head("/api/v1/status", 5, tok, "GET") + b"hello"
+        self.assertEqual(raw_http(self.port, req), (400, True))
+        req = self.head("/", 5, None, "GET") + b"hello"
+        self.assertEqual(raw_http(self.port, req), (400, True))
+        req = self.head("/api/v1/status", 5, tok, "HEAD") + b"hello"
+        self.assertIn(raw_http(self.port, req)[0], (400, 501))   # HEAD is not served at all: never read as a body
+        self.assertEqual(self.api("GET", "/status")[0], 200)
+
+    def test_agent_routes_and_operator_routes_both_keep_working(self):
+        self.assertEqual(FakeAgent(self).hello()[0], 200)
+        self.assertEqual(self.api("GET", "/agents")[0], 200)
+        self.assertEqual(net._request(self.url + net.API + "/agents")[0], 401)
+
+
+class ConnectionLimits(ServerCase):
+    def start(self, **kw):
+        srv = net.Server(self.kit, os.path.join(self.tmp, "store-%d" % len(kw)), None, say=lambda m: None)
+        url = srv.start("127.0.0.1", 0, **kw)
+        self.addCleanup(srv.stop)
+        return url, srv.httpd.server_address[1]
+
+    def idle(self, port, n):
+        socks = [socket.create_connection(("127.0.0.1", port), timeout=5) for _ in range(n)]
+        self.addCleanup(lambda: [s.close() for s in socks])
+        time.sleep(0.3)
+        return socks
+
+    def test_per_address_limit_refuses_the_next_connection_of_the_same_address(self):
+        url, port = self.start(per_addr=3, exempt=(), reserve=0)
+        socks = self.idle(port, 3)
+        self.assertEqual(raw_http(port, b"", wait=5), (503, True))
+        socks.pop().close()                                      # one slot comes back
+        for _ in range(50):
+            try:
+                if net._request(url + "/", timeout=5)[0] == 200:
+                    break
+            except OSError:
+                pass
+            time.sleep(0.1)
+        else:
+            self.fail("the freed slot was never usable")
+
+    def test_the_default_is_eight_per_address_and_loopback_is_exempt(self):
+        self.assertEqual(net.PER_ADDRESS_CONNECTIONS, 8)
+        self.assertEqual(net.LOOPBACK_ADDRS[0], "127.0.0.1")
+        url, port = self.start(per_addr=2)                       # exempt defaults to loopback: 3 idle ones are fine
+        self.idle(port, 3)
+        self.assertEqual(net._request(url + "/", timeout=5)[0], 200)
+
+    def test_loopback_has_a_reserve_above_the_global_cap(self):
+        url, port = self.start(max_conn=2, reserve=3)
+        socks = self.idle(port, 5)                               # 2 + 3 reserved slots
+        self.assertEqual(raw_http(port, b"", wait=5), (503, True))
+        # without loopback being exempt there is no reserve
+        url2, port2 = self.start(max_conn=2, reserve=3, exempt=())
+        self.idle(port2, 2)
+        self.assertEqual(raw_http(port2, b"", wait=5), (503, True))
+
+    def test_the_503_is_delivered_even_when_the_client_already_sent_a_big_request(self):
+        url, port = self.start(max_conn=1, reserve=0)
+        self.idle(port, 1)
+        req = b"POST /api/v1/agents HTTP/1.1\r\nHost: x\r\nContent-Length: 40000\r\n\r\n" + b"x" * 40000
+        self.assertEqual(raw_http(port, req, wait=5), (503, True))
+
+    def test_many_refusals_do_not_leak_threads(self):
+        url, port = self.start(max_conn=1, reserve=0)
+        self.idle(port, 1)
+        base = threading.active_count()
+        for _ in range(40):
+            self.assertEqual(raw_http(port, b"GET / HTTP/1.1\r\n\r\n", wait=5)[0], 503)
+        for _ in range(50):
+            if threading.active_count() <= base + 1:
+                break
+            time.sleep(0.1)
+        self.assertLessEqual(threading.active_count(), base + 1)
+
+
+class ResultDeadline(ServerCase):
+    def raw_post(self, port, path, key, meta, size, early, late, pause):
+        """Headers with a valid head MAC for `size` bytes, then `early` bytes at once, a pause, the rest. Returns the
+        status line's code or None when the server closed without answering."""
+        body_early = b"x" * early
+        body_late = b"x" * late
+        m = net._pack(meta)
+        hdr = {"X-RK-Meta": m, "X-RK-Sig": "0" * 64, "X-RK-Head": net._head_sig(key, path, m, size),
+               "Content-Length": str(size)}
+        req = ("POST %s HTTP/1.1\r\nHost: x\r\n" % path + "".join("%s: %s\r\n" % kv for kv in hdr.items()) + "\r\n").encode()
+        s = socket.create_connection(("127.0.0.1", port), timeout=15)
+        try:
+            s.sendall(req + body_early)
+            time.sleep(pause)
+            try:
+                s.sendall(body_late)
+            except OSError:
+                pass
+            buf = b""
+            try:
+                while True:
+                    chunk = s.recv(65536)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    if b"\r\n\r\n" in buf:
+                        break
+            except OSError:
+                pass
+            return int(buf.split(b" ", 2)[1]) if buf else None
+        finally:
+            s.close()
+
+    def test_the_result_route_gets_one_second_per_mib_other_routes_do_not(self):
+        self.assertEqual(net.RESULT_SECONDS_PER_MIB, 1)
+        srv = net.Server(self.kit, os.path.join(self.tmp, "store-d"), None, say=lambda m: None)
+        srv.start("127.0.0.1", 0, deadline=0.5)                  # tiny base deadline
+        self.addCleanup(srv.stop)
+        port = srv.httpd.server_address[1]
+        size = 4 * 2**20
+        meta = {"agent_id": "aabbccdd", "n": 1, "nonce": "z", "job_id": "j1", "status": 200}
+        tok = srv.tokens["agent_token"]
+        # the last 100 KB arrive 1.2 s late: past the 0.5 s base, well inside 0.5 + 4 s
+        late = self.raw_post(port, RESULT, tok, meta, size, size - 100000, 100000, 1.2)
+        self.assertIsNotNone(late, "an upload slower than the base deadline was cut on the result route")
+        # the same delay on any other route is cut at the base deadline (the connection is closed, no answer)
+        cut = self.raw_post(port, HELLO, tok, dict(meta, name="x"), size, size - 100000, 100000, 1.2)
+        self.assertIsNone(cut)
+
+    def test_a_result_upload_failure_is_answered_with_a_small_502(self):
+        for exc in (ConnectionResetError("connection reset by peer"), socket.timeout("timed out")):
+            with self.subTest(exc=type(exc).__name__):
+                self._upload_fails(lambda orig, exc=exc: self._raise_on_big(orig, exc))
+
+    def test_a_non_200_answer_to_the_result_is_answered_with_a_small_502(self):
+        orig = self.server._result
+
+        def refuse(a, meta, body, nonce, path, key):
+            if len(body) > 1000:
+                return self.server._agent_reply(500, {"error": "disk full"}, nonce, path, key)
+            return orig(a, meta, body, nonce, path, key)
+        self._upload_fails(None, patch_result=refuse, expect="HTTP 500")
+
+    def _raise_on_big(self, orig, exc):
+        def req(url, method="GET", body=b"", *a, **kw):
+            if url.endswith(RESULT) and len(body) > 1000:
+                raise exc
+            return orig(url, method, body, *a, **kw)
+        return req
+
+    def _upload_fails(self, make_request, patch_result=None, expect=None):
+        eng = agent_engine()
+        patches = [mock.patch.object(net, "route", lambda *a, **k: (200, (b"x" * 5000, "application/zip")))]
+        if make_request:
+            patches.append(mock.patch.object(net, "_request", make_request(net._request)))
+        if patch_result:
+            patches.append(mock.patch.object(self.server, "_result", patch_result))
+        with contextlib.ExitStack() as st:
+            for p in patches:
+                st.enter_context(p)
+            got, stop, th, result = start_connect(self, eng)
+            self.assertEqual(self.api("POST", "/agents/%s/pair" % got["id"], {"code": got["code"]})[0], 200)
+            t0 = time.monotonic()
+            status, out = self.api("GET", "/agents/%s/api/bundle/download" % got["id"])
+            self.assertLess(time.monotonic() - t0, 20)            # at once, not after the 1800 s job timeout
+            stop.set()
+            th.join(15)
+        self.assertEqual(status, 502, out)
+        self.assertIn("result upload failed", out["error"])
+        if expect:
+            self.assertIn(expect, out["error"])
+
+
+class CommandLineRound3(unittest.TestCase):
+    def run_main(self, argv):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = main_mod.main(argv)
+        return rc, out.getvalue()
+
+    def free_port(self):
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        return port
+
+    def test_url_normalisation(self):
+        self.assertEqual(net.normalize_url("HTTPS://Host:8765/"), "https://Host:8765")
+        self.assertEqual(net.normalize_url(" Http://10.0.0.1:1 "), "http://10.0.0.1:1")
+        for bad in ("127.0.0.1:9", "ftp://x", "//x", "https://", "http://h:99999", "localhost"):
+            with self.assertRaises(net.UrlError, msg=bad):
+                net.normalize_url(bad)
+
+    def test_pin_normalisation(self):
+        good = "ab" * 32
+        self.assertEqual(net.normalize_pin(good.upper()), good)
+        self.assertEqual(net.normalize_pin(":".join(good[i:i + 2] for i in range(0, 64, 2))), good)
+        for bad in ("zz", "ab" * 31, "ab" * 33, "é" * 64, "g" * 64, ""):
+            with self.assertRaises(ValueError, msg=bad):
+                net.normalize_pin(bad)
+
+    def test_connect_without_a_scheme_is_refused_with_one_line_and_exit_2(self):
+        rc, out = self.run_main(["--connect", "127.0.0.1:9", "--token", "t"])
+        self.assertEqual(rc, 2)
+        self.assertEqual(len(out.strip().splitlines()), 1)
+        self.assertIn("http://", out)
+
+    def test_bad_pin_is_exit_2_not_a_traceback(self):
+        for pin in ("zz", "é" * 64):
+            rc, out = self.run_main(["--connect", "https://127.0.0.1:9", "--token", "t", "--pin", pin])
+            self.assertEqual(rc, 2, pin)
+            self.assertIn("64 hex", out)
+            self.assertEqual(len(out.strip().splitlines()), 1)
+
+    def test_server_down_is_one_line_exit_2_no_traceback_and_the_start_line_is_in_the_case_log(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            url = "HTTP://127.0.0.1:%d" % self.free_port()
+            rc, out = self.run_main(["--connect", url, "--token", "SECRET-TOKEN-1", "--no-tls", "--out", tmp])
+            self.assertEqual(rc, 2, out)
+            self.assertIn("cannot reach the server at http://127.0.0.1:", out)
+            self.assertNotIn("Unexpected error", out)
+            self.assertIn("--no-tls only applies to --server", out)
+            logs = [os.path.join(r, f) for r, _, fs in os.walk(tmp) for f in fs if f == "debug.log"]
+            self.assertTrue(logs)
+            text = open(logs[0], encoding="utf-8").read()
+            self.assertIn("START | RecoveryKit", text)                # also in the case's own debug.log
+            self.assertIn("<token>", text)
+            self.assertNotIn("SECRET-TOKEN-1", text)
+
+    def test_pin_with_ca_says_the_pin_is_used(self):
+        eng = agent_engine()
+        with self.assertRaises(OSError):
+            net.connect(eng, "https://127.0.0.1:%d" % self.free_port(), "t", pin="ab" * 32, ca_file="whatever.pem",
+                        minutes=1, stop=threading.Event())
+        self.assertTrue(any("pin is used" in l and "--ca" in l for l in eng.ctx.ui.lines), eng.ctx.ui.lines)
+        out = []
+        net.ctl(tempfile.gettempdir(), ["--url", "https://127.0.0.1:%d" % self.free_port(), "--token", "t", "--pin", "ab" * 32,
+                                        "--ca", "whatever.pem", "agents"], out.append)
+        self.assertTrue(any("pin is used" in l for l in out), out)
+
+    def test_ctl_server_down_and_bad_urls(self):
+        out = []
+        rc = net.ctl(tempfile.gettempdir(), ["--url", "http://127.0.0.1:%d" % self.free_port(), "--token", "t", "agents"],
+                     out.append)
+        self.assertEqual(rc, 2)
+        self.assertEqual(len(out), 1)
+        self.assertTrue(out[0].startswith("cannot reach the server at http://127.0.0.1:"), out)
+        out = []
+        self.assertEqual(net.ctl(tempfile.gettempdir(), ["--url", "127.0.0.1:9", "--token", "t", "agents"], out.append), 2)
+        self.assertEqual(len(out), 1)
+        out = []
+        self.assertEqual(net.ctl(tempfile.gettempdir(), ["--url", "https://127.0.0.1:9", "--token", "t", "--pin", "zz",
+                                                         "agents"], out.append), 2)
+        self.assertIn("64 hex", out[0])
+
+    def test_help_examples_use_https(self):
+        with contextlib.redirect_stdout(io.StringIO()) as buf:
+            with self.assertRaises(SystemExit):
+                main_mod.parse_args(["--help"])
+        self.assertIn("https://192.168.1.10:8765", buf.getvalue().replace("\n", " ").replace("  ", ""))
+        self.assertNotIn("e.g. http://", buf.getvalue())
 
 
 if __name__ == "__main__":

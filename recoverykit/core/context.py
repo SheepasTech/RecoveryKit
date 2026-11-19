@@ -14,6 +14,14 @@ _HIVE_ERRORS = (regf.HiveError, struct.error, MemoryError, ValueError, OverflowE
                 IndexError)
 
 
+TRUNCATED_NOTE = "more than %d entries: only the first %d were read"
+
+
+class ChildList(list):
+    """Result of RegView.children(); `truncated` is True when the cap cut the enumeration short."""
+    truncated = False
+
+
 class RegView:
     """Read-only view of a Windows install's SOFTWARE and SYSTEM hives.
 
@@ -26,6 +34,7 @@ class RegView:
         self._hives = {}
         self.errors = {}   # hive name -> reason it could not be opened
         self.dirty = {}    # hive name -> True if the file was not cleanly flushed
+        self.notes = {}    # hive name -> [reason a read was truncated or cut short]
 
     def _hive(self, name):
         if name not in self._hives:
@@ -99,10 +108,66 @@ class RegView:
         h = self._hive(hive)
         try:
             k = h.open(path) if h else None
-            return k.values() if k else {}
+            vals = k.values() if k else {}
+            if h:
+                self._sync_notes(hive, h)
+            return vals
         except _HIVE_ERRORS as e:
             self._note(hive, e)
             return {}
+
+    def _sync_notes(self, hive, h):
+        lst = self.notes.setdefault(hive, [])
+        for n in h.notes:
+            if n not in lst and len(lst) < 20:
+                lst.append(n)
+
+    def children(self, hive, path, max_children=5000):
+        """[(child name, {value name: value})] of the subkeys of a key, in one pass.
+
+        Offline: the subkey list is walked once and each child is read by offset. Online: winreg
+        EnumKey plus the values of each child. At most `max_children` are returned; when there are
+        more, the list's `truncated` is True and TRUNCATED_NOTE is added to self.notes[hive]."""
+        out = ChildList()
+        if self.online:
+            try:
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, hive + "\\" + path, 0, winreg.KEY_READ) as k:
+                    i = 0
+                    while True:
+                        try:
+                            name = winreg.EnumKey(k, i)
+                        except OSError:
+                            break
+                        if len(out) >= max_children:
+                            out.truncated = True
+                            break
+                        out.append((name, self.values(hive, path + "\\" + name)))
+                        i += 1
+            except OSError:
+                pass
+        else:
+            h = self._hive(hive)
+            try:
+                key = h.open(path) if h else None
+                if key:
+                    for k in key.children():
+                        if len(out) >= max_children:
+                            out.truncated = True
+                            break
+                        try:
+                            vals = k.values()
+                        except regf.HiveError:
+                            vals = {}
+                        out.append((k.name, vals))
+            except _HIVE_ERRORS as e:
+                self._note(hive, e)
+            if h:
+                self._sync_notes(hive, h)
+        if out.truncated:
+            note = TRUNCATED_NOTE % (max_children, max_children)
+            if note not in self.notes.setdefault(hive, []):
+                self.notes[hive].append(note)
+        return out
 
     def exists(self, hive, path):
         if self.online:
