@@ -71,6 +71,8 @@ class Case:
     def assign(self, case_id, ticket=None):
         """Move the run folder under its case ID."""
         case_id = re.sub(r"[^A-Za-z0-9_-]", "", case_id) or "unknown"
+        if self.data.get("case_id") == case_id:
+            return  # a re-scan of the same target stays in the same run folder
         dest_parent = os.path.join(self.out_root, case_id)
         os.makedirs(dest_parent, exist_ok=True)
         dest = os.path.join(dest_parent, os.path.basename(self.dir))

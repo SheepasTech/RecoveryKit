@@ -189,12 +189,12 @@ def find_installs(ctx):
 
 
 def explicit_target(ctx, path, by_num):
-    """--target-path: a folder that holds \Windows (a mounted image, a mapped folder, an attached
+    """--target-path: a folder that holds a Windows directory (a mounted image, a mapped folder, an attached
     volume the scan did not list). Still verified by contents."""
-    root = os.path.abspath(path).rstrip("\/") + "\\"
+    root = os.path.abspath(path).rstrip("\\/") + "\\"
     windir = root + "Windows"
     if not _is_windows_dir(windir):
-        ctx.ui.say("--target-path %s: no Windows installation there (Windows\System32\config missing)." % path)
+        ctx.ui.say("--target-path %s: no Windows installation there (Windows/System32/config missing)." % path)
         return None
     letter = root[0].upper() if len(root) == 3 and root[1] == ":" else None
     vol = next((v for v in ctx.inventory.get("volumes", []) if v["letter"] and v["letter"] == root[0].upper()), None)

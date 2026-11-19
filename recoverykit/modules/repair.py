@@ -277,6 +277,43 @@ def remove_package_step(ctx, package_name):
         target_check=_check(ctx))
 
 
+# ---------------------------------------------------------------- offline disks, BitLocker
+def online_disk_steps(ctx):
+    """One step per disk that Windows reports as offline (its volumes cannot be read until it is online)."""
+    steps = []
+    for d in (ctx.inventory or {}).get("disks", []):
+        if not d.get("offline"):
+            continue
+        steps.append(RepairStep(
+            id="online_disk", title="Bring disk %d online (%s, %.0f GB)" % (
+                d["number"], d.get("model") or "model unknown", (d.get("size") or 0) / 2 ** 30),
+            effect="Marks the disk online so its volumes can be read. No partition or file is changed. "
+                   "Run the scan again afterwards.",
+            diskpart=["select disk %d" % d["number"], "online disk"],
+            risk="Low. Changes the disk's online/offline state only. If the disk is offline because of a "
+                 "signature collision with another disk, Windows may assign it a new disk signature.",
+            timeout=120, touches_target=False,
+            evidence="Disk %d is reported offline." % d["number"]))
+    return steps
+
+
+def unlock_step(ctx, letter, recovery_key):
+    """manage-bde -unlock for a BitLocker-locked volume. The key is never logged or stored."""
+    letter = str(letter).strip().rstrip(":\\").upper()
+    if len(letter) != 1 or not letter.isalpha():
+        raise ValueError("type the single drive letter of the locked volume")
+    key = recovery_key.strip()
+    if not re.fullmatch(r"(\d{6}-){7}\d{6}", key):
+        raise ValueError("a BitLocker recovery key is 8 groups of 6 digits separated by dashes")
+    return RepairStep(
+        id="unlock", title="Unlock BitLocker volume %s:" % letter,
+        effect="Unlocks the volume for this session so it can be read. Nothing on the disk is changed and "
+               "the volume locks again at reboot. The key is not written to any log or file.",
+        argv=["manage-bde", "-unlock", "%s:" % letter, "-RecoveryPassword", key],
+        risk="Low.", timeout=120, touches_target=False, secrets=(key,),
+        evidence="The volume is BitLocker-locked.")
+
+
 # ---------------------------------------------------------------- copy out
 def _on_target_volume(ctx, dest):
     root = ctx.target.root
@@ -508,6 +545,9 @@ def run_menu(ctx):
                 opts.append(("package", "Remove an update package"))
             if t is not None:
                 opts.append(("copy", "Copy user data out to another drive"))
+            if online_disk_steps(ctx):
+                opts.append(("online", "Bring an offline disk online"))
+            opts.append(("unlock", "Unlock a BitLocker volume (needs the recovery key)"))
             opts += [("guidance", "Show guidance (no commands run)"), ("boot", "Record boot test result"),
                      ("back", "Back")]
             key = ui.choose("Repair helpers", opts, default="back")
@@ -526,6 +566,21 @@ def run_menu(ctx):
                         _execute(ctx, remove_package_step(ctx, name))
                 elif key == "copy":
                     _menu_copy(ctx)
+                elif key == "online":
+                    steps = online_disk_steps(ctx)
+                    k = ui.choose("Offline disks", [(i, s.title) for i, s in enumerate(steps)] + [("back", "Back")],
+                                  default="back")
+                    if k != "back" and k is not None:
+                        res = _execute(ctx, steps[k])
+                        if res is not None and res.ok:
+                            ui.say("Disk is online. Go back and run the scan again to find its Windows install.")
+                elif key == "unlock":
+                    letter = ui.ask("Drive letter of the locked volume")
+                    if letter:
+                        rk = ui.ask("Recovery key (48 digits with dashes; not logged)", "", secret=True)
+                        res = _execute(ctx, unlock_step(ctx, letter, rk))
+                        if res is not None and res.ok:
+                            ui.say("Unlocked. Go back and run the scan again.")
                 elif key == "guidance":
                     for g in GUIDANCE:
                         ui.say("- " + g)
