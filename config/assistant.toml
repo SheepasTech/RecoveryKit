@@ -1,0 +1,332 @@
+# Decision file for the troubleshooting assistant (recoverykit/modules/assistant.py).
+# The assistant PROPOSES steps; it never runs anything. Plain ASCII only.
+#
+# Each [[rule]]: id, branch (A..E or X for notices/guardrails), order (sort key over the whole
+# list), title, text, when (ALL must hold; empty = always), evidence (facts quoted in the
+# output), optional symptoms (rule applies only when operator.symptom is one of them).
+# {fact.name} inside text is replaced by the fact's value.
+# Conditions: <fact> == v | != v | > n | < n | >= n | <= n | in [a, b] | contains v
+#             exists <fact> | missing <fact> | <fact> is true|false
+# Branches follow "project idea1": A establish the failure, B DISM source, C recovery
+# options, D boot configuration, E storage/hardware. A condition on an absent fact is false,
+# except "missing" and "!=".
+
+# ---------------------------------------------------------------- notices (X)
+
+[[rule]]
+id = "X-booted"
+branch = "X"
+order = 1
+title = "The operator confirmed the target boots"
+text = "The operator confirmed the target boots after repair. No further steps are proposed. Keep the case folder as the record."
+when = ["booted is true"]
+evidence = ["booted"]
+
+[[rule]]
+id = "X-online"
+branch = "X"
+order = 2
+title = "The target is the running Windows"
+text = "The target is the running Windows; this scan is not of an offline install. Findings describe the live system, and repair helpers are disabled. Boot the kit from WinRE or USB to examine the real offline install."
+when = ["target.online is true"]
+evidence = ["target.online"]
+
+[[rule]]
+id = "X-sfc-clean"
+branch = "X"
+order = 250
+title = "A clean SFC does not prove the machine boots"
+text = "SFC found no integrity violations, but that only covers protected system files. It does not rule out boot configuration, update, driver, registry, hardware or component-store problems. Do not treat it as a fix."
+when = ["repair.sfc.finding == sfc_clean", "booted != true"]
+evidence = ["repair.sfc.finding", "booted"]
+
+[[rule]]
+id = "X-not-fixed"
+branch = "X"
+order = 950
+title = "Do not call it fixed until it has booted"
+text = "Do not claim the problem is fixed until the operator has confirmed the target boots. Ask for the exact error messages and command output before choosing a repair branch."
+when = ["booted != true"]
+evidence = ["booted"]
+
+[[rule]]
+id = "X-guardrails"
+branch = "X"
+order = 960
+title = "Guardrails for every step"
+text = "Reconfirm disk number, partition, drive letter and the Windows folder in this session; letters and numbering change. Do not assume C: is the target. Do not run DISM and SFC at the same time against the same offline image. Never use diskpart clean, format or delete partition."
+when = ["booted != true"]
+evidence = ["target.present"]
+
+# ------------------------------------------- A: preserve data, establish the failure
+
+[[rule]]
+id = "A-backup"
+branch = "A"
+order = 100
+title = "Back up the customer's data before further repair"
+text = "Copy the important files from the target to a separate disk before trying any further repair. Reading the files is safe; repairs are not guaranteed to be."
+when = ["operator.data_backed_up != yes", "booted != true"]
+evidence = ["operator.data_backed_up"]
+
+[[rule]]
+id = "A-firmware-sees-disk"
+branch = "A"
+order = 110
+title = "Establish: does the firmware list the target disk?"
+text = "Open the BIOS/UEFI setup and check whether the target disk is listed. This decides between a hardware/storage branch and a software branch."
+when = ["operator.firmware_sees_disk != yes", "operator.firmware_sees_disk != no", "booted != true"]
+evidence = ["operator.firmware_sees_disk"]
+
+[[rule]]
+id = "A-boot-menu-wbm"
+branch = "A"
+order = 120
+title = "Establish: does the boot menu show Windows Boot Manager?"
+text = "Open the firmware boot menu and check whether Windows Boot Manager is listed for the target disk."
+when = ["operator.boot_menu_wbm != yes", "operator.boot_menu_wbm != no", "booted != true"]
+evidence = ["operator.boot_menu_wbm"]
+
+[[rule]]
+id = "A-symptom"
+branch = "A"
+order = 130
+title = "Establish: what exactly happens at boot?"
+text = "Record the exact behaviour: no boot device, automatic repair loop, blue screen with stop code, spinning dots or black screen, or another message. Write down the exact message."
+when = [
+  "operator.symptom != no_boot_device", "operator.symptom != repair_loop", "operator.symptom != stop_code",
+  "operator.symptom != spinning", "operator.symptom != other", "booted != true",
+]
+evidence = ["operator.symptom"]
+
+[[rule]]
+id = "A-recent-change"
+branch = "A"
+order = 140
+title = "Establish: was there a recent change?"
+text = "Ask whether a Windows update, driver or software install, power loss or forced shutdown, or disk/hardware change came just before the failure."
+when = [
+  "operator.recent_change != update", "operator.recent_change != driver", "operator.recent_change != power",
+  "operator.recent_change != hardware", "operator.recent_change != none", "booted != true",
+]
+evidence = ["operator.recent_change"]
+
+[[rule]]
+id = "A-stop-code"
+branch = "A"
+order = 150
+title = "Record the exact stop code"
+text = "Write down the stop code and any named file shown on the blue screen. Look for a memory dump in the target's Windows folder (MEMORY.DMP, Minidump) and keep a copy; do not delete it."
+when = ["booted != true"]
+symptoms = ["stop_code"]
+evidence = ["operator.symptom", "operator.stop_code"]
+
+[[rule]]
+id = "A-repair-loop-log"
+branch = "A"
+order = 151
+title = "Read the Startup Repair log of the loop"
+text = "An automatic repair loop normally writes SrtTrail.txt in the target's Windows\\System32\\Logfiles\\Srt folder. Read it for the failing component before choosing a repair."
+when = ["booted != true"]
+symptoms = ["repair_loop"]
+evidence = ["operator.symptom", "log.srttrail"]
+
+[[rule]]
+id = "A-spinning-log"
+branch = "A"
+order = 152
+title = "Check how far the boot gets"
+text = "For spinning dots or a black screen, note whether the manufacturer logo and the dots appear, and for how long. If boot logging exists, read ntbtlog.txt in the target's Windows folder to see the last driver loaded."
+when = ["booted != true"]
+symptoms = ["spinning"]
+evidence = ["operator.symptom"]
+
+# ------------------------------------------------------------- B: DISM repair
+
+[[rule]]
+id = "B-restorehealth-source"
+branch = "B"
+order = 200
+title = "Run RestoreHealth with a matching source"
+text = "The component store is repairable. Run DISM /Cleanup-Image /RestoreHealth with a source that matches the target exactly: same build family ({target.build}), same edition ({target.edition}), same architecture and same language ({target.language}); the WIM/ESD index must be the target's edition. Do not run it at the same time as SFC."
+when = ["repair.scanhealth.finding == repairable", "repair.restorehealth.finding != restored", "booted != true"]
+evidence = ["repair.scanhealth.finding", "repair.restorehealth.finding", "target.build", "target.edition", "target.language"]
+
+[[rule]]
+id = "B-source-missing-0x800f0915"
+branch = "B"
+order = 210
+title = "RestoreHealth returned 0x800f0915: source missing or incompatible"
+text = "Error 0x800f0915 means the repair content was not found. Check the source's build, edition, architecture and language against the target. Read the DISM log (Windows\\Logs\\DISM\\dism.log on the target). Do not retry the same media."
+when = ["repair.restorehealth.error_code == 0x800f0915", "booted != true"]
+evidence = ["repair.restorehealth.error_code", "repair.restorehealth.rc"]
+
+[[rule]]
+id = "B-source-mismatch"
+branch = "B"
+order = 220
+title = "Do not use the checked repair source"
+text = "The source was checked and does not match the target. Mismatched fields: {source.mismatch_fields}. Do not keep using that source; find media that matches the target on every field."
+when = ["source.checked is true", "source.ok is false", "booted != true"]
+evidence = ["source.checked", "source.ok", "source.mismatch_fields"]
+
+# ------------------------------------------------ C: recovery options, one at a time
+
+[[rule]]
+id = "C-uninstall-updates-first"
+branch = "C"
+order = 300
+title = "Uninstall the latest quality update first"
+text = "The problem began after an update. In WinRE choose Troubleshoot, Advanced options, Uninstall Updates, and remove the latest quality update first. Test boot afterwards and record the exact result."
+when = ["operator.recent_change == update", "booted != true"]
+evidence = ["operator.recent_change"]
+
+[[rule]]
+id = "C-uninstall-updates"
+branch = "C"
+order = 300
+title = "Try Uninstall Updates"
+text = "In WinRE choose Troubleshoot, Advanced options, Uninstall Updates, starting with the latest quality update. Test boot afterwards and record the exact result."
+when = ["operator.recent_change != update", "booted != true"]
+evidence = ["operator.recent_change"]
+
+[[rule]]
+id = "C-system-restore"
+branch = "C"
+order = 310
+title = "Try System Restore"
+text = "If a suitable restore point exists, try System Restore from WinRE. Test boot afterwards and record the exact result. One option at a time."
+when = ["booted != true"]
+evidence = ["operator.recent_change"]
+
+[[rule]]
+id = "C-startup-repair"
+branch = "C"
+order = 320
+title = "Try Startup Repair if not already tried"
+text = "Run Startup Repair from WinRE if it has not been tried; check SrtTrail.txt afterwards. Test boot and record the exact result."
+when = ["booted != true"]
+evidence = ["log.srttrail"]
+
+[[rule]]
+id = "C-avoid-reset"
+branch = "C"
+order = 330
+title = "Avoid Reset or reinstall for now"
+text = "Do not use Reset this PC, reinstall, or destructive partition/boot commands until the data is backed up and the customer understands the consequences."
+when = ["operator.data_backed_up != yes", "booted != true"]
+evidence = ["operator.data_backed_up"]
+
+# ------------------------------------------------- D: boot configuration (inspect only)
+
+[[rule]]
+id = "D-firmware-sees-disk"
+branch = "D"
+order = 400
+title = "The firmware sees the disk: look at boot configuration first"
+text = "No boot device although the firmware lists the disk points at the boot path (EFI partition or BCD) rather than the hardware. Inspect the EFI partition and BCD before anything else."
+when = ["operator.firmware_sees_disk == yes", "booted != true"]
+symptoms = ["no_boot_device"]
+evidence = ["operator.symptom", "operator.firmware_sees_disk", "operator.boot_menu_wbm"]
+
+[[rule]]
+id = "D-inspect-bcd"
+branch = "D"
+order = 410
+title = "Inspect the BCD, do not rewrite it"
+text = "The BCD has not been captured. Export and read it first (needs administrator or WinRE): bcdedit /store <ESP letter>:\\EFI\\Microsoft\\Boot\\BCD /enum all. Inspect only; keep the export in the case folder."
+when = ["bcd.captured is false", "booted != true"]
+evidence = ["bcd.captured", "boot.efi_count"]
+
+[[rule]]
+id = "D-which-efi"
+branch = "D"
+order = 420
+title = "Identify which EFI partition the firmware uses"
+text = "More than one EFI System partition exists ({boot.efi_count}; {boot.efi_on_target_disk} on the target disk). Identify the one the firmware actually boots from before acting; the one on the target disk is not necessarily it."
+when = ["boot.efi_count > 1", "booted != true"]
+evidence = ["boot.efi_count", "boot.efi_on_target_disk"]
+
+[[rule]]
+id = "D-no-blind-bcd"
+branch = "D"
+order = 430
+title = "Never rewrite boot configuration blindly"
+text = "Do not run bcdboot, bootrec or bcdedit /set, and do not change the boot order, without an exported BCD and a confirmed reason. They can break a working boot setup, especially with several Windows installs or EFI partitions."
+when = ["booted != true"]
+evidence = ["bcd.captured"]
+
+# --------------------------------------------------------- E: storage and hardware
+
+[[rule]]
+id = "E-hardware-first"
+branch = "E"
+order = 500
+title = "The firmware does not see the disk: hardware first"
+text = "Check the cables, port and power, try another port or another machine, and prioritise backing up the data over any Windows repair."
+when = ["operator.firmware_sees_disk == no", "booted != true"]
+symptoms = ["no_boot_device"]
+evidence = ["operator.symptom", "operator.firmware_sees_disk"]
+
+[[rule]]
+id = "E-disk-offline"
+branch = "E"
+order = 510
+title = "Bring the target disk online"
+text = "The target disk is offline, so its volumes cannot be read. Bringing it online is a repair step: use the kit's repair menu, which shows the command and asks first. It is not done automatically."
+when = ["target.disk_offline is true", "booted != true"]
+evidence = ["target.disk_offline"]
+
+[[rule]]
+id = "E-disk-health"
+branch = "E"
+order = 520
+title = "Get disk health (SMART) data"
+text = "Disk health could not be collected. Read the SMART data (for example Get-PhysicalDisk | Get-StorageReliabilityCounter in PowerShell, or the manufacturer tool). If the disk is missing, disconnects or reports errors, prioritise backup and hardware diagnosis over Windows repair."
+when = ["section.disk_health.status != ok", "booted != true"]
+evidence = ["section.disk_health.status"]
+
+[[rule]]
+id = "E-chkdsk-scan"
+branch = "E"
+order = 530
+title = "Run a read-only chkdsk"
+text = "Run chkdsk <target letter>: /scan on the mounted target volume. It only reads; do not use /f or /r until the data is backed up."
+when = ["booted != true"]
+evidence = ["target.present"]
+
+[[rule]]
+id = "E-free-space"
+branch = "E"
+order = 540
+title = "Free space on the target before repairs"
+text = "The target volume is low on free space, which can make repairs and updates fail. Free space (move files to the backup disk) before running repairs."
+when = ["free_space.low is true", "booted != true"]
+evidence = ["free_space.low"]
+
+[[rule]]
+id = "E-bitlocker"
+branch = "E"
+order = 550
+title = "A volume may be BitLocker-locked"
+text = "A fixed volume has no readable file system and may be BitLocker-locked. Unlocking needs the recovery key from the customer or their Microsoft account; the kit never stores it."
+when = ["bitlocker.unreadable is true", "booted != true"]
+evidence = ["bitlocker.unreadable"]
+
+[[rule]]
+id = "E-pending"
+branch = "E"
+order = 560
+title = "Pending servicing operations"
+text = "Pending servicing operations were found and may block boot or repairs. Look at them (Windows\\WinSxS\\pending.xml, the Component Based Servicing registry keys) before running DISM or SFC."
+when = ["pending.any is true", "booted != true"]
+evidence = ["pending.any"]
+
+[[rule]]
+id = "E-no-srttrail"
+branch = "E"
+order = 570
+title = "SrtTrail.txt is missing"
+text = "SrtTrail.txt is not present: Startup Repair has not run on this install, or its log is absent. Run Startup Repair from WinRE to produce it."
+when = ["log.srttrail == missing", "booted != true"]
+evidence = ["log.srttrail"]

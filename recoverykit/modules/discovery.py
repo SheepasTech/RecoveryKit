@@ -5,6 +5,7 @@ assumptions); offline registry data comes from core.context.RegView.
 """
 import hashlib
 import os
+import shutil
 
 from ..core import winapi
 from ..core.context import LCID, RegView, Target
@@ -179,7 +180,49 @@ def find_installs(ctx):
         t.reg = RegView(windir, online)
         t.info = install_info(t)
         out.append(t)
+    explicit = ctx.options.get("target_path")
+    if explicit:
+        t = explicit_target(ctx, explicit, by_num)
+        if t:
+            out = [x for x in out if os.path.normcase(x.windir) != os.path.normcase(t.windir)] + [t]
     return out
+
+
+def explicit_target(ctx, path, by_num):
+    """--target-path: a folder that holds \Windows (a mounted image, a mapped folder, an attached
+    volume the scan did not list). Still verified by contents."""
+    root = os.path.abspath(path).rstrip("\/") + "\\"
+    windir = root + "Windows"
+    if not _is_windows_dir(windir):
+        ctx.ui.say("--target-path %s: no Windows installation there (Windows\System32\config missing)." % path)
+        return None
+    letter = root[0].upper() if len(root) == 3 and root[1] == ":" else None
+    vol = next((v for v in ctx.inventory.get("volumes", []) if v["letter"] and v["letter"] == root[0].upper()), None)
+    on_volume_root = bool(vol and letter)
+    if on_volume_root:
+        volume = vol
+    else:
+        volume = {"guid_path": None, "letter": letter, "fs": None, "label": "", "errors": [], "extents": [],
+                  "drive_type": "unknown", "disk": None, "partition": None}
+        try:
+            du = shutil.disk_usage(root)
+            volume.update(size=du.total, free=du.free)
+        except OSError as e:
+            volume["errors"].append(str(e))
+    disk = by_num.get(volume.get("disk"))
+    part = next((p for p in disk["partitions"] if p["number"] == volume.get("partition")), None) if disk else None
+    online = False
+    try:
+        online = bool(ctx.env.get("windir")) and os.path.samefile(windir, ctx.env["windir"])
+    except OSError:
+        pass
+    t = Target(root=root, windir=windir, online=online, letter=letter, volume=volume, disk=disk, partition=part)
+    t.reg = RegView(windir, online)
+    t.info = install_info(t)
+    t.info["explicit_path"] = True
+    if not on_volume_root:
+        t.info["errors"].append("target given by path, not found as a volume root: disk and partition are unknown")
+    return t
 
 
 def _is_windows_dir(windir):
@@ -246,6 +289,9 @@ def choose_target(ctx):
     installs = ctx.inventory.get("installs", [])
     if not installs:
         return None
+    for t in installs:
+        if t.info.get("explicit_path"):
+            return t
     want = (ctx.options.get("target") or "").rstrip(":\\").upper()
     if want:
         for t in installs:

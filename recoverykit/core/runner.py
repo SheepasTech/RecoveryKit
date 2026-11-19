@@ -79,7 +79,7 @@ def _flags(args):
 _DISM_REPAIR = {"/cleanup-image", "/scanhealth", "/checkhealth", "/restorehealth", "/source", "/limitaccess",
                 "/scratchdir", "/image", "/remove-package", "/packagename", "/get-packages", "/get-currentedition",
                 "/get-intl", "/get-drivers", "/english", "/logpath", "/format", "/revertpendingactions"}
-_DISM_EXPORT = {"/export-image", "/sourceimagefile", "/sourceindex", "/destinationimagefile", "/compress",
+_DISM_EXPORT = {"/export-image", "/sourceimagefile", "/sourceindex", "/destinationimagefile", "/compress", "/swmfile",
                 "/checkintegrity", "/english", "/logpath", "/scratchdir"}
 _ROBOCOPY_BAD = {"/mov", "/move", "/purge", "/mir", "/zb", "/sec", "/secfix", "/nocopy", "/create", "/a-", "/a+", "/im", "/is", "/it"}
 _SMART_OK = {"-a", "-i", "-h", "-x", "-c", "-l", "-j", "--json", "--scan", "--scan-open", "-d", "--all", "--info",
@@ -174,7 +174,8 @@ def classify(argv):
         return READ, ""
 
     if exe == "smartctl":
-        return (READ, "") if set(fl) <= _SMART_OK else (FORBIDDEN, "smartctl is limited to reading")
+        sfl = _flags([a for a in args if not a.lower().startswith("/dev/")])  # /dev/pdN is a device, not a switch
+        return (READ, "") if set(sfl) <= _SMART_OK else (FORBIDDEN, "smartctl is limited to reading")
 
     if exe == "robocopy":
         if set(fl) & _ROBOCOPY_BAD:
@@ -316,6 +317,7 @@ class Runner:
             res.timed_out = True
             res.error = "timed out after %ds" % timeout
         t.join(5)
+        p.stdout.close()
         res.out = "\n".join(chunks)
         res.seconds = time.monotonic() - t0
         return res
@@ -480,6 +482,8 @@ class Runner:
 
 
 def _decode(raw):
+    if raw.count(b"\x00") > len(raw) // 4:   # UTF-16 output (sfc): keep the ASCII part
+        raw = raw.replace(b"\x00", b"")
     for enc in ("utf-8", "oem"):
         try:
             return raw.decode(enc)

@@ -1,0 +1,40 @@
+{
+  "schema": 1,
+  "case_id": "T-idea1fix",
+  "ticket": null,
+  "environment": {"kind": "windows", "admin": true, "firmware": "UEFI"},
+  "target": {
+    "root": "W:\\",
+    "windir": "W:\\Windows",
+    "online": false,
+    "letter": "W",
+    "disk": {"number": 0, "model": "KINGSTON SA400S37120G", "size": 120034123776, "style": "GPT", "offline": false},
+    "partition": {"number": 3, "size": 111000000000, "type": "Basic"},
+    "volume": {"fs": "NTFS", "size": 111000000000, "free": 60000000000},
+    "info": {"product": "Windows 11 Home", "edition": "Core", "build": "26100", "ubr": 8875,
+             "build_full": "10.0.26100.8875", "architecture": "x64", "language": "en-US"}
+  },
+  "operator_answers": {
+    "symptom": "unknown", "firmware_sees_disk": "unknown", "boot_menu_wbm": "unknown",
+    "recent_change": "unknown", "data_backed_up": "unknown"
+  },
+  "sections": {
+    "disks": {"title": "Disks", "status": "ok", "reason": "", "items": [], "data": {"disk_count": 1, "volume_count": 3}},
+    "target": {"title": "Chosen target", "status": "ok", "reason": "", "items": [], "data": {}},
+    "free_space": {"title": "Free space", "status": "ok", "reason": "", "items": [],
+                   "data": {"size": 111000000000, "free": 60000000000, "low": false}},
+    "boot_structure": {"title": "Boot structure", "status": "ok", "reason": "", "items": [],
+                       "data": {"efi_partitions": [{"disk": 0, "partition": 1, "size": 104857600, "on_target_disk": true}],
+                                "recovery_partitions": [{"disk": 0, "partition": 4, "size": 672137216, "on_target_disk": true}]}},
+    "bitlocker": {"title": "BitLocker", "status": "ok", "reason": "", "items": [], "data": {}},
+    "disk_health": {"title": "Disk health", "status": "missing", "reason": "not collected", "items": [], "data": {}}
+  },
+  "files": [],
+  "repair_log": [
+    {"id": "sfc", "rc": 0, "finding": "sfc_clean", "error_code": null, "kind": "executed"},
+    {"id": "scanhealth", "rc": 0, "finding": "repairable", "error_code": null, "kind": "executed"},
+    {"id": "restorehealth", "rc": 1, "finding": "not_repairable", "error_code": "0x800F0915", "kind": "executed"}
+  ],
+  "source_check": {"ok": false, "mismatch_fields": ["build", "language"]},
+  "booted_after_repair": null
+}

@@ -1,0 +1,49 @@
+DEBUG LOGGING
+=============
+
+Logging is always on. It cannot be switched off.
+
+Where the logs are
+------------------
+Every run gets its own folder on the kit (the USB):
+
+  cases\<case-id>\<YYYYMMDD-HHMM>\
+
+Before the target disk is known (no case id yet) the run writes to:
+
+  cases\_pending\<YYYYMMDD-HHMM>\
+
+Files in the run folder
+-----------------------
+  debug.log      everything that happened, one line each, prefixed by type:
+                   SCREEN|  every line shown on the screen
+                   PROMPT|  every question asked
+                   ANSWER|  every answer typed
+                   CMD   |  every command, with its exit code and its output
+                 plus section starts and ends, file copies, and exceptions with traceback
+  audit.log      one JSON object per line for every command attempted, including commands
+                 that were refused, declined or only dry-run. Fields: seq, time, kind,
+                 purpose, command, argv, exit_code, seconds, timed_out, error, note,
+                 output_file
+  audit\NNNN-<tool>.txt   the full output of each command (NNNN = seq from audit.log)
+  case.json      machine-readable summary of the case
+  report.md      human-readable case file
+
+Copy on a normal Windows
+------------------------
+On a normal Windows a mirror of debug.log also goes to
+
+  %TEMP%\Debug\RecoveryKit\<stamp>\debug.log
+
+like the other ITwork tools. In WinRE %TEMP% is a RAM disk and disappears at reboot, so the copy
+on the USB (cases\...) is the one that survives.
+
+Secrets
+-------
+BitLocker recovery keys and other secrets are never logged. They are shown as <hidden> on screen
+and <redacted> in the logs.
+
+Reporting a problem
+-------------------
+Zip the run folder (or run run.cmd --bundle) and send it. The run folder may contain customer
+data: see docs\manual.md.
