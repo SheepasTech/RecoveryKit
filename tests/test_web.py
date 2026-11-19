@@ -13,7 +13,7 @@ FORBIDDEN = ["innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "
              "http://", "https://", "localStorage"]
 SERVER_PATHS = {"/status", "/agents", "/cases"}
 SERVER_AGENT_VERBS = {"pair", "revoke", "fetch-bundle"}
-AGENT_PATHS = {"status", "scan", "report", "suggestions", "repair/steps", "audit", "files"}
+AGENT_PATHS = {"status", "scan", "report", "suggestions", "repair/steps", "audit", "files", "case"}
 
 
 def read_page():
@@ -44,6 +44,25 @@ class PageStatic(unittest.TestCase):
         self.assertEqual(srv, SERVER_PATHS)
         self.assertEqual(verbs, SERVER_AGENT_VERBS)
         self.assertEqual(agent, AGENT_PATHS)
+
+    def test_no_data_driven_href_or_src(self):
+        script = re.search(r"<script>(.*)</script>", read_page().decode("ascii"), re.S).group(1)
+        self.assertNotRegex(script, r"""setAttribute\(\s*["'](href|src|style|on\w+)["']""")
+        for m in re.finditer(r"\.(href|src)\s*=(?!=)\s*([^;\n]*)", script):
+            self.assertRegex(m.group(2).strip(), r'^"[^"]*"$', m.group(0))
+
+    def test_every_input_has_label(self):
+        text = read_page().decode("ascii")
+        for tag in re.findall(r"<input\b[^>]*>", text):
+            m = re.search(r'\bid="([^"]+)"', tag)
+            self.assertIsNotNone(m, tag)
+            self.assertRegex(text, r'<label[^>]*\bfor="%s"' % re.escape(m.group(1)))
+        for tag in re.findall(r"<select\b[^>]*>", text):
+            m = re.search(r'\bid="([^"]+)"', tag)
+            self.assertRegex(text, r'<label[^>]*\bfor="%s"' % re.escape(m.group(1)))
+
+    def test_status_line_is_live_region(self):
+        self.assertRegex(read_page().decode("ascii"), r'<div id="statusline"[^>]*aria-live="polite"')
 
 
 class PageServed(unittest.TestCase):

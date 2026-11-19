@@ -6,6 +6,8 @@ tags: [tools, recovery]
 Portable USB toolkit that diagnoses, collects evidence from and (only with confirmation) repairs unbootable Windows installations. It is meant to run from normal Windows, WinRE, WinPE or the Windows Setup Shift+F10 prompt, with its own Python on the stick.
 
 > **Status.** Implemented and covered by automated tests on one development PC (Windows 11, not elevated). **Not yet exercised: a real WinRE boot, an administrator session, a real offline disk, any real repair command, and two machines on a LAN.** Scanning is read-only, so a first try on a real machine is safe; treat the repair helpers as untested until one has been walked through on a disposable install.
+>
+> What was checked: the unit tests (they build a fake offline Windows with real hive files; repairs only in dry run); scans of the development PC's own running Windows, also from the USB stick with the bundled Python; the control server, pairing, relayed scan, bundle retrieval and revocation between two processes over 127.0.0.1. Not checked: TLS (no certificate was made), the browser page in a real browser, boot-time behaviour of the bundled Python, which tools WinRE has.
 
 The design is in [RecoveryKit-spec.md](RecoveryKit-spec.md), progress in [roadmap.md](roadmap.md), changes in [CHANGELOG.md](CHANGELOG.md). No customer data or keys are stored in this repository.
 
@@ -57,16 +59,16 @@ The menu starts with **Scan**: it finds the Windows installations by disk and co
 | `--auto` | Never wait for input. Defaults are used; no repair is ever confirmed |
 | `--target W` / `--target-path DIR` | Target by drive letter, or a folder that contains `Windows` (mounted image). Still verified by contents |
 | `--ticket NR` | Ticket number for the case ID (`ITW-<ticket>-<target id>`) |
-| `--out DIR` | Case output location when the USB is read-only or full |
+| `--out DIR` | Case output location when the USB is read-only or full, or when the scan stopped because the output would land on the target volume |
 | `--chkdsk` | Add a read-only `chkdsk` (slow) |
 | `--answer KEY=VALUE` | Pre-answer a boot-failure question, e.g. `symptom=repair_loop` |
 | `--dry-run` | Repair steps are shown and logged, never executed |
 | `--bundle` | Zip the run folder |
 | `--wipe-case ID` | Delete a case from the output location |
 | `--decode-id ID` | Show which components a device ID stands for |
-| `--serve` | Headless: agent API on 127.0.0.1 ([docs/api.md](docs/api.md)) |
-| `--connect URL --token T` | Remote session: the agent dials out to the control server |
-| `--server --bind IP` | Run the control server (API and browser page) on the main machine |
+| `--serve` [`--port N`] [`--allow-repairs`] | Headless: agent API on 127.0.0.1 ([docs/api.md](docs/api.md)). Repairs through it only with `--allow-repairs` |
+| `--connect URL --token T` [`--pin SHA256`] [`--session-minutes N`] [`--allow-remote-repairs`] | Remote session: the agent dials out to the control server. Read-only unless `--allow-remote-repairs` |
+| `--server --bind IP` [`--port N`] [`--store DIR`] [`--intake DIR`] | Run the control server (API and browser page) on the main machine |
 | `--ctl ...` | Command-line client for the control server |
 
 ## Output
@@ -99,10 +101,12 @@ Logging is always on. Details are in [docs/logging.txt](docs/logging.txt). On a 
 | `run.cmd` | Launcher. Pure `cmd`, relative to its own location |
 | `Install-ToUsb.ps1` | Fetches the embeddable Python and copies the kit to a stick. Never touches `cases\` there |
 | `python/` | Embeddable 64-bit Python 3.14, git-ignored |
+| `lib/` | Empty: no third-party dependencies |
+| `cases/`, `devices/` | Output of the kit on the stick (git-ignored): one folder per case, the device registry |
 | `recoverykit/core/` | Hive parser, disk inventory, command wrapper, case model, logging, console UI |
-| `recoverykit/modules/` | discovery, logs, regdiff, drivers, triage, assistant, repair, report |
+| `recoverykit/modules/` | discovery, device, logs, loganalysis, regdiff, drivers, triage, assistant, repair, report |
 | `recoverykit/engine.py`, `net.py`, `web/` | The engine and its API, the server, the browser page |
-| `config/` | `kit.toml`, `assistant.toml` |
+| `config/` | `kit.toml`, `assistant.toml`; the server writes its tokens to `token-server.json` here (git-ignored) |
 | `plugins/` | Optional `*.py` with `collect(ctx)`. Loaded only when listed with a matching SHA-256 in `plugins/manifest.sha256`. A listed plugin is trusted code, not sandboxed |
 | `tools/` | Optional third-party binaries (smartctl), used only when listed in `tools/manifest.sha256` |
 | `tests/` | `python -m unittest discover -s tests -t .` |

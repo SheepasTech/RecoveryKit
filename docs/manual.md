@@ -4,6 +4,8 @@
 
 A USB toolkit that diagnoses an unbootable Windows installation, collects its logs and writes a report. Repairs exist but only run after a typed confirmation. It carries its own 64-bit Python, so it needs no Python and no PowerShell on the machine it runs on. 64-bit only.
 
+**Status.** Built and unit-tested on one development PC. It has not been run in WinRE or against a real broken PC yet, so whether the bundled Python starts there and which tools WinRE has are not confirmed. Use the first-run checklist below ("First run on a real machine") on the first real machine.
+
 ## Preparing the USB
 
 On a normal Windows PC, from the project folder:
@@ -30,17 +32,58 @@ Attach the disk of the broken PC and run `run.cmd` from the kit. Run it as admin
 
 ## Switches
 
+Run `run.cmd --help` for the same list. Abbreviations of switch names are not accepted.
+
+Scan:
+
 | Switch | Effect |
 |---|---|
-| `--scan` | Discovery, log collection and report, no menu |
+| (none) | Text menu |
+| `--scan` | Discovery, log collection, inventories and report, no menu |
 | `--auto` | Never waits for input; uses defaults; never confirms a repair |
-| `--target <letter>` | Use this drive letter as the target Windows |
-| `--ticket <nr>` | Ticket number, used in the case id |
-| `--out <dir>` | Write case output here (USB read-only or full) |
-| `--chkdsk` | Add a read-only chkdsk (slow) |
+| `--target <letter>` | Use this drive letter as the target Windows (still verified by contents) |
+| `--target-path <dir>` | Folder that contains `Windows` (mounted image or mapped folder). Verified by contents; disk and partition are shown as unknown, so repairs against it are refused |
+| `--ticket <nr>` | Ticket number, used in the case id (`ITW-<nr>-<target id>`; without it `T-<target id>`) |
+| `--out <dir>` | Write case output here instead of `cases\` next to `run.cmd` (USB read-only or full, or the case would land on the target disk) |
+| `--chkdsk` | Add a read-only chkdsk of the target (slow) |
+| `--answer KEY=VALUE` | Pre-answer a boot-failure question; repeatable. Keys: `symptom` (`no_boot_device`, `repair_loop`, `stop_code`, `spinning`, `other`, `unknown`), `firmware_sees_disk`, `boot_menu_wbm`, `data_backed_up` (`yes`, `no`, `unknown`), `recent_change` (`update`, `driver`, `power`, `hardware`, `none`, `unknown`). Example: `--answer symptom=repair_loop` |
+| `--bundle` | Zip the run folder when done |
 | `--dry-run` | Repairs are shown and logged, never executed |
-| `--bundle` | Zip the run folder |
-| `--wipe-case <case-id>` | Delete that case from the USB |
+
+Headless agent API (this machine only):
+
+| Switch | Effect |
+|---|---|
+| `--serve` | Serve the agent API on 127.0.0.1 and wait. Prints a token; every request needs it |
+| `--port <n>` | Port for `--serve` (default 8766) or `--server` (default 8765) |
+| `--allow-repairs` | Let loopback API clients run confirmed repair steps. Without it the API cannot repair |
+
+Remote session (the agent dials out; no port is opened on the target):
+
+| Switch | Effect |
+|---|---|
+| `--connect <url>` | Control server URL, for example `http://192.168.1.10:8765` |
+| `--token <T>` | Agent token of the server (`agent_token` in the server's `config\token-server.json`). Needed with `--connect` |
+| `--pin <sha256>` | Expected SHA-256 fingerprint of the server's TLS certificate |
+| `--session-minutes <n>` | Session length (default 60) |
+| `--allow-remote-repairs` | Let the remote operator run confirmed repair steps in this session. Default: read-only |
+
+Control server (on the main machine):
+
+| Switch | Effect |
+|---|---|
+| `--server` | Run the control server |
+| `--bind <ip>` | Interface to bind (default 127.0.0.1; give the LAN address to be reachable) |
+| `--store <dir>` | Where received bundles are stored (default `cases\_server`) |
+| `--intake <dir>` | Also copy bundles to `<dir>\ITW <ticket>\` (vault intake) |
+| `--ctl ...` | Operator client: `agents`, `pair ID CODE`, `get ID PATH`, `post ID PATH [JSON]`, `fetch-bundle ID`, `bundles`, `revoke ID` |
+
+Other:
+
+| Switch | Effect |
+|---|---|
+| `--decode-id <id>` | Show which components a device ID stands for, then exit |
+| `--wipe-case <case-id>` | Delete that case folder from the output location (asks for a typed yes), then exit |
 | `--version` | Print the version |
 
 ## Where the output goes
@@ -50,9 +93,10 @@ Attach the disk of the broken PC and run `run.cmd` from the kit. Run it as admin
 ```
 case.json     machine-readable summary
 report.md     human-readable case file
-inventory/    disks.json, partitions.json, hardware.json, installs.json
+inventory/    disks, partitions, hardware, installs, registry snapshot, drivers,
+              autoruns, services, tasks, log-findings.json (mostly .json)
 logs/         collected logs, raw and untouched (prefixed target- or host-)
-exports/      bcd.bak, registry hives (only when requested)
+exports/      BCD: bcd-<label>.bak (untouched backup) and .work (the copy bcdedit reads)
 debug.log     everything shown and run
 audit.log     every command attempted, with exit code
 audit/        full output of each command
@@ -65,14 +109,16 @@ Details of the logs: `docs\logging.txt`.
 - Scanning and collecting never write to the target disk. Repairs are a separate step.
 - The target is identified by disk, partition size and contents, never by a fixed drive letter, and is checked again before every repair step.
 - Every repair shows the exact command and its effect and waits for a typed yes.
+- Repairs against the running Windows are refused. Only offline installs can be repaired.
+- Every external program goes through one allowlist; anything not on it is refused and logged.
 - Some commands are not built in at all: `diskpart clean`, `format`, `delete partition`, `bootrec /fixmbr`, and blind `bcdboot` or `bcdedit /set` without a BCD export first.
-- Before any BCD or registry change the original is exported to the case folder.
+- Before any BCD change the original is exported to the case folder; the change is refused if that export does not exist. The kit never writes to the target's registry.
 - A clean SFC does not mean the PC boots. The report says "fixed" only after you confirm it booted.
 - If a section cannot run, the report says why and the others continue.
 
 ## Customer data
 
-The USB can hold customer data (names, PINs, disk contents) in `cases\`. Before leaving the USB with a customer, delete the cases with `run.cmd --wipe-case <case-id>` (or remove the `cases\` contents). Nothing is sent over the network.
+The USB can hold customer data (names, PINs, disk contents) in `cases\`. Before leaving the USB with a customer, delete the cases with `run.cmd --wipe-case <case-id>` (or remove the `cases\` contents). `--wipe-case` does not remove `devices\<ID>` (user names, serial numbers) or the copy of the log in `%TEMP%`; delete those by hand. Deleted files on a USB stick can still be recoverable. Nothing is sent over the network unless you start a remote session.
 
 ## Device ID
 
@@ -102,11 +148,73 @@ The folder holds user names and serial numbers. Treat it like `cases`.
 
 ## Inventories in every scan
 
-Besides the logs, a scan writes three read-only inventories into `inventory\`:
+Besides the logs, a scan writes read-only findings and inventories into `inventory\`:
+
+- `log-findings.json`: what the collected logs say (Startup Repair root cause, CBS and DISM errors with HRESULTs, corrupt component files, device install failures, notable events, problems in the BCD listing). Each finding names its file.
 
 - `registry-snapshot.json` with a list of startup-relevant findings (safe-boot flag, setup in progress, control-set mismatch, pending servicing, non-default shell). From the second run of a case on, `registry-changes.txt` lists what changed.
 - `drivers.json`: third-party drivers, newest first. Drivers added in the 30 days before the install's last activity are listed in the report. The menu item "Third-party drivers" proposes removing one (a confirmed repair step).
 - `autoruns.json`, `services.json`, `tasks.json`: what starts automatically, with entries worth a look marked. These are findings, not verdicts; nothing is removed.
+
+## When a scan stops
+
+A scan stops, before collecting anything, if the case output (or the `devices\` folder) would be written onto the target Windows volume. Nothing is written to the target. The screen says `Scan stopped: ... Choose another output location with --out.` Run it again with a folder on another drive, for example:
+
+```
+run.cmd --scan --out E:\cases
+```
+
+`cases\` next to `run.cmd` is the default, so this normally happens only when the kit itself sits on the target disk, or when `--out` points there. If the USB is read-only or has under 50 MB free, the kit asks for another folder (with `--auto` it uses a folder under `%TEMP%`, which is lost on reboot in WinRE).
+
+## Plugins
+
+Optional Python files in `plugins\` (`collect(ctx)`, see `docs\module-interface.md`). A plugin runs only if `plugins\manifest.sha256` lists it with the SHA-256 of the file. No manifest, not listed, or a changed file: the plugin is not loaded and its section shows an error with the reason. A listed plugin is trusted code and runs with the kit's rights; list only code you have read.
+
+To add an entry, compute the hash and append a line `<64 hex>  <file name>`:
+
+```
+certutil -hashfile plugins\name.py SHA256
+```
+
+```
+# plugins\manifest.sha256
+<the 64 hex digits from certutil, no spaces>  name.py
+```
+
+Edit the plugin again and its hash changes: update the line. No plugin ships with the kit.
+
+## The repair menu
+
+Menu "Repair and backup helpers" first asks `Enter repair mode?` and needs a typed yes. It also works before a scan (disk online, BitLocker unlock, source check). The items, in the order they appear:
+
+1. Check a repair source (WIM/ESD/SWM): compares build, edition, architecture and language with the target and refuses a mismatch.
+2. List / run a proposed repair step (offline target only): DISM, SFC, BCD steps; a BCD step is offered only when a BCD export was made in this run, the target disk is GPT, the Windows volume has a letter and the disk has exactly one EFI System partition; otherwise the menu says why.
+3. Remove an update package (offline target only): you type the exact package name.
+4. Copy user data out to another drive (whenever there is a target): shows needed and free space first, refuses if it does not fit.
+5. Bring an offline disk online (only when an offline disk exists).
+6. Unlock a BitLocker volume: asks for the drive letter and the recovery key (hidden, never logged).
+7. Show guidance (no commands run).
+8. Record boot test result: booted / did not boot / not tested, plus a note. Only this sets "booted" in the report.
+9. Back.
+
+The main menu items are: Scan; Troubleshooting assistant; Repair and backup helpers; Third-party drivers (propose removing one); Answer / update the boot-failure questions; Device settings (notes, ticket); Bundle this run into a zip; Quit. Everything except Scan, Repair and Quit needs a scan first.
+
+Each step is run one at a time. After a step, test-boot the target and record the result before the next step.
+
+## Dry run
+
+With `--dry-run` a repair step shows everything and runs nothing. Per step the screen prints: why (the finding that triggered it), the exact command, the effect, the risk, for BCD steps the backup file, and the line `DRY RUN: the command will be recorded but not executed.` It still asks `Run this command?`. Answer yes and `audit.log` gets an entry of kind `dry-run` ("not executed"); answer no and it gets `declined`. The target is not touched either way. Use it to read what a repair would do before doing it.
+
+## First run on a real machine (not yet tested in WinRE)
+
+Nothing here has been run in WinRE. Treat the first real boot as a test and write down what you see.
+
+1. Boot WinRE (or Shift+F10), find the stick, start `run.cmd`. Note whether the bundled Python starts (the first line says `Using bundled Python`).
+2. Scan first, read-only: choose Scan, or `run.cmd --scan`. Note any section marked `missing` or `error` (for example no `wevtutil`, no `manage-bde`) and the reason.
+3. Compare the chosen disk with what you know: model, size, partition, edition and language. If it is not the customer's disk, stop.
+4. Open `report.md` in the case folder (`type`, or on the main machine after bundling). Check facts, the "not yet established" list and the findings.
+5. Only then consider repairs: try `--dry-run` first, one step at a time, test-boot after each, record the result.
+6. Bundle the case (`--bundle` or the menu) and copy it to the main machine. Write down what differed from this manual.
 
 ## Headless and remote use
 
@@ -114,4 +222,4 @@ Besides the logs, a scan writes three read-only inventories into `inventory\`:
 - A program on the same machine: `run.cmd --serve` and call the agent API on 127.0.0.1 with the token it prints.
 - From the main machine: start `run.cmd --server --bind <LAN address>` there, then on the target run `run.cmd --connect http://<address>:8765 --token <agent_token>` and tell the operator the pairing code shown on the target's screen. Open `http://<address>:8765/` in a browser, or use `run.cmd --ctl`.
 
-The target never opens a LAN port: it dials out. A remote session is read-only unless it was started with `--allow-remote-repairs`, and ends on a keypress on the target, after 60 minutes, or when revoked. Without TLS certificates the traffic is authenticated but not encrypted: trusted LAN only. All routes are in `docs\api.md`.
+The target never opens a LAN port: it dials out. A remote session is read-only unless it was started with `--allow-remote-repairs`, and ends on a keypress on the target, after `--session-minutes` (default 60), or when revoked. Without TLS certificates the traffic is authenticated but not encrypted: trusted LAN only. All routes are in `docs\api.md`.
