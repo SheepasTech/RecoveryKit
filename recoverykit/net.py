@@ -250,6 +250,8 @@ class Server:
                 job = a["jobs"].get(timeout=min(float(meta.get("wait", POLL_WAIT)), POLL_WAIT))
             except queue.Empty:
                 return self._agent_reply(200, {"paired": True}, nonce)
+            if job is None or a["revoked"]:      # woken up by a revoke
+                return self._agent_reply(200, {"revoked": True}, nonce)
             return self._agent_reply(200, {"paired": True, "job": job}, nonce)
         if path == "/agent/v1/result":
             slot = a["results"].get(str(meta.get("job_id")))
@@ -330,6 +332,7 @@ class Server:
                 return js(200, {"paired": True})
             if verb == "revoke" and method == "POST":
                 a["revoked"], a["paired"] = True, False
+                a["jobs"].put(None)              # wake a held poll so the agent learns it at once
                 LOG.info("SERVER| agent %s revoked by %s", aid, operator)
                 return js(200, {"revoked": True})
             if verb == "fetch-bundle" and method == "POST":
@@ -599,9 +602,16 @@ def ctl(kit_root, argv, out=print):
     else:
         out(ctl.__doc__)
         return 2
-    status, headers, data = _request(url + API + path, method, body, {
-        "Authorization": "Bearer " + token, "Content-Type": "application/json", "Content-Length": str(len(body)),
-        "X-RK-Operator": os.environ.get("USERNAME", "operator")}, timeout=JOB_TIMEOUT + 30)
+    if any(ch.isspace() or ord(ch) < 33 or ch in (":", chr(92)) for ch in path):
+        out("Not a valid API path: %r (use for example /status or /repair/steps)" % path)
+        return 2
+    try:
+        status, headers, data = _request(url + API + path, method, body, {
+            "Authorization": "Bearer " + token, "Content-Type": "application/json", "Content-Length": str(len(body)),
+            "X-RK-Operator": os.environ.get("USERNAME", "operator")}, timeout=JOB_TIMEOUT + 30)
+    except (OSError, http.client.HTTPException) as e:
+        out("Cannot reach the server at %s: %s: %s" % (url, type(e).__name__, e))
+        return 1
     ctype = headers.get("Content-Type", "")
     if ctype.startswith("application/json"):
         try:
