@@ -215,7 +215,7 @@ class CaseRobustness(unittest.TestCase):
             c2.data["case_id"] = "T-abcd1234"
             ui2 = QuietUI()
             with mock.patch.object(case_mod.os, "rename", side_effect=PermissionError("busy")):
-                device.apply_settings(types.SimpleNamespace(case=c2, ui=ui2), {"ticket": "16028"})
+                device.apply_settings(types.SimpleNamespace(case=c2, ui=ui2), {"ticket": "12345"})
             self.assertTrue(any("could not be moved" in ln and "busy" in ln for ln in ui.lines + ui2.lines))
 
     def test_new_run_keeps_scan_a_in_its_own_folder(self):
