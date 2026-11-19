@@ -65,6 +65,14 @@ class PageStatic(unittest.TestCase):
         self.assertRegex(read_page().decode("ascii"), r'<div id="statusline"[^>]*aria-live="polite"')
 
 
+class SmokeScript(unittest.TestCase):
+    def test_smoke_script_only_uses_loopback_urls(self):
+        with open(os.path.join(ROOT, "tests", "browser", "smoke.mjs"), encoding="utf-8") as f:
+            text = f.read()
+        for m in re.finditer(r"(?i)(?:https?|wss?)://([^/\s\"'`:]+)", text):
+            self.assertIn(m.group(1).lower(), ("127.0.0.1", "localhost"), m.group(0))
+
+
 class PageServed(unittest.TestCase):
     def test_served_without_token_api_still_protected(self):
         with tempfile.TemporaryDirectory() as tmp:

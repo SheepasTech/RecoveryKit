@@ -979,7 +979,9 @@ def connect(engine, url, token, pin=None, minutes=60, name="", stop=None, on_cod
         if pin:
             ui.say("WARNING: --pin is ignored with an http:// URL (there is no certificate to pin). Use https://.")
     code_hash = hashlib.sha256(("%s|%s" % (code, agent_id)).encode()).hexdigest()
-    st, hello = call("/agent/v1/hello", {"name": name or (engine.ctx.case.data.get("case_id") or "unpaired"),
+    st, hello = call("/agent/v1/hello", {"name": name or engine.ctx.case.data.get("case_id")
+                                         or "%s (%s)" % (os.environ.get("COMPUTERNAME") or "agent",
+                                                         (getattr(engine.ctx, "env", None) or {}).get("kind", "?")),
                                          "version": __version__, "code_hash": code_hash,
                                          "allow_remote_repairs": engine.allow_remote_repairs})
     if st != 200:
