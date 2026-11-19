@@ -25,6 +25,28 @@ from .core.runner import Refused, Runner
 API = "/api/v1"
 
 
+def _redact(text, secrets):
+    """text with every secret value replaced (an argv element that contains one is hidden whole)."""
+    text = str(text)
+    for sec in secrets or ():
+        if sec and str(sec) in text:
+            text = text.replace(str(sec), "<hidden>")
+    return text
+
+
+def _snapshot(fn, tries=30):
+    """Result of fn() computed while another thread (a running scan) may change the case data: dict/list
+    iteration that hits a concurrent change raises RuntimeError; retry until it comes out consistent."""
+    err = None
+    for _ in range(tries):
+        try:
+            return fn()
+        except (RuntimeError, ValueError, TypeError) as e:     # dictionary changed size during iteration ...
+            err = e
+            time.sleep(0.005)
+    raise ApiError(503, "the case is changing (a scan is running); try again (%s)" % err)
+
+
 class ApiError(Exception):
     def __init__(self, status, message):
         super().__init__(message)
@@ -139,11 +161,20 @@ class Engine:
             return report.generate(self.ctx.case)
 
     def sections(self):
-        return {n: {"title": s["title"], "status": s["status"], "reason": s["reason"],
-                    "items": [i for i in s["items"] if i["status"] != "ok"]}
-                for n, s in self.ctx.case.data["sections"].items()}
+        def build():
+            return {n: {"title": s.get("title"), "status": s.get("status"), "reason": s.get("reason"),
+                        "items": [i for i in list(s.get("items") or []) if i.get("status") != "ok"]}
+                    for n, s in list(self.ctx.case.data["sections"].items())}
+        return _snapshot(build)
+
+    def case_snapshot(self):
+        """A consistent JSON-able copy of case.json's data, safe while a scan is running."""
+        return _snapshot(lambda: json.loads(json.dumps(self.ctx.case.data, default=str)))
 
     def status(self):
+        return _snapshot(self._status)
+
+    def _status(self):
         ctx, t = self.ctx, self.ctx.target
         from .modules import discovery
         return {"version": __version__, "environment": ctx.env["kind"], "admin": ctx.env["admin"],
@@ -207,6 +238,9 @@ class Engine:
             return dest
 
     def files(self):
+        return _snapshot(self._files)
+
+    def _files(self):
         out = []
         base = self.ctx.case.dir
         for root, dirs, files in os.walk(base):
@@ -285,8 +319,12 @@ class Engine:
             tkey = self._target_key()
             out = []
             for i, s in enumerate(steps):
-                cmd = "diskpart: " + " / ".join(s.diskpart) if s.diskpart is not None else " ".join(
-                    '"%s"' % a if " " in str(a) else str(a) for a in s.argv)
+                sec = tuple(getattr(s, "secrets", ()) or ())
+                if s.diskpart is not None:
+                    cmd = "diskpart: " + " / ".join(_redact(x, sec) for x in s.diskpart)
+                else:
+                    shown = ["<hidden>" if any(v and v in str(a) for v in sec) else str(a) for a in s.argv]
+                    cmd = " ".join('"%s"' % a if " " in a else a for a in shown)
                 key = s.id if s.id not in self._steps else "%s-%d" % (s.id, i)
                 token = hashlib.sha256((nonce + "|" + cmd).encode("utf-8")).hexdigest()[:12]
                 self._steps[key] = (s, token, ctx.target, tkey)
@@ -298,20 +336,21 @@ class Engine:
         """Run one proposed step after an explicit confirm bound to the shown command."""
         from .modules import repair
         ctx = self.ctx
-        allowed = self.allow_remote_repairs if remote else self.allow_repairs
-        if not allowed:
-            raise ApiError(403, "repairs are not enabled for this session on the target (start it with %s)" % (
-                "--allow-remote-repairs" if remote else "--allow-repairs"))
-        if step_id not in self._steps:
-            raise ApiError(404, "unknown step id; list the steps first")
-        step, want, listed_target, listed_key = self._steps[step_id]
-        if confirm != "yes" or not hmac.compare_digest(str(token), want):
-            raise ApiError(409, "not confirmed: send confirm=\"yes\" and the token shown for this exact command")
-        if ctx.target is not listed_target or self._target_key() != listed_key:
-            self._steps = {}
-            raise ApiError(409, "the target changed since the steps were listed; list the steps again")
-        self._steps.pop(step_id, None)        # single use: running it again needs a fresh listing
         with self._op("repair " + step_id):
+            # the checks are inside the lock: two identical concurrent calls cannot both pass them
+            allowed = self.allow_remote_repairs if remote else self.allow_repairs
+            if not allowed:
+                raise ApiError(403, "repairs are not enabled for this session on the target (start it with %s)" % (
+                    "--allow-remote-repairs" if remote else "--allow-repairs"))
+            if step_id not in self._steps:
+                raise ApiError(404, "unknown step id; list the steps first")
+            step, want, listed_target, listed_key = self._steps[step_id]
+            if confirm != "yes" or not hmac.compare_digest(str(token), want):
+                raise ApiError(409, "not confirmed: send confirm=\"yes\" and the token shown for this exact command")
+            if ctx.target is not listed_target or self._target_key() != listed_key:
+                self._steps = {}
+                raise ApiError(409, "the target changed since the steps were listed; list the steps again")
+            self._steps.pop(step_id, None)        # single use: running it again needs a fresh listing
             ui = ctx.ui
             LOG.info("REPAIR| API confirmation by operator %r for step %s (%s)", operator, step_id,
                      "relayed" if remote else "loopback")
@@ -330,7 +369,7 @@ class Engine:
                 repair.refresh_letter(ctx)
             self.module("assistant", "collect")
             self.report()
-            return {"result": entry, "output": (res.out if res is not None else "")[-20000:],
+            return {"result": entry, "output": _redact((res.out if res is not None else "")[-20000:], getattr(step, "secrets", ())),
                     "next": "Test boot before the next step, then record the result."}
 
     def close(self):
@@ -380,7 +419,7 @@ def _dispatch(e, method, p, q, b, remote, operator):
         if p == "/status":
             return e.status()
         if p == "/case":
-            return e.ctx.case.data
+            return e.case_snapshot()
         if p == "/sections":
             return e.sections()
         if p == "/report":
@@ -394,9 +433,9 @@ def _dispatch(e, method, p, q, b, remote, operator):
             with open(e.file_path(p[len("/files/"):]), "rb") as f:
                 return f.read(), "application/octet-stream"
         if p == "/audit":
-            return e.audit(int(q.get("since", 0)))
+            return e.audit(_int_param(q, "since"))
         if p == "/log":
-            return e.log_tail(int(q.get("offset", 0)))
+            return e.log_tail(_int_param(q, "offset"))
         if p == "/repair/steps":
             return e.repair_steps()
         if p == "/bundle/download":
@@ -419,11 +458,23 @@ def _dispatch(e, method, p, q, b, remote, operator):
     if p == "/repair/source":
         if not b.get("path"):
             raise ApiError(400, "path is required")
-        return e.check_source(str(b["path"]), b.get("index"))
+        src = str(b["path"])
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in src):
+            raise ApiError(400, "path must not contain control characters")
+        if remote and src.startswith(("\\\\", "//")):
+            raise ApiError(403, "a relayed session may not use a network path as the repair source")
+        return e.check_source(src, b.get("index"))
     if p == "/repair/run":
         return e.run_step(str(b.get("id", "")), str(b.get("token", "")), b.get("confirm"),
                           operator=operator if remote else str(b.get("operator") or operator), remote=remote)
     raise ApiError(404, "unknown POST route %s" % p)
+
+
+def _int_param(q, name):
+    try:
+        return int(q.get(name, 0))
+    except (TypeError, ValueError):
+        raise ApiError(400, "%s must be an integer" % name)
 
 
 def _check_scan_body(b, remote):

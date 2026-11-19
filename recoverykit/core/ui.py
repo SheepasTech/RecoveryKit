@@ -3,9 +3,18 @@
 Every line shown and every answer typed is logged. Secret answers are logged
 as <hidden>.
 """
+import re
 import sys
 
 from .log import LOG
+
+# C0 controls except newline/CR/tab handling (splitlines removes line breaks), DEL and C1 controls.
+_CTL = re.compile("[" + chr(0) + "-" + chr(8) + chr(11) + "-" + chr(31) + chr(127) + "-" + chr(159) + "]")
+
+
+def clean(text):
+    """Text safe to print: control characters (ESC, BEL, C1 ...) removed; newline kept."""
+    return _CTL.sub("", str(text).replace(chr(9), " "))
 
 
 class UI:
@@ -19,12 +28,13 @@ class UI:
                 pass
 
     def say(self, text=""):
-        for line in str(text).splitlines() or [""]:
+        for line in clean(text).splitlines() or [""]:
             LOG.info("SCREEN| %s", line)
             print(line, flush=True)
 
     def raw(self, line):
         """A line of live tool output."""
+        line = " ".join(clean(line).splitlines())
         LOG.info("TOOL  | %s", line)
         print(line, flush=True)
 
@@ -33,6 +43,7 @@ class UI:
         self.say("=== %s ===" % text)
 
     def ask(self, prompt, default="", secret=False):
+        prompt, default = clean(prompt), clean(default)
         LOG.info("PROMPT| %s [default=%r]", prompt, default)
         if self.auto:
             LOG.info("ANSWER| (auto) %r", default)
@@ -64,6 +75,7 @@ class UI:
 
     def confirm_yes(self, question):
         """True only if the operator types the whole word yes. Never true in auto mode."""
+        question = clean(question)
         LOG.info("CONFIRM| %s", question)
         if self.auto:
             LOG.info("ANSWER| (auto) no")

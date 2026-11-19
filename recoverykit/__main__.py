@@ -44,7 +44,10 @@ def parse_args(argv):
     g = p.add_argument_group("remote session (agent connects out; no port is opened on the target)")
     g.add_argument("--connect", metavar="URL", help="control server URL, e.g. http://192.168.1.10:8765")
     g.add_argument("--token", metavar="T", help="agent token of the server (from its config/token-server.json)")
-    g.add_argument("--pin", metavar="SHA256", help="expected SHA-256 fingerprint of the server's TLS certificate")
+    g.add_argument("--pin", metavar="SHA256", help="expected SHA-256 fingerprint of the server's TLS certificate "
+                   "(for a server whose CA is not on this stick)")
+    g.add_argument("--ca", metavar="FILE", help="CA certificate that signed the server (default: config/ca-cert.pem "
+                   "on the stick, put there by Install-ToUsb.ps1)")
     g.add_argument("--session-minutes", type=int, default=60, help="remote session length (default 60)")
     g.add_argument("--allow-remote-repairs", action="store_true",
                    help="let the remote operator run confirmed repair steps in this session (default: read-only)")
@@ -52,6 +55,9 @@ def parse_args(argv):
     g.add_argument("--server", action="store_true", help="run the control server")
     g.add_argument("--bind", metavar="IP", default="127.0.0.1", help="interface to bind (default 127.0.0.1; give the LAN address)")
     g.add_argument("--store", metavar="DIR", help="where received bundles are stored (default: cases/_server)")
+    g.add_argument("--no-tls", action="store_true", help="run the server without TLS (plain HTTP, trusted LAN only)")
+    g.add_argument("--ca-dir", metavar="DIR", help="folder of the certificate authority (default: "
+                   "%%LOCALAPPDATA%%\\ITwork\\CA)")
     g.add_argument("--intake", metavar="DIR", help="also copy bundles to <DIR>/ITW <ticket>/ (vault intake)")
     g.add_argument("--ctl", nargs=argparse.REMAINDER, metavar="...", help="operator client: agents | pair ID CODE | "
                    "get ID PATH | post ID PATH [JSON] | fetch-bundle ID | bundles | revoke ID")
@@ -112,9 +118,12 @@ def wipe_case(out_root, case_id, ui):
     if os.path.dirname(target) != os.path.abspath(out_root) or not case_id.strip(". "):
         ui.say("Not a case ID: %r" % case_id)
         return 2
-    if case_id.startswith("_"):
+    if os.path.basename(target).startswith("_"):
         ui.say("Refused: %r is not a case folder (names starting with _ are kit internals such as _pending or "
                "_server). Also note that --wipe-case never removes devices\\<ID> or the %%TEMP%% mirror of the log." % case_id)
+        return 2
+    if any(sep in case_id for sep in ("/", "\\")) or (os.sep in case_id) or (os.altsep and os.altsep in case_id):
+        ui.say("Not a case ID (no path separators allowed): %r" % case_id)
         return 2
     if not os.path.isdir(target):
         ui.say("No such case folder: %s" % target)
@@ -207,11 +216,12 @@ def main(argv=None):
         return 0
     if args.ctl is not None:
         from . import net
-        return net.ctl(KIT_ROOT, args.ctl, pin=args.pin)
+        return net.ctl(KIT_ROOT, args.ctl, pin=args.pin, ca_file=args.ca, ca_dir=args.ca_dir)
     if args.server:
         from . import net
         store = os.path.abspath(args.store) if args.store else os.path.join(KIT_ROOT, "cases", "_server")
-        return net.run_server(KIT_ROOT, args.bind, args.port or 8765, store, args.intake)
+        return net.run_server(KIT_ROOT, args.bind, args.port or 8765, store, args.intake,
+                              ca_dir=args.ca_dir, no_tls=args.no_tls)
 
     headless = args.auto or args.serve or bool(args.connect)
     ui = UI(auto=headless)
@@ -266,7 +276,7 @@ def main(argv=None):
             net.serve_local(engine, args.port or 8766)
         elif args.connect:
             from . import net
-            net.connect(engine, args.connect, args.token, pin=args.pin, minutes=args.session_minutes)
+            net.connect(engine, args.connect, args.token, pin=args.pin, minutes=args.session_minutes, ca_file=args.ca)
         elif not (args.scan or args.auto):
             menu(engine)
         if args.bundle:
@@ -275,9 +285,15 @@ def main(argv=None):
         ui.say("Interrupted by the operator.")
         rc = 130
     except Exception as e:  # noqa: BLE001
-        LOG.critical("FATAL |\n%s", traceback.format_exc())
-        ui.say("Unexpected error: %s: %s. Details are in debug.log in %s" % (type(e).__name__, e, case.dir))
-        rc = 1
+        from . import net
+        if isinstance(e, net.TlsError):          # a refused or failed TLS connection: one clear line, no traceback
+            LOG.error("AGENT | %s", e)
+            ui.say(str(e))
+            rc = 2
+        else:
+            LOG.critical("FATAL |\n%s", traceback.format_exc())
+            ui.say("Unexpected error: %s: %s. Details are in debug.log in %s" % (type(e).__name__, e, case.dir))
+            rc = 1
     finally:
         LOG.info("END   | exit code %s after %.0fs", rc, time.monotonic() - _T0)
         engine.close()

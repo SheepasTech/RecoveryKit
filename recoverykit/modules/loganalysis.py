@@ -12,6 +12,7 @@ from collections import Counter
 from ..core.log import LOG
 
 MAX_BYTES = 8 * 2 ** 20
+MAX_LINE = 4000
 MAX_HEADLINES = 12
 BCD_GUID = "{9dea862c-5cdd-4e70-acc1-f32b344d4795}"
 
@@ -77,8 +78,17 @@ def _read_tail(path):
     return text, {"size": size, "truncated": truncated}
 
 
-def _lines(text):
-    return text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+def _lines(text, info=None):
+    """Lines of text, each clipped to MAX_LINE characters (the number clipped goes to info["clipped_lines"])."""
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    clipped = 0
+    for i, ln in enumerate(lines):
+        if len(ln) > MAX_LINE:
+            lines[i] = ln[:MAX_LINE]
+            clipped += 1
+    if clipped and info is not None:
+        info["clipped_lines"] = info.get("clipped_lines", 0) + clipped
+    return lines
 
 
 def _last_distinct(lines, n):
@@ -107,9 +117,9 @@ def _clip(s, n=300):
 def analyse_srttrail(path):
     text, info = _read_tail(path)
     attempts_hdr = text.count("Startup Repair diagnosis and repair log")
-    nums = [int(x) for x in re.findall(r"Number of repair attempts:\s*(\d+)", text)]
+    nums = [int(x) for x in re.findall(r"Number of repair attempts:\s*(\d{1,9})", text)]
     chunk = text.split("Startup Repair diagnosis and repair log")[-1] if attempts_hdr else text
-    lines = _lines(chunk)
+    lines = _lines(chunk, info)
     causes, i = [], 0
     while i < len(lines):
         if lines[i].strip().lower().startswith("root cause found"):
@@ -140,11 +150,11 @@ def analyse_srttrail(path):
     nonzero = [c for c in codes if int(c, 16) != 0]
     failed, name = [], None
     for ln in lines:
-        m = re.match(r"^\s*Name:\s*(.+?)\s*$", ln)
+        m = re.match(r"^\s*Name:\s*(.*\S)$", ln.rstrip())
         if m:
             name = m.group(1)
             continue
-        m = re.match(r"^\s*Result:\s*(.*)$", ln)
+        m = re.match(r"^\s*Result:\s*(.*)$", ln.rstrip())
         if m and name:
             norm = re.sub(r"\s+", " ", m.group(1)).strip().lower()
             if norm != "completed successfully. error code = 0x0":
@@ -173,7 +183,7 @@ def _corrupt_names(lines):
 
 def analyse_cbs(path):
     text, info = _read_tail(path)
-    lines = _lines(text)
+    lines = _lines(text, info)
     err = [ln.rstrip() for ln in lines if ", Error " in ln]
     corrupt = _corrupt_names(lines)
     last_time = None
@@ -189,7 +199,7 @@ def analyse_cbs(path):
 
 def analyse_dism(path):
     text, info = _read_tail(path)
-    lines = _lines(text)
+    lines = _lines(text, info)
     err = [ln.rstrip() for ln in lines if ", Error " in ln]
     last_op = None
     for ln in reversed(lines):
@@ -203,12 +213,12 @@ def analyse_dism(path):
 
 def analyse_setup(path):
     text, info = _read_tail(path)
-    lines = _lines(text)
+    lines = _lines(text, info)
     err = [ln.rstrip() for ln in lines if ", Error " in ln or "FatalError" in ln]
     phase = None
     for ln in reversed(lines):
         if "SETUPPHASE" in ln or "Setup phase" in ln:
-            m = (re.search(r"(?:SETUPPHASE|Setup phase)\s*[:=]\s*(\S.*?)\s*$", ln)
+            m = (re.search(r"(?:SETUPPHASE|Setup phase)\s*[:=]\s*(\S.*)$", ln.rstrip())
                  or re.search(r"SETUPPHASE_?(\w+)", ln))
             if m:
                 phase = _clip(m.group(1), 80)
@@ -220,13 +230,14 @@ def analyse_setup(path):
 def analyse_setupapi(path):
     text, info = _read_tail(path)
     installs, pending, fails = [], None, []
-    for ln in _lines(text):
-        m = re.match(r"^>>>\s+\[((?:Setup online )?Device Install.*)\]\s*$", ln)
+    for ln in _lines(text, info):
+        ln = ln.rstrip()
+        m = re.match(r"^>>>\s+\[((?:Setup online )?Device Install.*)\]$", ln)
         if m:
             pending = {"header": _clip(m.group(1), 200), "start": None}
             installs.append(pending)
             continue
-        m = re.match(r"^>>>\s+Section start\s+(.+?)\s*$", ln)
+        m = re.match(r"^>>>\s+Section start\s+(\S.*)$", ln)
         if m and pending is not None and pending["start"] is None:
             pending["start"] = m.group(1)
         elif ln.startswith("!!!"):
@@ -239,10 +250,22 @@ def _norm_source(src):
     return s[len("microsoft-windows-"):] if s.startswith("microsoft-windows-") else s
 
 
-_SHORT = re.compile(r"^Event\[\d+\]:\s*(\S+)\s+Level\s+\d+\s*(?:\([^)]*\))?\s+ID\s+(\d+)\s+(.+?)(?:\s+\[(.*)\])?\s*$")
+_SHORT = re.compile(r"^Event\[\d{1,9}\]: ?(\S+) Level \d{1,9} ?(?:\([^)]*\))? ID (\d{1,9}) (.*)$")
+_WS = re.compile(r"\s+")
 
 
-def parse_events(text):
+def _short_source(rest):
+    """Source part of the text after the ID: everything before a trailing " [channel]" (linear scan)."""
+    if rest.endswith("]"):
+        i = rest.find("[")
+        while i >= 0:
+            if i > 0 and rest[i - 1].isspace() and rest[:i].strip():
+                return rest[:i].strip()
+            i = rest.find("[", i + 1)
+    return rest.strip()
+
+
+def parse_events(text, info=None):
     """Both formats. Returns [{"source", "id", "date", "text"}]."""
     events, cur = [], None
 
@@ -250,17 +273,17 @@ def parse_events(text):
         if cur and cur.get("source") and cur.get("id") is not None:
             events.append(cur)
 
-    for ln in _lines(text):
+    for ln in _lines(text, info):
         if ln.startswith("Event["):
             fin()
             cur = {"source": None, "id": None, "date": None, "text": []}
-            m = _SHORT.match(ln.rstrip())
+            m = _SHORT.match(_WS.sub(" ", ln).strip())
             if m:
-                cur.update(date=m.group(1), id=int(m.group(2)), source=m.group(3).strip())
+                cur.update(date=m.group(1), id=int(m.group(2)), source=_short_source(m.group(3)))
             continue
         if cur is None:
             continue
-        m = re.match(r"^\s+(Source|Event ID|Date):\s*(.*?)\s*$", ln)
+        m = re.match(r"^\s+(Source|Event ID|Date):\s*(.*)$", ln.rstrip())
         if m and cur["source"] is None and m.group(1) == "Source":
             cur["source"] = m.group(2)
         elif m and m.group(1) == "Event ID" and cur["id"] is None and m.group(2).isdigit():
@@ -275,7 +298,7 @@ def parse_events(text):
 
 def analyse_events(path):
     text, info = _read_tail(path)
-    events = parse_events(text)
+    events = parse_events(text, info)
     by = Counter("%s %d" % (e["source"], e["id"]) for e in events)
     notable, summary = [], {}
     for e in events:
@@ -298,14 +321,14 @@ def analyse_events(path):
             "notable_summary": sorted(summary.values(), key=lambda s: -s["count"]), **info}
 
 
-def _parse_bcd(text):
+def _parse_bcd(text, info=None):
     blocks, cur, prev = [], None, ""
-    for ln in _lines(text):
+    for ln in _lines(text, info):
         if re.match(r"^-{3,}\s*$", ln) and prev.strip():
             cur = {"title": prev.strip(), "el": {}}
             blocks.append(cur)
         elif cur is not None and ln and not ln[0].isspace():
-            m = re.match(r"^(\S+)\s{2,}(\S.*?)\s*$", ln)
+            m = re.match(r"^(\S+)\s{2,}(\S.*)$", ln.rstrip())
             if m:
                 cur["el"].setdefault(m.group(1).lower(), m.group(2))
         prev = ln
@@ -314,7 +337,7 @@ def _parse_bcd(text):
 
 def analyse_bcd(path):
     text, info = _read_tail(path)
-    blocks = _parse_bcd(text)
+    blocks = _parse_bcd(text, info)
     withid = [b for b in blocks if "identifier" in b["el"]]
     res = {"entries": len(withid), "has_bootmgr": False, "default": None, "os_loaders": [], "problems": [], **info}
     if not withid:
@@ -391,6 +414,8 @@ def _run(sec, name, path, fn, missing_why):
     if res.get("unrecognised"):
         sec.item(name, "error", "listing not in English or empty" + ("; " + note if note else ""))
         return res
+    if res.get("clipped_lines"):
+        note = (note + "; " if note else "") + "%d line(s) clipped to %d characters" % (res["clipped_lines"], MAX_LINE)
     sec.item(name, "ok", note, size=res.get("size"))
     return res
 

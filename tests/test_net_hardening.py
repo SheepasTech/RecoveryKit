@@ -3,6 +3,7 @@
 Servers bind 127.0.0.1 port 0 only. Engines are dry-run; no repair command is ever executed.
 """
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -65,9 +66,7 @@ class ServerCase(unittest.TestCase):
     # signed agent message by hand
     def post(self, path, meta, body=b"", sign_path=None, tok=None):
         m = net._pack(meta)
-        return net._request(self.url + path, "POST", body, {
-            "X-RK-Meta": m, "X-RK-Sig": net._sig(tok or self.token, sign_path or path, m, body),
-            "Content-Length": str(len(body))})
+        return net._request(self.url + path, "POST", body, net._signed_headers(tok or self.token, sign_path or path, m, body))
 
     def api(self, method, path, body=None, timeout=60):
         data = json.dumps(body).encode() if body is not None else b""
@@ -81,22 +80,35 @@ class ServerCase(unittest.TestCase):
 class FakeAgent:
     """An agent speaking the wire protocol by hand; answers relayed jobs from a table path -> (status, ctype, bytes)."""
 
+    code = "123456"
+
     def __init__(self, t, answers=None, aid=None):
         self.t, self.answers, self.aid, self.n = t, answers or {}, aid or secrets.token_hex(4), 0
+        self.key = t.token                       # the agent token until the server says "switch"
         self.jobs, self.stop = [], threading.Event()
         self.thread = None
 
     def call(self, path, meta, body=b""):
         self.n += 1
-        status, headers, data = self.t.post(path, dict(meta, agent_id=self.aid, n=self.n, nonce=secrets.token_hex(6)), body)
-        return status, json.loads(data)
+        status, headers, data = self.t.post(path, dict(meta, agent_id=self.aid, n=self.n, nonce=secrets.token_hex(6)), body,
+                                            tok=self.key)
+        obj = json.loads(data)
+        if obj.get("switch") and self.key == self.t.token:
+            self.key = net._session_key(self.t.token, self.aid, self.code)
+        return status, obj
 
     def hello(self):
-        return self.call(HELLO, {"name": "fake", "code_hash": "x"})
+        return self.call(HELLO, {"name": "fake", "code_hash": hashlib.sha256(
+            ("%s|%s" % (self.code, self.aid)).encode()).hexdigest()})
 
     def pair(self):
+        """hello, the operator's pairing, and the first poll that tells this agent to switch to the session key."""
         self.hello()
-        self.t.server.agents[self.aid]["paired"] = True
+        status, out = self.t.api("POST", "/agents/%s/pair" % self.aid, {"code": self.code})
+        assert status == 200, out
+        status, r = self.call(POLL, {"wait": 0})
+        assert (status, r) == (200, {"paired": True, "switch": True}), (status, r)
+        assert self.key != self.t.token
 
     def result(self, job_id, status=200, ctype="application/json", body=b"{}"):
         return self.call(RESULT, {"job_id": job_id, "status": status, "ctype": ctype}, body)
@@ -170,24 +182,24 @@ class AgentProtocol(ServerCase):
         victim.pair()
         before = dict(self.server.agents[victim.aid])
         meta = {"agent_id": victim.aid, "nonce": "z", "name": "evil", "code_hash": "evil"}
-        self.assertEqual(self.post(HELLO, dict(meta, n=10**18))[0], 400)
-        self.assertEqual(self.post(HELLO, dict(meta, n=2**53))[0], 400)
-        self.assertEqual(self.post(HELLO, dict(meta, n=-5))[0], 400)
-        self.assertEqual(self.post(HELLO, dict(meta, n="7"))[0], 400)
-        self.assertEqual(self.post(HELLO, dict(meta, n=True))[0], 400)
-        status, headers, data = self.post(HELLO, dict(meta, n=50))
+        # a message with a valid signature but a bad counter (the key is the victim's own)
+        for n, want in ((10**18, 400), (2**53, 400), (-5, 400), ("7", 400), (True, 400)):
+            self.assertEqual(self.post(HELLO, dict(meta, n=n), tok=victim.key)[0], want, n)
+        status, headers, data = self.post(HELLO, dict(meta, n=50), tok=victim.key)
         self.assertEqual(status, 409)
-        self.assertEqual(headers["X-RK-Sig"], net._sig(self.token, HELLO, headers["X-RK-Meta"], data))   # signed reply
+        self.assertEqual(headers["X-RK-Sig"], net._sig(victim.key, HELLO, headers["X-RK-Meta"], data))   # signed reply
         a = self.server.agents[victim.aid]
         self.assertTrue(a["paired"])
-        self.assertEqual((a["n"], a["name"], a["code_hash"]), (before["n"], "fake", "x"))
+        self.assertEqual((a["n"], a["name"]), (before["n"], "fake"))
+        self.assertEqual(a["code_hash"], before["code_hash"])
         self.assertEqual(victim.call(POLL, {"wait": 0})[0], 200)       # the real agent carries on
 
     def test_one_message_cannot_burn_the_counter(self):
         victim = FakeAgent(self)
         victim.pair()
         n = self.server.agents[victim.aid]["n"]
-        self.assertEqual(self.post(POLL, {"agent_id": victim.aid, "n": n + 1_000_001, "nonce": "z", "wait": 0})[0], 409)
+        self.assertEqual(self.post(POLL, {"agent_id": victim.aid, "n": n + 1_000_001, "nonce": "z", "wait": 0},
+                                   tok=victim.key)[0], 409)
         self.assertEqual(victim.call(POLL, {"wait": 0})[0], 200)
 
     def test_old_unpaired_entry_can_be_replaced_a_paired_one_never(self):
@@ -204,27 +216,11 @@ class AgentProtocol(ServerCase):
         a = FakeAgent(self)
         a.hello()
         m = net._pack({"agent_id": a.aid, "n": 2, "nonce": "p1", "wait": 0})
-        sig = net._sig(self.token, POLL, m, b"")
-        status, _, _ = net._request(self.url + POLL, "POST", b"", {"X-RK-Meta": m, "X-RK-Sig": sig, "Content-Length": "0"})
+        hdr = net._signed_headers(self.token, POLL, m, b"")
+        status, _, _ = net._request(self.url + POLL, "POST", b"", hdr)
         self.assertEqual(status, 200)
-        status, _, _ = net._request(self.url + HELLO, "POST", b"", {"X-RK-Meta": m, "X-RK-Sig": sig, "Content-Length": "0"})
+        status, _, _ = net._request(self.url + HELLO, "POST", b"", hdr)
         self.assertEqual(status, 401)
-
-    def test_agent_cap(self):
-        ids = []
-        for i in range(net.MAX_AGENTS):
-            a = FakeAgent(self, aid="a%03d" % i)
-            self.assertEqual(a.hello()[0], 200)
-            ids.append(a.aid)
-        self.assertEqual(len(self.server.agents), 64)
-        extra = FakeAgent(self, aid="extra")
-        self.assertEqual(extra.hello()[0], 200)                     # the oldest unpaired entry made room
-        self.assertEqual(len(self.server.agents), 64)
-        self.assertNotIn(ids[0], self.server.agents)
-        for a in self.server.agents.values():
-            a["paired"] = True
-        self.assertEqual(FakeAgent(self, aid="late").hello()[0], 429)
-        self.assertEqual(len(self.server.agents), 64)
 
     def test_pair_failures_are_counted_under_the_lock(self):
         a = FakeAgent(self)
@@ -238,6 +234,313 @@ class AgentProtocol(ServerCase):
         [t.join() for t in ts]
         self.assertEqual(self.server.agents[a.aid]["pair_failures"], 5)
         self.assertEqual(sorted(results).count(403), 5)
+
+
+# ------------------------------------------------------------------ A2 session key
+class SessionKey(ServerCase):
+    def queue_job(self, a, job_id="j1"):
+        ag = self.server.agents[a.aid]
+        ag["results"][job_id] = {"done": threading.Event()}
+        ag["jobs"].put({"id": job_id, "method": "GET", "path": API + "/status", "query": {}, "body": {}, "operator": "x",
+                        "expires": time.time() + 100})
+        return ag
+
+    def snapshot(self, ag):
+        return (ag["n"], ag["last_seen"], ag["jobs"].qsize(), sorted(ag["results"]))
+
+    def test_session_key_is_bound_to_token_agent_and_code(self):
+        k = net._session_key(self.token, "aabbccdd", "123456")
+        self.assertNotEqual(k, self.token)
+        self.assertEqual(len(k), 64)
+        self.assertNotEqual(k, net._session_key(self.token, "aabbccdd", "123457"))
+        self.assertNotEqual(k, net._session_key(self.token, "aabbccde", "123456"))
+        self.assertNotEqual(k, net._session_key("other-token", "aabbccdd", "123456"))
+
+    def test_token_holder_cannot_poll_post_results_or_hello_for_a_paired_agent(self):
+        victim = FakeAgent(self)
+        victim.pair()
+        victim.call(POLL, {"wait": 0})                      # a message signed with the session key: window closed
+        ag = self.queue_job(victim)
+        before = self.snapshot(ag)
+        n = ag["n"]
+        for path, extra in ((POLL, {"wait": 0}), (RESULT, {"job_id": "j1", "status": 200, "ctype": "application/json"}),
+                            (HELLO, {"name": "evil", "code_hash": "x"})):
+            status, headers, data = self.post(path, dict(extra, agent_id=victim.aid, n=n + 1, nonce="z"), b"{}")
+            self.assertEqual(status, 401, path)
+            self.assertNotIn("X-RK-Sig", headers)
+            self.assertEqual(self.snapshot(ag), before, path)          # nothing changed: not n, last_seen, queue
+        # a guess at the session key with a wrong code does not work either
+        bad = net._session_key(self.token, victim.aid, "000000")
+        self.assertEqual(self.post(POLL, {"agent_id": victim.aid, "n": n + 1, "nonce": "z", "wait": 0}, tok=bad)[0], 401)
+        self.assertEqual(self.snapshot(ag), before)
+        status, r = victim.call(POLL, {"wait": 1})                      # the real agent still gets its job
+        self.assertEqual((status, r["job"]["id"]), (200, "j1"))
+        self.assertEqual(self.server.agents[victim.aid]["name"], "fake")
+
+    def test_before_the_first_session_message_a_token_poll_only_gets_a_stateless_switch_answer(self):
+        victim = FakeAgent(self)
+        victim.hello()
+        self.assertEqual(self.api("POST", "/agents/%s/pair" % victim.aid, {"code": victim.code})[0], 200)
+        ag = self.queue_job(victim)
+        before = self.snapshot(ag)
+        status, headers, data = self.post(POLL, {"agent_id": victim.aid, "n": 99999, "nonce": "z", "wait": 0})
+        self.assertEqual((status, json.loads(data)), (200, {"paired": True, "switch": True}))   # no job, signed with the token
+        self.assertEqual(headers["X-RK-Sig"], net._sig(self.token, POLL, headers["X-RK-Meta"], data))
+        self.assertEqual(self.snapshot(ag), before)
+        self.assertEqual(self.post(RESULT, {"agent_id": victim.aid, "n": 99999, "nonce": "z", "job_id": "j1"}, b"{}")[0], 401)
+        self.assertEqual(self.post(HELLO, {"agent_id": victim.aid, "n": 99999, "nonce": "z"})[0], 401)
+        self.assertEqual(self.snapshot(ag), before)
+        status, r = victim.call(POLL, {"wait": 0})          # the real agent: switch, then the job comes with the new key
+        self.assertTrue(r["switch"])
+        status, r = victim.call(POLL, {"wait": 1})
+        self.assertEqual(r["job"]["id"], "j1")
+        self.assertEqual(self.post(POLL, {"agent_id": victim.aid, "n": 99999, "nonce": "z", "wait": 0})[0], 401)   # closed now
+
+    def test_nothing_is_relayed_before_pairing(self):
+        a = FakeAgent(self)
+        a.hello()
+        self.assertEqual(self.api("GET", "/agents/%s/api/status" % a.aid)[0], 409)
+        self.assertEqual(a.call(POLL, {"wait": 0}), (200, {"paired": False}))
+
+    def test_connect_switches_keys_and_the_whole_session_runs_on_the_session_key(self):
+        seen = []
+        orig = net._sig
+
+        def spy(key, *a):
+            seen.append(key)
+            return orig(key, *a)
+        eng = types.SimpleNamespace(ctx=types.SimpleNamespace(ui=QuietUI(), case=types.SimpleNamespace(data={})),
+                                    allow_remote_repairs=False)
+        got, stop = {}, threading.Event()
+        with mock.patch.object(net, "_sig", spy), mock.patch.object(net, "route", lambda *a, **k: (200, {"ok": 1})):
+            t = threading.Thread(target=net.connect, args=(eng, self.url, self.token),
+                                 kwargs={"minutes": 1, "stop": stop, "on_code": lambda i, c: got.update(id=i, code=c)})
+            t.start()
+            self.addCleanup(lambda: (stop.set(), t.join(15)))
+            for _ in range(100):
+                if got:
+                    break
+                time.sleep(0.05)
+            self.assertEqual(self.api("POST", "/agents/%s/pair" % got["id"], {"code": got["code"]})[0], 200)
+            self.assertEqual(self.api("GET", "/agents/%s/api/status" % got["id"]), (200, {"ok": 1}))
+            time.sleep(0.5)
+        sk = net._session_key(self.token, got["id"], got["code"])
+        self.assertIn(self.token, seen)
+        self.assertIn(sk, seen)
+        self.assertEqual(seen[-5:].count(sk), 5)            # the end of the session uses the session key only
+
+
+# ------------------------------------------------------------------ A3 agent table
+class AgentTable(ServerCase):
+    def test_fresh_table_refuses_new_hello_with_a_signed_429_and_a_stale_entry_makes_room(self):
+        ids = []
+        for i in range(net.MAX_AGENTS):
+            a = FakeAgent(self, aid="%08x" % (0xa0000000 + i))
+            self.assertEqual(a.hello()[0], 200)
+            ids.append(a.aid)
+        extra = FakeAgent(self, aid="eeeeeeee")
+        status, headers, data = self.post(HELLO, {"agent_id": "eeeeeeee", "n": 1, "nonce": "q", "name": "x"})
+        self.assertEqual(status, 429)
+        self.assertEqual(headers["X-RK-Sig"], net._sig(self.token, HELLO, headers["X-RK-Meta"], data))
+        self.assertEqual(len(self.server.agents), 64)
+        self.assertIn(ids[0], self.server.agents)                      # nobody was evicted
+        self.server.agents[ids[5]]["last_seen"] -= net.STALE_UNPAIRED + 1
+        self.server.agents[ids[6]]["last_seen"] -= net.STALE_UNPAIRED + 50     # the longest silent one goes
+        self.assertEqual(extra.hello()[0], 200)
+        self.assertNotIn(ids[6], self.server.agents)
+        self.assertIn(ids[5], self.server.agents)
+        self.assertEqual(len(self.server.agents), 64)
+        for a in self.server.agents.values():
+            a["paired"] = True
+        self.assertEqual(FakeAgent(self, aid="1a7e1a7e").hello()[0], 429)
+        self.assertEqual(len(self.server.agents), 64)
+
+    def test_silent_paired_entries_are_pruned_on_hello_and_on_the_agent_list(self):
+        for i in range(3):
+            a = FakeAgent(self, aid="%08x" % (0xb0000000 + i))
+            a.hello()
+            self.server.agents[a.aid]["paired"] = True
+        for aid in ("b0000000", "b0000001"):
+            self.server.agents[aid]["last_seen"] -= net.PAIRED_IDLE + 60
+        self.assertEqual(FakeAgent(self, aid="c0000000").hello()[0], 200)
+        self.assertEqual(sorted(self.server.agents), ["b0000002", "c0000000"])
+        self.server.agents["b0000002"]["last_seen"] -= net.PAIRED_IDLE + 60
+        status, listing = self.api("GET", "/agents")
+        self.assertEqual([x["id"] for x in listing], ["c0000000"])
+        self.assertNotIn("b0000002", self.server.agents)
+
+    def _run_connect(self, on_code=None):
+        eng = types.SimpleNamespace(ctx=types.SimpleNamespace(ui=QuietUI(), case=types.SimpleNamespace(data={})),
+                                    allow_remote_repairs=False)
+        polls = []
+        orig_call = self.server._agent_call
+
+        def counting(path, headers, body):
+            if path == POLL:
+                polls.append(1)
+            return orig_call(path, headers, body)
+        out = {}
+        stop = threading.Event()
+        with mock.patch.object(net, "BACKOFF_STEP", 0.01), mock.patch.object(net, "BACKOFF_MAX", 0.02), \
+                mock.patch.object(self.server, "_agent_call", counting):
+            t0 = time.monotonic()
+            out["reason"] = net.connect(eng, self.url, self.token, minutes=1, stop=stop,
+                                        on_code=(lambda i, c: on_code(i)) if on_code else None)
+            out["seconds"] = time.monotonic() - t0
+        out["polls"] = len(polls)
+        return out
+
+    def test_connect_treats_a_signed_404_as_a_failure_with_backoff_and_ends_after_five(self):
+        out = self._run_connect(lambda aid: self.server.agents.pop(aid))     # the entry was evicted: signed 404s
+        self.assertEqual(out["polls"], 5)
+        self.assertIn("server unreachable", out["reason"])
+        self.assertIn("404", out["reason"])
+        self.assertLess(out["seconds"], 10)
+
+    def test_connect_treats_409_and_429_the_same_way(self):
+        for status in (409, 429):
+            orig = self.server._agent_reply
+
+            def reply(st, obj, nonce, path, key, _s=status, _o=orig):
+                if path == POLL:
+                    return _o(_s, {"error": "no"}, nonce, path, key)
+                return _o(st, obj, nonce, path, key)
+            with mock.patch.object(self.server, "_agent_reply", reply):
+                out = self._run_connect()
+            self.assertEqual(out["polls"], 5, status)
+            self.assertIn(str(status), out["reason"])
+
+
+# ------------------------------------------------------------------ A4 head MAC, limits
+class HeadAuth(ServerCase):
+    def head_request(self, path, meta, body_len, head_key=None, cl=None):
+        """Request headers only (the body is NOT sent), as bytes. head_key None = no X-RK-Head."""
+        m = net._pack(meta)
+        lines = ["POST %s HTTP/1.1" % path, "Host: x", "X-RK-Meta: %s" % m, "X-RK-Sig: %s" % ("0" * 64),
+                 "Content-Length: %d" % (body_len if cl is None else cl)]
+        if head_key:
+            lines.append("X-RK-Head: %s" % net._head_sig(head_key, path, m, body_len))
+        return ("\r\n".join(lines) + "\r\n\r\n").encode()
+
+    def test_huge_content_length_with_a_bad_head_mac_is_refused_without_reading_the_body(self):
+        meta = {"agent_id": "aabbccdd", "n": 1, "nonce": "z", "job_id": "nope"}
+        for head_key in (None, "wrong-key"):
+            t0 = time.monotonic()
+            res = raw_http(self.port, self.head_request(RESULT, meta, 2**30, head_key), wait=10)
+            self.assertEqual(res, (401, True), head_key)
+            self.assertLess(time.monotonic() - t0, 3)              # answered at once, nothing was waited for
+
+    def test_head_mac_covers_path_and_content_length(self):
+        meta = {"agent_id": "aabbccdd", "n": 1, "nonce": "z"}
+        # MAC made for 5 bytes but the request says 6: refused before the body
+        req = self.head_request(POLL, meta, 5, self.token, cl=6)
+        self.assertEqual(raw_http(self.port, req, wait=5), (401, True))
+        # MAC made for the poll path used on the hello path
+        req = self.head_request(POLL, meta, 5, self.token).replace(b"POST " + POLL.encode(), b"POST " + HELLO.encode())
+        self.assertEqual(raw_http(self.port, req, wait=5), (401, True))
+
+    def test_result_limit_is_64_mib_unless_the_job_is_pending_for_that_agent(self):
+        a = FakeAgent(self)
+        a.pair()
+        size = net.MAX_BODY + 1
+        meta = {"agent_id": a.aid, "n": 99, "nonce": "z", "job_id": "unknown"}
+        req = self.head_request(RESULT, meta, size, a.key)
+        self.assertEqual(raw_http(self.port, req, wait=5), (413, True))
+        self.server.agents[a.aid]["results"]["j9"] = {"done": threading.Event()}
+        s = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        try:
+            s.sendall(self.head_request(RESULT, dict(meta, job_id="j9"), size, a.key))
+            s.settimeout(1)
+            with self.assertRaises(socket.timeout):               # accepted: the server now waits for the body
+                s.recv(100)
+        finally:
+            s.close()
+        other = FakeAgent(self)
+        other.pair()
+        req = self.head_request(RESULT, dict(meta, agent_id=other.aid, job_id="j9"), size, other.key)
+        self.assertEqual(raw_http(self.port, req, wait=5), (413, True))            # another agent's job id
+
+    def test_slow_drip_body_is_cut_off_at_the_total_deadline(self):
+        srv = net.Server(self.kit, os.path.join(self.tmp, "store2"), None, say=lambda m: None)
+        srv.start("127.0.0.1", 0, deadline=1.5)
+        self.addCleanup(srv.stop)
+        port = srv.httpd.server_address[1]
+        m = net._pack({"agent_id": "aabbccdd", "n": 1, "nonce": "z", "name": "x"})
+        hdr = net._signed_headers(srv.tokens["agent_token"], HELLO, m, b"x" * 200)
+        req = ("POST %s HTTP/1.1\r\nHost: x\r\n" % HELLO + "".join("%s: %s\r\n" % kv for kv in hdr.items()) + "\r\n").encode()
+        s = socket.create_connection(("127.0.0.1", port), timeout=10)
+        t0 = time.monotonic()
+        sent, closed = 0, False
+        try:
+            s.sendall(req)
+            while time.monotonic() - t0 < 10 and not closed:
+                try:
+                    s.sendall(b"x")
+                    sent += 1
+                except OSError:
+                    closed = True
+                    break
+                time.sleep(0.2)                                    # well inside the 30 s socket timeout
+                s.setblocking(False)
+                try:
+                    closed = s.recv(10) == b""
+                except BlockingIOError:
+                    pass
+                except OSError:
+                    closed = True
+                s.setblocking(True)
+            self.assertTrue(closed)
+            self.assertLess(time.monotonic() - t0, 4)
+            self.assertLess(sent, 100)
+        finally:
+            s.close()
+
+    def test_connection_cap_gives_503_at_once_and_frees_up(self):
+        srv = net.Server(self.kit, os.path.join(self.tmp, "store3"), None, say=lambda m: None)
+        url = srv.start("127.0.0.1", 0, max_conn=3)
+        self.addCleanup(srv.stop)
+        port = srv.httpd.server_address[1]
+        idle = [socket.create_connection(("127.0.0.1", port), timeout=5) for _ in range(3)]
+        try:
+            time.sleep(0.3)
+            t0 = time.monotonic()
+            self.assertEqual(raw_http(port, b"", wait=5), (503, True))   # the 4th connection of a cap of 3
+            self.assertLess(time.monotonic() - t0, 2)
+            idle.pop().close()                                     # one slot comes back
+            for _ in range(50):
+                try:
+                    if net._request(url + "/", timeout=5)[0] == 200:
+                        break
+                except OSError:
+                    pass
+                time.sleep(0.1)
+            else:
+                self.fail("the freed slot was never usable")
+        finally:
+            for s in idle:
+                s.close()
+        self.assertEqual(net.MAX_CONNECTIONS, 64)
+
+
+# ------------------------------------------------------------------ B14 agent id and text
+class AgentIdAndText(ServerCase):
+    def test_bad_agent_ids_are_400_and_create_no_state(self):
+        for bad in ("__proto__", "AABBCCDD", "aabbccd", "aabbccdd0", "aabb ccd", "aabbccd\n", "../x", "", "constructor"):
+            status = self.post(HELLO, {"agent_id": bad, "n": 1, "nonce": "z", "name": "x"})[0]
+            self.assertEqual(status, 400, repr(bad))
+        self.assertEqual(self.server.agents, {})
+        self.assertEqual(self.post(HELLO, {"agent_id": "0a1b2c3d", "n": 1, "nonce": "z", "name": "x"})[0], 200)
+
+    def test_name_and_version_are_printable_ascii_and_clipped(self):
+        meta = {"agent_id": "0a1b2c3d", "n": 1, "nonce": "z", "name": "ev\nil\x1b[31m‮ nameé" + "x" * 100,
+                "version": "1.\r\n2" + "9" * 50}
+        self.assertEqual(self.post(HELLO, meta)[0], 200)
+        a = self.server.agents["0a1b2c3d"]
+        self.assertEqual(len(a["name"]), 60)
+        self.assertTrue(a["name"].startswith("evil[31m name"))
+        self.assertEqual(a["version"], ("1.2" + "9" * 50)[:20])
+        for c in a["name"] + a["version"]:
+            self.assertTrue(" " <= c <= "~")
 
 
 # ------------------------------------------------------------------ C8
@@ -270,10 +573,10 @@ class JobExpiry(ServerCase):
         calls = []
         orig = self.server._agent_reply
 
-        def zero_ttl(status, obj, nonce, path):
+        def zero_ttl(status, obj, *rest):
             if "job" in obj:
                 obj = dict(obj, job=dict(obj["job"], ttl=0))
-            return orig(status, obj, nonce, path)
+            return orig(status, obj, *rest)
         self.server._agent_reply = zero_ttl
         eng = types.SimpleNamespace(ctx=types.SimpleNamespace(ui=QuietUI(), case=types.SimpleNamespace(data={})),
                                     allow_remote_repairs=False)
@@ -458,6 +761,30 @@ class BundleFetch(ServerCase):
         status, _ = self.fetch(blob=bytes(good))
         self.assertEqual(status, 502)
 
+    def test_zip_bombs_and_huge_directories_are_refused_before_testzip(self):
+        def refused(blob):
+            with mock.patch.object(zipfile.ZipFile, "testzip", side_effect=AssertionError("testzip must not run")):
+                status, out = self.fetch(blob=blob)
+            self.assertEqual(status, 502, out)
+            self.assertEqual([f for f in self.stored_files() if f.endswith(".zip")], [])
+        zeros = {"run/case.json": b"{}", "run/big.bin": b"\x00" * (2 * 2**20)}      # ~2 KiB compressed
+        with mock.patch.object(net, "ZIP_RATIO_MIN_SIZE", 2**20):
+            refused(make_zip(zeros))                                              # ratio above 1000 and above the size floor
+        with mock.patch.object(net, "MAX_ZIP_TOTAL", 2**20):
+            refused(make_zip(zeros))                                              # declared total too large
+        with mock.patch.object(net, "MAX_ZIP_MEMBERS", 3):
+            refused(make_zip({"run/f%d" % i: b"x" for i in range(5)}))            # too many members
+        # the real limits accept a normal bundle, and a big but honest member is not a bomb
+        self.assertEqual(self.fetch(blob=make_zip({"run/case.json": b"{}", "run/x.bin": os.urandom(100000)}))[0], 200)
+
+    def test_declared_huge_member_is_refused_with_the_real_limits(self):
+        blob = make_zip({"run/case.json": b"{}", "run/zeros.bin": b"\x00" * (300 * 2**20)})   # ~300 KiB, 300 MiB declared
+        with mock.patch.object(zipfile.ZipFile, "testzip", side_effect=AssertionError("testzip must not run")):
+            status, out = self.fetch(blob=blob)
+        self.assertEqual(status, 502, out)
+        self.assertIn("compression ratio", out["error"])
+        self.assertEqual([f for f in self.stored_files() if f.endswith(".zip")], [])
+
     def test_agent_json_that_is_not_an_object_gives_502(self):
         self.assertEqual(self.fetch(status_obj=[1, 2])[0], 502)
         self.assertEqual(self.fetch(case_obj="text")[0], 502)
@@ -593,11 +920,31 @@ class CommandLine(unittest.TestCase):
                 self.assertEqual(main_mod.wipe_case(out, name, ui), 2)
                 self.assertTrue(os.path.isdir(os.path.join(out, name)))
                 self.assertTrue(any("devices" in l and "TEMP" in l for l in ui.lines))
+            for evil in ("./_server", ".\\_pending", "x/../_server", "_server/", "sub/ITW-1-A", "sub\\ITW-1-A",
+                         "..\\" + os.path.basename(out), "./ITW-1-A"):
+                ui = QuietUI()
+                ui.confirm_yes = lambda question: self.fail("must not even ask: %r" % evil)
+                self.assertEqual(main_mod.wipe_case(out, evil, ui), 2, evil)
+                self.assertTrue(os.path.isdir(os.path.join(out, "_server")), evil)
             os.makedirs(os.path.join(out, "ITW-1-A"))
             ui = QuietUI()
             ui.confirm_yes = lambda question: True
             self.assertEqual(main_mod.wipe_case(out, "ITW-1-A", ui), 0)
             self.assertTrue(any("devices" in l and "TEMP" in l for l in ui.lines))
+
+    def test_ctl_strips_control_characters_from_what_the_server_sends(self):
+        evil = "ok \x1b[2J\x1b]0;pwned\x07 a\rb\x7f\x9b end\nsecond line"
+        for ctype, data in (("text/markdown", evil.encode()), ("application/json", json.dumps({"k": evil}).encode()),
+                            ("application/json", b'{"bad": "' + evil.encode() + b'"}'), ("application/octet-stream", b"x")):
+            out = []
+            with mock.patch.object(net, "_request", lambda *a, **k: (200, {"Content-Type": ctype}, data)):
+                net.ctl(tempfile.gettempdir(), ["--url", "http://127.0.0.1:1", "--token", "t", "get", "abc12345", "/report"],
+                        out.append)
+            text = "\n".join(out)
+            for ch in "\x1b\x07\r\x7f\x9b":
+                self.assertNotIn(ch, text, (ctype, repr(ch)))
+            if ctype == "text/markdown":
+                self.assertIn("end\nsecond line", text)
 
     def test_pin_with_http_warns_in_ctl(self):
         out = []

@@ -16,6 +16,7 @@ import re
 import subprocess
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass, field
 
 from .log import LOG
@@ -120,9 +121,25 @@ def _inside(path, folder):
         return False
 
 
-def _robocopy(args):
+def _norm(path):
+    p = path.rstrip("\\/")
+    return os.path.normcase(os.path.abspath(p if len(p) > 2 else path))
+
+
+def _same_or_inside(a, b):
+    """True if normalised path a equals b or is inside b."""
+    try:
+        return a == b or os.path.commonpath([a, b]) == b
+    except ValueError:
+        return False
+
+
+def _robocopy(args, case_dir=None):
     if len(args) < 2 or args[0].startswith("/") or args[1].startswith("/"):
         return FORBIDDEN, "robocopy needs a source and a destination first"
+    src, dst = _norm(args[0]), _norm(args[1])
+    if _same_or_inside(dst, src) or _same_or_inside(src, dst):
+        return FORBIDDEN, "robocopy destination and source must be separate folders (not equal, not nested)"
     prev = None
     for a in args[2:]:
         if not a.startswith("/"):
@@ -138,20 +155,79 @@ def _robocopy(args):
             return FORBIDDEN, "robocopy %s value %r is not allowed" % (name, val)
         if name in _ROBO_NUM and not val.isdigit():
             return FORBIDDEN, "robocopy %s needs a number" % name
-        if name == "/log" and not val:
-            return FORBIDDEN, "robocopy /LOG needs a path"
+        if name == "/log":
+            if not val:
+                return FORBIDDEN, "robocopy /LOG needs a path"
+            if not (case_dir and _inside(val, case_dir)):
+                return FORBIDDEN, "robocopy /LOG must be a file inside the case folder"
         if name in ("/e", "/xj", "/np", "/tee", "/fft") and ":" in a:
             return FORBIDDEN, "robocopy %s takes no value" % name
     return HOST, ""
 
 
-def classify(argv, case_dir=None):
-    """Return (class, reason) for a command line. Deny by default.
+_SLASH_LOOKALIKES = "\uff0f\u2215\u2044\u29f8\u2212"
+_WRITE_WORDS = {"call", "set", "delete", "create", "terminate", "add", "save", "clean", "format", "import",
+                "export", "write", "remove", "restore"}
+_BCD_WORDS = {"all", "active", "firmware", "bootmgr", "osloader", "resume", "memdiag", "ntldr", "bootapp",
+              "bootsector", "inherit", "hypervisor", "badmemory", "fwbootmgr"}
+_BCD_ID_RE = re.compile(r"^\{[A-Za-z0-9\-]+\}$")
+_REG_KEY_RE = re.compile(r"^(HK(LM|CU|CR|U|CC)|HKEY_[A-Z_]+)(\\.*)?$", re.IGNORECASE)
+_REG_SWITCHES = {"/v", "/ve", "/s", "/reg:64", "/reg:32", "/t", "/f", "/k", "/d", "/c", "/e", "/z", "/se"}
+_WEVT_QE_SW = {"/lf", "/q", "/c", "/rd", "/f"}
 
-    case_dir: the case folder; `bcdedit /export <path>` is only read-only when <path> is inside it.
+
+def _vet(argv):
+    """(clean list of str, None) or (None, reason): shape and character checks done before any parsing."""
+    if not isinstance(argv, (list, tuple)) or not argv:
+        return None, "empty or malformed command"
+    out = []
+    for a in argv:
+        if isinstance(a, str):
+            pass
+        elif isinstance(a, int):
+            a = str(a)
+        elif isinstance(a, os.PathLike):
+            a = os.fspath(a)
+            if not isinstance(a, str):
+                return None, "command element is not text"
+        else:
+            return None, "command element is not text: %s" % type(a).__name__
+        if any(ord(c) < 0x20 or ord(c) == 0x7f or c == '"' for c in a):
+            return None, "command element contains a control character or a double quote"
+        out.append(a)
+    if not out[0].isascii():
+        return None, "tool name contains non-ASCII characters"
+    for a in out[1:]:
+        t = a.lstrip()
+        if not t:
+            continue
+        c = t[0]
+        if c in _SLASH_LOOKALIKES or (not c.isascii() and unicodedata.category(c) == "Pd"):
+            return None, "argument starts with a look-alike of a switch character"
+        if c in "/-":
+            if t != a:
+                return None, "switch with leading white space"
+            if not re.split("[:=]", t, 1)[0].isascii():
+                return None, "switch name contains non-ASCII characters"
+    return out, None
+
+
+def classify(argv, case_dir=None):
+    """Return (class, reason) for a command line. Deny by default. Never raises.
+
+    case_dir: the case folder; `bcdedit /export <path>`, `bcdedit /store <path>` and robocopy /LOG are only
+    allowed when <path> is inside it.
     """
-    if not argv:
-        return UNKNOWN, "empty command"
+    try:
+        clean, why = _vet(argv)
+        if clean is None:
+            return FORBIDDEN, why
+        return _classify(clean, case_dir)
+    except Exception as e:      # deny by default: a command that cannot be checked is not run
+        return FORBIDDEN, "could not be checked: %s" % type(e).__name__
+
+
+def _classify(argv, case_dir=None):
     if any(c in str(argv[0]) for c in "\\/:"):
         return FORBIDDEN, "give the tool name only, not a path: %s" % argv[0]
     exe = _base(argv[0])
@@ -170,6 +246,8 @@ def classify(argv, case_dir=None):
                "pwsh": "PowerShell only runs through run_ps() with built-in read-only scripts",
                "format": "format is a forbidden command"}.get(exe, "%s is not allowed" % exe)
         return FORBIDDEN, why
+    if exe in ("bootrec", "dism", "sfc") and not all(a.startswith("/") for a in args):
+        return FORBIDDEN, "%s takes switches only" % exe
     if exe == "bootrec":
         if "/fixmbr" in fl or "/fixboot" in fl:
             return FORBIDDEN, "bootrec /fixmbr and /fixboot are forbidden commands"
@@ -208,16 +286,31 @@ def classify(argv, case_dir=None):
     if exe == "bcdedit":
         if "/import" in fl or "/createstore" in fl or "/sysstore" in fl:
             return FORBIDDEN, "bcdedit store replacement is not offered"
+        store = None
+        rest = list(args)
+        if "/store" in fl:
+            idx = [i for i, x in enumerate(low) if x == "/store"]
+            if len(idx) != 1 or idx[0] + 1 >= len(args) or not args[idx[0] + 1] or args[idx[0] + 1].startswith("/"):
+                return FORBIDDEN, "bcdedit /store needs exactly one path value"
+            store = args[idx[0] + 1]
+            del rest[idx[0]:idx[0] + 2]
+        store_ok = store is None or bool(case_dir and _inside(store, case_dir))
         if "/export" in fl:
-            if not set(fl) <= {"/export", "/store"}:
+            idx = [i for i, x in enumerate(low) if x == "/export"]
+            if len(idx) != 1 or not set(fl) <= {"/export", "/store"}:
                 return FORBIDDEN, "bcdedit /export takes no other switches"
-            i = low.index("/export")
-            dest = args[i + 1] if i + 1 < len(args) else ""
-            if case_dir and dest and not dest.startswith("/") and _inside(dest, case_dir):
+            dest = args[idx[0] + 1] if idx[0] + 1 < len(args) else ""
+            if not store_ok:
+                return FORBIDDEN, "bcdedit may only open a copy of the store inside the case folder"
+            if case_dir and dest and not dest.startswith("/") and _inside(dest, case_dir) and len(rest) == 2:
                 return READ, ""
             return FORBIDDEN, "bcdedit /export is only allowed to a file inside the case folder"
         if set(fl) <= {"/enum", "/v", "/store"}:
-            return READ, ""
+            if not store_ok:
+                return FORBIDDEN, "bcdedit may only open a copy of the store inside the case folder"
+            if all(x.startswith("/") or x.lower() in _BCD_WORDS or _BCD_ID_RE.fullmatch(x) for x in rest):
+                return READ, ""
+            return FORBIDDEN, "unexpected bcdedit arguments"
         if "/store" not in fl:
             return FORBIDDEN, "bcdedit without /store would edit the BCD of the running environment"
         return REPAIR, "needs-bcd-backup"
@@ -231,12 +324,17 @@ def classify(argv, case_dir=None):
 
     if exe == "reg":
         if low and low[0] == "query":
+            if len(args) < 2 or not _REG_KEY_RE.fullmatch(args[1]):
+                return FORBIDDEN, "reg query needs a local HKLM/HKCU/... key (no remote host paths)"
+            if not all(x.lower() in _REG_SWITCHES for x in args[2:] if x.startswith(("/", "-"))):
+                return FORBIDDEN, "reg query switch is not on the allowlist"
             return READ, ""
         return FORBIDDEN, "reg %s is not offered; hives are read with the built-in parser" % (low[0] if low else "")
 
     if exe == "manage-bde":
         if set(fl) == {"-status"}:
-            return READ, ""
+            return (READ, "") if all(x.startswith("-") or _CHKDSK_VOL_RE.fullmatch(x) for x in args) \
+                else (FORBIDDEN, "manage-bde -status takes only a drive letter")
         if fl == ["-unlock", "-recoverypassword"]:
             return HOST, ""
         return FORBIDDEN, "manage-bde is limited to -status and -unlock -RecoveryPassword"
@@ -253,11 +351,28 @@ def classify(argv, case_dir=None):
 
     if exe == "wevtutil":
         if low and low[0] in _WEVT_READ:
+            sw = [x for x in args[1:] if x.startswith(("/", "-"))]
+            pos = [x for x in args[1:] if not x.startswith(("/", "-"))]
+            if any(x.startswith("-") for x in sw):
+                return FORBIDDEN, "wevtutil switches start with /"
+            if low[0] in ("qe", "query-events"):
+                okn = _WEVT_QE_SW
+            elif low[0] in ("gl", "get-log", "gli", "get-loginfo"):
+                okn = {"/lf"}
+            else:
+                okn = set()
+            want = 1 if low[0] in ("qe", "query-events", "gl", "get-log", "gli", "get-loginfo") else 0
+            if len(pos) != want or (pos and pos[0].startswith(("\\\\", "//"))):
+                return FORBIDDEN, "wevtutil needs one local log name or file (no remote host paths)"
+            for x in sw:
+                n, sep, _v = x.lower().partition(":")
+                if n not in okn or not sep:
+                    return FORBIDDEN, "wevtutil switch %s is not allowed" % n
             return READ, ""
         return FORBIDDEN, "wevtutil is limited to queries (no export, clear or set)"
 
     if exe == "wmic":
-        if any(w in ("call", "set", "delete", "create", "terminate") for w in low):
+        if any(w in _WRITE_WORDS for w in low):
             return FORBIDDEN, "wmic is limited to queries"
         if "get" not in low:
             return FORBIDDEN, "wmic is limited to '<alias> get <properties>'"
@@ -276,6 +391,9 @@ def classify(argv, case_dir=None):
             return FORBIDDEN, "smartctl is limited to reading"
         for i, a in enumerate(args):
             nxt = args[i + 1] if i + 1 < len(args) else ""
+            prev = args[i - 1].lower() if i else ""
+            if not a.startswith("-") and not a.lower().startswith("/dev/") and prev not in ("-l", "-d"):
+                return FORBIDDEN, "unexpected smartctl argument %r" % a
             if a.lower() == "-l" and nxt.lower() not in _SMART_L_OK:
                 return FORBIDDEN, "smartctl -l value %r is not allowed" % nxt
             if a.lower() == "-d" and not _SMART_D_RE.fullmatch(nxt):
@@ -283,12 +401,15 @@ def classify(argv, case_dir=None):
         return READ, ""
 
     if exe == "robocopy":
-        return _robocopy(args)
+        return _robocopy(args, case_dir)
 
     if exe in ("ipconfig", "ver", "systeminfo", "hostname", "whoami"):
-        return (READ, "") if not (set(fl) - {"/all", "/fo", "/nh"}) else (UNKNOWN, "unexpected arguments")
+        if set(fl) - {"/all", "/fo", "/nh"} or not all(x.startswith("/") or x.lower() in ("csv", "list", "table")
+                                                       for x in args):
+            return UNKNOWN, "unexpected arguments"
+        return READ, ""
     if exe == "reagentc":
-        return (READ, "") if fl == ["/info"] or set(fl) == {"/info", "/target"} else (FORBIDDEN, "reagentc is limited to /info")
+        return (READ, "") if low == ["/info"] else (FORBIDDEN, "reagentc is limited to exactly /info")
     if exe == "wpeutil":
         return (HOST, "") if low == ["initializenetwork"] else (FORBIDDEN, "wpeutil is limited to InitializeNetwork")
     if exe == "drvload":
@@ -355,6 +476,11 @@ def _addresses_running_windows(argv):
         paths = _switch_values(args, "/offbootdir") + _switch_values(args, "/offwindir")
     elif exe in ("bcdboot", "chkdsk") and args:
         paths = [args[0]]
+    elif exe == "bcdedit":
+        for i, a in enumerate(args[:-1]):
+            v = args[i + 1]
+            if a.lower() in ("/store", "-store") and v and (os.path.splitdrive(v)[0] or v[0] in "\\/"):
+                paths.append(v)         # a relative store has no drive of its own: it lives next to the kit
     sysdrive = os.environ.get("SystemDrive", "").upper()
     sysroot = os.environ.get("SystemRoot", "")
     for p in paths:
@@ -449,7 +575,7 @@ class Runner:
                     return p
         return None
 
-    def _exec(self, argv, timeout, stdin_text=None, live=False, env=None):
+    def _exec(self, argv, timeout, stdin_text=None, live=False, env=None, secrets=()):
         res = Result(list(argv))
         exe = self.resolve(argv[0])
         if not exe:
@@ -459,7 +585,7 @@ class Runner:
         try:
             p = subprocess.Popen([exe] + [str(a) for a in argv[1:]], stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, shell=False, env=env)
-        except OSError as e:
+        except (OSError, ValueError) as e:
             res.error = "could not start: %s" % e
             return res
         chunks = []
@@ -469,7 +595,7 @@ class Runner:
                 line = _decode(raw).rstrip("\r\n")
                 chunks.append(line)
                 if live:
-                    self.ui.raw(line)
+                    self.ui.raw(_redact(line, secrets))
         t = threading.Thread(target=pump, daemon=True)
         t.start()
         try:
@@ -623,12 +749,14 @@ class Runner:
         seq = self._next()
         self._audit(Result(argv, seq=seq, kind="started"), purpose, note="started", secrets=step.secrets)
         if step.diskpart is not None:
-            res = self._exec(["diskpart"], step.timeout, stdin_text="\r\n".join(lines) + "\r\nexit\r\n", live=True)
+            res = self._exec(["diskpart"], step.timeout, stdin_text="\r\n".join(lines) + "\r\nexit\r\n", live=True,
+                             secrets=step.secrets)
             res.argv = argv
         else:
-            res = self._exec(argv, step.timeout, live=True)
+            res = self._exec(argv, step.timeout, live=True, secrets=step.secrets)
         res.seq, res.kind = seq, kind
         self._audit(res, purpose, secrets=step.secrets)
+        res.out = _redact(res.out, step.secrets)
         ui.say("Exit code: %s%s" % (res.rc, "  (%s)" % res.error if res.error else ""))
         return res
 
@@ -642,12 +770,15 @@ class Runner:
         status = {}
         if not os.path.isfile(manifest):
             return status
-        with open(manifest, encoding="utf-8") as f:
-            for line in f:
+        if True:
+            for line in read_manifest_lines(manifest):
                 parts = line.split()
                 if len(parts) < 2 or line.lstrip().startswith("#"):
                     continue
                 want, rel = parts[0].lower(), " ".join(parts[1:]).lstrip("*")
+                if not _SHA256_RE.fullmatch(want):
+                    status[rel] = "ignored: hash is not 64 hex characters"
+                    continue
                 p = os.path.join(tools_dir, rel.replace("/", os.sep))
                 try:
                     escapes = os.path.commonpath([os.path.abspath(p), tools_dir]) != tools_dir
@@ -671,6 +802,33 @@ class Runner:
                     status[rel] = "checksum mismatch, will not be used"
         LOG.info("TOOLS | %s", status)
         return status
+
+
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def _redact(text, secrets=()):
+    """`text` with every non-empty secret replaced by <redacted>."""
+    for s in secrets:
+        if s:
+            text = text.replace(s, "<redacted>")
+    return text
+
+
+def read_manifest_lines(path):
+    """Lines of a checksum manifest. Accepts UTF-8 (with or without BOM) and UTF-16 with BOM (PowerShell 5 `>`).
+    OSError propagates; decoding never raises."""
+    with open(path, "rb") as f:
+        raw = f.read()
+    if raw[:2] == b"\xff\xfe":
+        text = raw[2:].decode("utf-16-le", "replace")
+    elif raw[:2] == b"\xfe\xff":
+        text = raw[2:].decode("utf-16-be", "replace")
+    elif raw[:3] == b"\xef\xbb\xbf":
+        text = raw[3:].decode("utf-8", "replace")
+    else:
+        text = raw.decode("utf-8", "replace")
+    return text.splitlines()
 
 
 def _decode(raw):

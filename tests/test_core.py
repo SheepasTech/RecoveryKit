@@ -57,7 +57,14 @@ class Classify(unittest.TestCase):
             self.assertIn(classify(argv)[0], (UNKNOWN, FORBIDDEN), argv)
 
     def test_read_only(self):
-        for argv in (["bcdedit", "/store", "x", "/enum", "all", "/v"], ["bcdedit", "/enum", "all"],
+        # bcdedit may open a store only when it is a copy inside the case folder
+        case_dir = os.path.join(tempfile.gettempdir(), "rk-case-x")
+        inside = os.path.join(case_dir, "exports", "bcd.work")
+        self.assertEqual(classify(["bcdedit", "/store", inside, "/enum", "all", "/v"], case_dir=case_dir)[0], READ)
+        self.assertEqual(classify(["bcdedit", "/store", "W:\\EFI\\Microsoft\\Boot\\BCD", "/enum", "all"],
+                                  case_dir=case_dir)[0], FORBIDDEN)
+        self.assertEqual(classify(["bcdedit", "/store", inside, "/enum", "all", "/v"])[0], FORBIDDEN)
+        for argv in (["bcdedit", "/enum", "all"],
                      ["manage-bde", "-status"], ["chkdsk", "W:"],
                      ["wevtutil", "qe", "f.evtx", "/lf:true", "/q:*", "/c:5"], ["ipconfig", "/all"],
                      ["reg", "query", "HKLM\\X"], ["dism", "/Get-WimInfo", "/WimFile:x.wim"],
@@ -303,9 +310,11 @@ class Rules(unittest.TestCase):
                     self.assertNotIn(node.func.id, ("print", "input", "eval", "exec"), "%s calls %s()" % (path, node.func.id))
 
     def test_only_runner_imports_subprocess(self):
+        # runner.py runs commands on the target. tlsca.py (ADR 0020) runs New-ItworkCertificates.ps1 on the control
+        # host only, with a fixed argument list and validated names; it never runs on a target.
         for root, _, files in os.walk(os.path.join(ROOT, "recoverykit")):
             for f in files:
-                if f.endswith(".py") and f != "runner.py":
+                if f.endswith(".py") and f not in ("runner.py", "tlsca.py"):
                     with open(os.path.join(root, f), encoding="utf-8") as fh:
                         self.assertNotIn("import subprocess", fh.read(), f)
 

@@ -33,6 +33,7 @@ def _filetime(v):
 class Hive:
     def __init__(self, path):
         self.path = str(path)
+        self.notes = []
         self._f = open(self.path, "rb")
         try:
             self._m = mmap.mmap(self._f.fileno(), 0, access=mmap.ACCESS_READ)
@@ -66,7 +67,7 @@ class Hive:
     def _cell(self, off):
         """Return (start, length) of the data of the cell at hive offset `off`."""
         pos = BASE + off
-        if off == NO_OFFSET or pos + 4 > len(self._m):
+        if off == NO_OFFSET or off < 0 or pos + 4 > len(self._m):
             raise HiveError("cell offset 0x%x outside hive" % off)
         size = struct.unpack_from("<i", self._m, pos)[0]
         length = abs(size) - 4
@@ -93,46 +94,87 @@ class Hive:
         return key.value(name, default)
 
 
+MAX_SUBKEYS = 200000
+MAX_VALUES = 4096
+MAX_VALUE_BYTES = 1 << 20
+MAX_BIG_DATA = 16 << 20
+DB_SEGMENT = 16344
+_PARSE_ERRORS = (struct.error, IndexError, ValueError, OverflowError, MemoryError, RecursionError)
+
+
+def _u(fmt, m, pos, limit):
+    """struct.unpack_from that stays inside [.., limit) and reports HiveError only."""
+    if pos < 0 or pos + struct.calcsize(fmt) > limit:
+        raise HiveError("structure at 0x%x runs past its cell" % pos)
+    try:
+        return struct.unpack_from(fmt, m, pos)
+    except _PARSE_ERRORS as e:
+        raise HiveError("unreadable structure: %s" % e)
+
+
 class Key:
     def __init__(self, hive, off):
         self.hive = hive
         m = hive._m
         s, n = hive._cell(off)
-        if m[s:s + 2] != b"nk":
+        if n < 76 or m[s:s + 2] != b"nk":
             raise HiveError("expected nk cell at 0x%x" % off)
         self._s = s
-        flags = struct.unpack_from("<H", m, s + 2)[0]
-        self.timestamp = _filetime(struct.unpack_from("<Q", m, s + 4)[0])
-        self._nsub, = struct.unpack_from("<I", m, s + 20)
-        self._sublist, = struct.unpack_from("<I", m, s + 28)
-        self._nval, = struct.unpack_from("<I", m, s + 36)
-        self._vallist, = struct.unpack_from("<I", m, s + 40)
-        nlen, = struct.unpack_from("<H", m, s + 72)
+        end = s + n
+        flags = _u("<H", m, s + 2, end)[0]
+        self.timestamp = _filetime(_u("<Q", m, s + 4, end)[0])
+        self._nsub, = _u("<I", m, s + 20, end)
+        self._sublist, = _u("<I", m, s + 28, end)
+        self._nval, = _u("<I", m, s + 36, end)
+        self._vallist, = _u("<I", m, s + 40, end)
+        nlen, = _u("<H", m, s + 72, end)
+        if 76 + nlen > n:
+            raise HiveError("key name runs past its cell at 0x%x" % off)
         raw = bytes(m[s + 76:s + 76 + nlen])
         self.name = raw.decode("latin-1") if flags & 0x20 else raw.decode("utf-16-le", "replace")
 
-    def _sub_offsets(self, off=None, depth=0):
-        if off is None:
-            if not self._nsub or self._sublist == NO_OFFSET:
-                return
-            off = self._sublist
-        if depth > 8:
-            raise HiveError("subkey list nested too deep")
+    def _sub_offsets(self):
+        if not self._nsub or self._sublist == NO_OFFSET:
+            return
+        limit = min(self._nsub, MAX_SUBKEYS)
         m = self.hive._m
-        s, n = self.hive._cell(off)
-        sig = bytes(m[s:s + 2])
-        count, = struct.unpack_from("<H", m, s + 2)
-        if sig in (b"lf", b"lh"):
-            for i in range(count):
-                yield struct.unpack_from("<I", m, s + 4 + i * 8)[0]
-        elif sig == b"li":
-            for i in range(count):
-                yield struct.unpack_from("<I", m, s + 4 + i * 4)[0]
-        elif sig == b"ri":
-            for i in range(count):
-                yield from self._sub_offsets(struct.unpack_from("<I", m, s + 4 + i * 4)[0], depth + 1)
-        else:
-            raise HiveError("unknown subkey list type %r" % sig)
+        seen = set()
+        yielded = 0
+        stack = [(self._sublist, 0)]
+        try:
+            while stack:
+                off, depth = stack.pop()
+                if depth > 8:
+                    raise HiveError("subkey list nested too deep")
+                if off in seen:
+                    continue
+                seen.add(off)
+                if len(seen) > MAX_SUBKEYS:
+                    raise HiveError("too many subkey lists")
+                s, n = self.hive._cell(off)
+                end = s + n
+                if n < 4:
+                    raise HiveError("subkey list too short")
+                sig = bytes(m[s:s + 2])
+                count = _u("<H", m, s + 2, end)[0]
+                if sig in (b"lf", b"lh"):
+                    esz = 8
+                elif sig in (b"li", b"ri"):
+                    esz = 4
+                else:
+                    raise HiveError("unknown subkey list type %r" % sig)
+                count = min(count, (n - 4) // esz)
+                if sig == b"ri":
+                    for i in reversed(range(count)):
+                        stack.append((_u("<I", m, s + 4 + i * 4, end)[0], depth + 1))
+                    continue
+                for i in range(count):
+                    yield _u("<I", m, s + 4 + i * esz, end)[0]
+                    yielded += 1
+                    if yielded >= limit:
+                        return
+        except _PARSE_ERRORS as e:
+            raise HiveError("bad subkey list: %s" % e)
 
     def subkeys(self):
         out = []
@@ -157,23 +199,34 @@ class Key:
                 return k
         return None
 
-    def _values_raw(self):
-        """Yield (name, type, bytes)."""
+    def _vk_records(self):
+        """Yield (name, vtype, vk_start, dsize, doff) without touching the data cells."""
         if not self._nval or self._vallist == NO_OFFSET:
             return
         m = self.hive._m
-        ls, ln = self.hive._cell(self._vallist)
-        for i in range(min(self._nval, ln // 4)):
-            voff, = struct.unpack_from("<I", m, ls + i * 4)
-            try:
-                s, n = self.hive._cell(voff)
-            except HiveError:
-                continue
-            if m[s:s + 2] != b"vk":
-                continue
-            nlen, dsize, doff, vtype, vflags = struct.unpack_from("<HIIIH", m, s + 2)
-            raw = bytes(m[s + 20:s + 20 + nlen])
-            name = raw.decode("latin-1") if vflags & 1 else raw.decode("utf-16-le", "replace")
+        try:
+            ls, ln = self.hive._cell(self._vallist)
+            end = ls + ln
+            for i in range(min(self._nval, ln // 4, MAX_VALUES)):
+                voff, = _u("<I", m, ls + i * 4, end)
+                try:
+                    s, n = self.hive._cell(voff)
+                except HiveError:
+                    continue
+                if n < 20 or m[s:s + 2] != b"vk":
+                    continue
+                nlen, dsize, doff, vtype, vflags = _u("<HIIIH", m, s + 2, s + n)
+                if 20 + nlen > n:
+                    continue
+                raw = bytes(m[s + 20:s + 20 + nlen])
+                name = raw.decode("latin-1") if vflags & 1 else raw.decode("utf-16-le", "replace")
+                yield name, vtype, s, dsize, doff
+        except _PARSE_ERRORS as e:
+            raise HiveError("bad value list: %s" % e)
+
+    def _values_raw(self):
+        """Yield (name, type, bytes)."""
+        for name, vtype, s, dsize, doff in self._vk_records():
             try:
                 data = self._data(s, dsize, doff)
             except HiveError:
@@ -182,31 +235,46 @@ class Key:
 
     def _data(self, vk_start, dsize, doff):
         m = self.hive._m
-        if dsize & 0x80000000:
-            size = dsize & 0x7FFFFFFF
-            return bytes(m[vk_start + 8:vk_start + 8 + min(size, 4)])
-        if dsize == 0:
-            return b""
-        s, n = self.hive._cell(doff)
-        if dsize > 16344 and m[s:s + 2] == b"db":
-            count, = struct.unpack_from("<H", m, s + 2)
-            lst, = struct.unpack_from("<I", m, s + 4)
-            ls, ln = self.hive._cell(lst)
-            out = bytearray()
-            for i in range(count):
-                seg, = struct.unpack_from("<I", m, ls + i * 4)
-                ss, sn = self.hive._cell(seg)
-                out += m[ss:ss + min(sn, 16344)]
-            return bytes(out[:dsize])
-        return bytes(m[s:s + min(dsize, n)])
+        try:
+            if dsize & 0x80000000:
+                size = dsize & 0x7FFFFFFF
+                return bytes(m[vk_start + 8:vk_start + 8 + min(size, 4)])
+            if dsize == 0:
+                return b""
+            if dsize > MAX_BIG_DATA:
+                self.hive.notes.append("value data of %d bytes not read (limit %d)" % (dsize, MAX_BIG_DATA))
+                return b""
+            want = min(dsize, MAX_VALUE_BYTES)
+            s, n = self.hive._cell(doff)
+            if dsize > DB_SEGMENT and n >= 8 and m[s:s + 2] == b"db":
+                count, = _u("<H", m, s + 2, s + n)
+                lst, = _u("<I", m, s + 4, s + n)
+                count = min(count, -(-dsize // DB_SEGMENT))
+                ls, ln = self.hive._cell(lst)
+                count = min(count, ln // 4)
+                out = bytearray()
+                for i in range(count):
+                    seg, = _u("<I", m, ls + i * 4, ls + ln)
+                    ss, sn = self.hive._cell(seg)
+                    out += m[ss:ss + min(sn, DB_SEGMENT)]
+                    if len(out) >= want:
+                        break
+                return bytes(out[:want])
+            return bytes(m[s:s + min(want, n)])
+        except _PARSE_ERRORS as e:
+            raise HiveError("bad value data: %s" % e)
 
     def values(self):
         return {name: decode(vtype, data) for name, vtype, data in self._values_raw()}
 
     def value(self, name, default=None):
         low = name.lower()
-        for n, vtype, data in self._values_raw():
+        for n, vtype, s, dsize, doff in self._vk_records():
             if n.lower() == low:
+                try:
+                    data = self._data(s, dsize, doff)
+                except HiveError:
+                    data = b""
                 return decode(vtype, data)
         return default
 

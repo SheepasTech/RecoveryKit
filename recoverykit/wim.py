@@ -9,7 +9,8 @@ import xml.etree.ElementTree as ET
 
 MAGIC = b"MSWIM\x00\x00\x00"
 ARCH = {0: "x86", 9: "x64", 12: "arm64"}
-MAX_XML = 64 * 1024 * 1024
+MAX_XML = 16 * 1024 * 1024
+MAX_STR = 200
 
 
 def _text(node, path):
@@ -18,7 +19,7 @@ def _text(node, path):
     n = node.find(path)
     if n is None or n.text is None:
         return None
-    return n.text.strip() or None
+    return n.text.strip()[:MAX_STR] or None
 
 
 def _int(s):
@@ -39,7 +40,8 @@ def _image(node):
         version = "%s.%s.%s%s" % (major, minor, build, ".%s" % spbuild if spbuild is not None else "")
     langs = []
     if win is not None:
-        langs = [(n.text or "").strip() for n in win.findall("LANGUAGES/LANGUAGE") if (n.text or "").strip()]
+        langs = [(n.text or "").strip()[:MAX_STR] for n in win.findall("LANGUAGES/LANGUAGE")
+                 if (n.text or "").strip()][:50]
     return {"index": _int(node.get("INDEX")), "name": _text(node, "NAME"),
             "edition": _text(win, "EDITIONID"), "architecture": ARCH.get(arch),
             "build": build, "spbuild": spbuild, "version": version,
@@ -73,13 +75,22 @@ def read_info(path):
     except OSError as e:
         info["errors"].append("cannot read: %s" % e)
         return info
+    except (ValueError, OverflowError, struct.error, MemoryError) as e:
+        info["errors"].append("header is damaged: %s: %s" % (type(e).__name__, e))
+        return info
     try:
         if raw[:2] == b"\xff\xfe":
             raw = raw[2:]
         text = raw.decode("utf-16-le")
         root = ET.fromstring(text)
-        images = [_image(n) for n in root.findall("IMAGE")]
-    except (UnicodeDecodeError, ET.ParseError) as e:
+        images = []
+        for n in root.findall("IMAGE")[:1000]:
+            img = _image(n)
+            if img["index"] is None:
+                info["errors"].append("image without an integer INDEX dropped")
+                continue
+            images.append(img)
+    except (ValueError, ET.ParseError, OverflowError, MemoryError, RecursionError) as e:
         info["errors"].append("XML metadata is unreadable: %s" % e)
         return info
     info["images"] = images

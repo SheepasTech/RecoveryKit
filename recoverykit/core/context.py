@@ -1,5 +1,6 @@
 """Shared objects handed to every module: Ctx, Target and RegView."""
 import os
+import struct
 import winreg
 from dataclasses import dataclass, field
 
@@ -7,6 +8,10 @@ from . import regf
 
 LCID = {"0409": "en-US", "0809": "en-GB", "0427": "lt-LT", "0419": "ru-RU", "0415": "pl-PL", "0407": "de-DE",
         "040c": "fr-FR", "0426": "lv-LV", "0425": "et-EE", "0410": "it-IT", "0c0a": "es-ES", "0422": "uk-UA"}
+
+
+_HIVE_ERRORS = (regf.HiveError, struct.error, MemoryError, ValueError, OverflowError, RecursionError,
+                IndexError)
 
 
 class RegView:
@@ -29,10 +34,13 @@ class RegView:
                 h = regf.Hive(path)
                 self.dirty[name] = h.dirty
                 self._hives[name] = h
-            except (OSError, regf.HiveError) as e:
+            except (OSError, *_HIVE_ERRORS) as e:
                 self.errors[name] = "%s: %s" % (type(e).__name__, e)
                 self._hives[name] = None
         return self._hives[name]
+
+    def _note(self, hive, e):
+        self.errors.setdefault(hive, "%s: %s" % (type(e).__name__, e))
 
     def get(self, hive, path, name, default=None):
         if self.online:
@@ -44,7 +52,8 @@ class RegView:
         h = self._hive(hive)
         try:
             return h.get(path, name, default) if h else default
-        except regf.HiveError:
+        except _HIVE_ERRORS as e:
+            self._note(hive, e)
             return default
 
     def subkeys(self, hive, path):
@@ -66,7 +75,8 @@ class RegView:
         try:
             k = h.open(path) if h else None
             return k.subkey_names() if k else []
-        except regf.HiveError:
+        except _HIVE_ERRORS as e:
+            self._note(hive, e)
             return []
 
     def values(self, hive, path):
@@ -90,7 +100,8 @@ class RegView:
         try:
             k = h.open(path) if h else None
             return k.values() if k else {}
-        except regf.HiveError:
+        except _HIVE_ERRORS as e:
+            self._note(hive, e)
             return {}
 
     def exists(self, hive, path):
@@ -103,7 +114,8 @@ class RegView:
         h = self._hive(hive)
         try:
             return bool(h and h.open(path))
-        except regf.HiveError:
+        except _HIVE_ERRORS as e:
+            self._note(hive, e)
             return False
 
     def control_set(self):

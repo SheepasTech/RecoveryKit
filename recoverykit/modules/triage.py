@@ -6,6 +6,8 @@ removes or changes anything. Files are only written under the case folder.
 """
 import os
 import re
+import stat
+import struct
 import xml.etree.ElementTree as ET
 from datetime import datetime
 
@@ -16,6 +18,13 @@ ADMIN_HINT = " (needs administrator / WinRE)"
 TASK_MAX = 1024 * 1024
 TASK_NS = "http://schemas.microsoft.com/windows/2004/02/mit/task"
 MAX_SAY = 40
+MAX_FIELD = 2000        # stored string fields
+MAX_LIST = 20           # actions / triggers per task
+MAX_FLAGGED = 200       # flagged entries kept in section data (the inventory json keeps the rest)
+MAX_INVENTORY = 20000   # entries per inventory json
+TASK_FILES = 5000
+TASK_DIRS = 5000
+TASK_DEPTH = 16
 
 F_WRITABLE = "runs from a user-writable location"
 F_LOLBIN = "script host or LOLBin launcher"
@@ -55,6 +64,50 @@ def _txt(v):
     if isinstance(v, bytes):
         return v.decode("utf-16-le", "replace").rstrip("\x00") if len(v) % 2 == 0 else v.hex()
     return "" if v is None else str(v)
+
+
+def _c(v, n=MAX_FIELD):
+    s = v if isinstance(v, str) else _txt(v)
+    return s if len(s) <= n else s[:n] + "..."
+
+
+def _is_link(d):
+    """True for a symlink, a junction or any reparse point (DirEntry or path). Never follows."""
+    try:
+        if hasattr(d, "is_symlink"):
+            if d.is_symlink() or getattr(d, "is_junction", lambda: False)():
+                return True
+            st = d.stat(follow_symlinks=False)
+        else:
+            st = os.lstat(d)
+            if stat.S_ISLNK(st.st_mode):
+                return True
+        return bool(getattr(st, "st_file_attributes", 0) & 0x400)
+    except OSError:
+        return True
+
+
+def _plain_file(path):
+    """A regular file that is not a link (a device, pipe or reparse point is not read)."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISREG(st.st_mode) and not getattr(st, "st_file_attributes", 0) & 0x400
+
+
+def _inside(path, base):
+    try:
+        b = os.path.normcase(os.path.realpath(base))
+        return os.path.commonpath([b, os.path.normcase(os.path.realpath(path))]) == b
+    except (ValueError, OSError):
+        return False
+
+
+def _capped(entries):
+    """(first MAX_FLAGGED flagged entries, count of the rest) for section data."""
+    fl = [e for e in entries if e["flags"]]
+    return fl[:MAX_FLAGGED], max(0, len(fl) - MAX_FLAGGED)
 
 
 def _ascii(s):
@@ -158,14 +211,16 @@ def collect(ctx):
 # ------------------------------------------------------------------ 1. autoruns
 def _entry(source, name, command, root, windir, extra=()):
     command = _txt(command)
-    return {"source": source, "name": name, "command": command, "flags": _flags(root, windir, command, extra)}
+    return {"source": _c(source), "name": _c(name), "command": _c(command),
+            "flags": _flags(root, windir, command, extra)}
 
 
 def _list_users(root):
     """(names of folders under Users, error text or None)."""
     try:
         with os.scandir(os.path.join(root, "Users")) as it:
-            names = [d.name for d in it if d.is_dir() and d.name.lower() not in ("all users", "default user")]
+            names = [d.name for d in it if d.is_dir(follow_symlinks=False) and not _is_link(d)
+                     and d.name.lower() not in ("all users", "default user")]
         return sorted(names), None
     except FileNotFoundError:
         return [], "no Users folder"
@@ -228,15 +283,20 @@ def _autoruns(ctx, sec):
                  os.path.join(root, "Users", u, "AppData", "Roaming", STARTUP_REL), ents)
     _startup(sec, root, windir, "common Startup", os.path.join(root, "ProgramData", STARTUP_REL), ents)
 
-    ctx.case.write_json("inventory/autoruns.json", ents)
-    flagged = [e for e in ents if e["flags"]]
-    sec.data = {"count": len(ents), "flagged": flagged}
+    ctx.case.write_json("inventory/autoruns.json", ents[:MAX_INVENTORY])
+    flagged, more = _capped(ents)
+    sec.data = {"count": len(ents), "flagged": flagged, "flagged_not_shown": more}
+    if len(ents) > MAX_INVENTORY:
+        sec.item("inventory", "skipped", "autoruns.json holds the first %d of %d entries" % (MAX_INVENTORY, len(ents)))
     return ents
 
 
 def _user_hive(sec, root, windir, user, ents):
     path = os.path.join(root, "Users", user, "NTUSER.DAT")
-    if not os.path.exists(path):
+    if not os.path.lexists(path):
+        return
+    if not _plain_file(path) or not _inside(path, root):
+        sec.item("user " + user, "skipped", "NTUSER.DAT is a link, not a regular file, or resolves outside the target: not read")
         return
     try:
         h = regf.Hive(path)
@@ -254,16 +314,21 @@ def _user_hive(sec, root, windir, user, ents):
                 ents.append(_entry("user %s %s" % (user, label), name, val, root, windir))
                 n += 1
         sec.item("user " + user, "ok", "%d value(s)" % n)
-    except (OSError, regf.HiveError) as e:
+    except (OSError, regf.HiveError, struct.error, ValueError, OverflowError, MemoryError, IndexError,
+            RecursionError) as e:
         sec.item("user " + user, "error", "%s: %s" % (type(e).__name__, e))
     finally:
         h.close()
 
 
 def _startup(sec, root, windir, label, folder, ents):
+    if os.path.lexists(folder) and (_is_link(folder) or not _inside(folder, root)):
+        sec.item(label, "skipped", "folder is a link or resolves outside the target: not read")
+        return
     try:
         with os.scandir(folder) as it:
-            files = sorted(d.name for d in it if d.is_file() and d.name.lower() != "desktop.ini")
+            files = sorted(d.name for d in it if d.is_file(follow_symlinks=False) and not _is_link(d)
+                           and d.name.lower() != "desktop.ini")[:1000]
     except (FileNotFoundError, NotADirectoryError):
         return
     except OSError as e:
@@ -272,7 +337,7 @@ def _startup(sec, root, windir, label, folder, ents):
     for f in files:
         ext = os.path.splitext(f)[1].lower()
         fl = [F_STARTUP] if ext in (".exe", ".bat", ".cmd", ".vbs", ".vbe", ".js", ".jse", ".ps1", ".hta", ".scr", ".com") else []
-        ents.append({"source": label, "name": f, "command": os.path.join(folder, f), "flags": fl})
+        ents.append({"source": label, "name": _c(f), "command": _c(os.path.join(folder, f)), "flags": fl})
     sec.item(label, "ok", "%d file(s)" % len(files))
 
 
@@ -301,14 +366,15 @@ def _services(ctx, sec):
             continue
         image = _txt(v.get("ImagePath"))
         extra = (F_BOOTDRV,) if start in (0, 1) and image and _boot_outside_system32(image) else ()
-        out.append({"name": name, "start": start, "type": v.get("Type"), "image_path": image,
-                    "display_name": _txt(v.get("DisplayName")), "object_name": _txt(v.get("ObjectName")),
-                    "flags": _flags(root, windir, image, extra)})
+        out.append({"name": _c(name), "start": start, "type": v.get("Type") if isinstance(v.get("Type"), int) else None,
+                    "image_path": _c(image), "display_name": _c(v.get("DisplayName")),
+                    "object_name": _c(v.get("ObjectName")), "flags": _flags(root, windir, image, extra)})
     why = getattr(reg, "errors", {}).get("SYSTEM")
     if why:
         sec.item("hive SYSTEM", "error", why + ADMIN_HINT)
-    ctx.case.write_json("inventory/services.json", out)
-    sec.data = {"count": len(out), "flagged": [e for e in out if e["flags"]]}
+    ctx.case.write_json("inventory/services.json", out[:MAX_INVENTORY])
+    flagged, more = _capped(out)
+    sec.data = {"count": len(out), "flagged": flagged, "flagged_not_shown": more}
     return out
 
 
@@ -316,8 +382,12 @@ def _services(ctx, sec):
 def _read_task(full, rel, windir_root):
     root, windir = windir_root
     st = os.stat(full)
-    ent = {"path": rel, "author": "", "enabled": True, "hidden": False, "actions": [], "run_as": "",
-           "triggers": [], "modified": datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds"), "flags": []}
+    try:
+        modified = datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds")
+    except (OSError, OverflowError, ValueError):
+        modified = None   # timestamp outside the supported range: the task is still read
+    ent = {"path": _c(rel), "author": "", "enabled": True, "hidden": False, "actions": [], "run_as": "",
+           "triggers": [], "modified": modified, "flags": []}
     try:
         if st.st_size > TASK_MAX:
             raise ValueError("file is larger than 1 MB")
@@ -331,8 +401,8 @@ def _read_task(full, rel, windir_root):
         tree = ET.fromstring(text)
     except OSError:
         raise
-    except (ValueError, ET.ParseError, UnicodeError) as e:
-        ent["error"] = "%s: %s" % (type(e).__name__, e)
+    except (ValueError, ET.ParseError, UnicodeError, RecursionError, MemoryError) as e:
+        ent["error"] = _c("%s: %s" % (type(e).__name__, e), 300)
         ent["flags"] = [F_UNPARSEABLE]
         return ent
     for el in tree.iter():
@@ -341,18 +411,18 @@ def _read_task(full, rel, windir_root):
 
     def tx(path):
         e = tree.find(path)
-        return (e.text or "").strip() if e is not None else ""
+        return _c((e.text or "").strip()) if e is not None else ""
 
     ent["author"] = tx("RegistrationInfo/Author")
     ent["enabled"] = tx("Settings/Enabled").lower() != "false"
     ent["hidden"] = tx("Settings/Hidden").lower() == "true"
     ent["run_as"] = tx("Principals/Principal/UserId") or tx("Principals/Principal/GroupId")
     trg = tree.find("Triggers")
-    ent["triggers"] = [c.tag for c in trg] if trg is not None else []
+    ent["triggers"] = [_c(c.tag) for c in list(trg)[:MAX_LIST]] if trg is not None else []
     fl = []
-    for ex in tree.findall("Actions/Exec"):
+    for ex in tree.findall("Actions/Exec")[:MAX_LIST]:
         cmd = ((ex.findtext("Command") or "").strip() + " " + (ex.findtext("Arguments") or "").strip()).strip()
-        ent["actions"].append(cmd)
+        ent["actions"].append(_c(cmd))
         fl += _flags(root, windir, cmd)
     if ent["hidden"] and not rel.startswith("Microsoft/"):
         fl.append(F_HIDDEN)
@@ -364,27 +434,54 @@ def _tasks(ctx, sec):
     t = ctx.target
     top = os.path.join(t.windir, "System32", "Tasks")
     out = []
+    st = {"dirs": 0, "links": [], "links_n": 0, "other": 0, "capped": None, "note": None}
 
-    def walk(folder, rel):
+    def walk(folder, rel, depth):
+        st["dirs"] += 1
         try:
             with os.scandir(folder) as it:
-                items = sorted(it, key=lambda d: d.name.lower())
+                items = []
+                for d in it:          # bounded: a hostile folder cannot hold the scan hostage
+                    if len(items) >= TASK_FILES:
+                        st["note"] = "more than %d entries in one folder, the rest ignored" % TASK_FILES
+                        break
+                    items.append(d)
+            items.sort(key=lambda d: d.name.lower())
         except OSError:
             if not rel:
                 raise
             return sec.item("tasks/" + rel, "error", "folder could not be read" + ADMIN_HINT)
         for d in items:
+            if st["capped"]:
+                return
             r = rel + "/" + d.name if rel else d.name
             try:
-                if d.is_dir():
-                    walk(d.path, r)
-                else:
+                if _is_link(d):
+                    st["links_n"] += 1
+                    if len(st["links"]) < 10:
+                        st["links"].append(_c(r, 200))
+                elif d.is_dir(follow_symlinks=False):
+                    if depth >= TASK_DEPTH:
+                        st["capped"] = "folders nested deeper than %d levels" % TASK_DEPTH
+                    elif st["dirs"] >= TASK_DIRS:
+                        st["capped"] = "more than %d folders" % TASK_DIRS
+                    else:
+                        walk(d.path, r, depth + 1)
+                elif d.is_file(follow_symlinks=False):
+                    if len(out) >= TASK_FILES:
+                        st["capped"] = "more than %d task files" % TASK_FILES
+                        return
                     out.append(_read_task(d.path, r, (t.root, t.windir)))
+                else:
+                    st["other"] += 1   # device, pipe, socket: never opened
             except OSError as e:
-                sec.item("tasks/" + r, "error", "%s: %s" % (type(e).__name__, e.strerror or e))
+                sec.item("tasks/" + _c(r, 200), "error", "%s: %s" % (type(e).__name__, e.strerror or e))
 
     try:
-        walk(top, "")
+        if os.path.lexists(top) and not _inside(top, t.root):
+            sec.set("error", "Tasks folder resolves outside the target: not read")
+            return out
+        walk(top, "", 0)
     except FileNotFoundError:
         sec.set("missing", "no Windows\\System32\\Tasks folder on the target: %s" % top)
         return out
@@ -394,13 +491,20 @@ def _tasks(ctx, sec):
     except OSError as e:
         sec.set("error", "%s: %s" % (type(e).__name__, e.strerror or e))
         return out
+    if st["links_n"]:
+        sec.item("tasks links", "skipped", "%d link(s)/junction(s) not followed, e.g. %s" % (st["links_n"], "; ".join(st["links"][:5])))
+    if st["other"]:
+        sec.item("tasks other", "skipped", "%d entr(ies) that are not regular files were not opened" % st["other"])
+    if st["capped"] or st["note"]:
+        sec.item("tasks cap", "skipped", "scan limited: %s (%d task file(s) read)" % (st["capped"] or st["note"], len(out)))
     for e in out:
         # Windows' own tasks legitimately use rundll32, cmd and msiexec: that alone is not a finding there.
         if e["path"].startswith("Microsoft/"):
             e["flags"] = [f for f in e["flags"] if f != F_LOLBIN]
-    ctx.case.write_json("inventory/tasks.json", out)
+    ctx.case.write_json("inventory/tasks.json", out[:MAX_INVENTORY])
+    flagged, more = _capped(out)
     sec.data = {"count": len(out), "non_microsoft": sum(1 for e in out if not e["path"].startswith("Microsoft/")),
-                "flagged": [e for e in out if e["flags"]]}
+                "flagged": flagged, "flagged_not_shown": more, "capped": st["capped"] or st["note"], "links_skipped": st["links_n"]}
     return out
 
 

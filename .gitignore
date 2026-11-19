@@ -37,3 +37,8 @@ __pycache__/
 # Device registry on the stick: hardware, usernames, per-device settings. Never commit.
 devices/
 .claude/settings.local.json
+
+# TLS material of this PC's control server (ADR 0020); the CA itself lives in %LOCALAPPDATA%\ITwork\CA
+config/ca-cert.pem
+config/server-cert.pem
+config/server-key.pem

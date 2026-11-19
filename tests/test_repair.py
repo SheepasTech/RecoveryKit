@@ -89,7 +89,15 @@ class Base(unittest.TestCase):
 
 
 def kind_of(step):
-    return classify_diskpart(step.diskpart)[0] if step.diskpart is not None else classify(step.argv)[0]
+    if step.diskpart is not None:
+        return classify_diskpart(step.diskpart)[0]
+    # The wrapper is given the case folder at run time (robocopy /LOG must be inside it): derive it
+    # here from the step's own /LOG:<case>\logs\<file> argument, as Runner.repair would know it.
+    case_dir = None
+    for a in step.argv:
+        if str(a).upper().startswith("/LOG:"):
+            case_dir = os.path.dirname(os.path.dirname(str(a)[5:]))
+    return classify(step.argv, case_dir=case_dir)[0]
 
 
 class SourceTests(Base):

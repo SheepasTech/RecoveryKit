@@ -131,6 +131,29 @@ class FindInstalls(unittest.TestCase):
         self.assertIsNone(discovery.choose_target(ctx))
 
 
+    def test_one_unreadable_install_does_not_hide_the_others(self):
+        import struct
+        vols = [volume("C", self.c), volume("W", self.w)]
+        with open(os.path.join(self.w, "Windows", "System32", "config", "SOFTWARE"), "wb") as f:
+            f.write(os.urandom(4096))
+        ctx = ctx_for(self.tmp.name, "windows", vols, host_windir="")
+        self.addCleanup(ctx.case.close)
+
+        def info(t):
+            if t.letter == "W":
+                raise struct.error("unpack requires a buffer of 4 bytes")
+            return {"errors": [], "product": "Windows 11"}
+        with FakeLetters({"C": self.c, "W": self.w}),                 mock.patch.object(discovery.os.path, "samefile", side_effect=OSError("no")),                 mock.patch.dict(os.environ, {"SystemDrive": "Z:"}),                 mock.patch.object(discovery, "install_info", info),                 mock.patch.object(discovery, "RegView", lambda w, o: types.SimpleNamespace(close=lambda: None)):
+            installs = discovery.find_installs(ctx)
+        self.assertEqual(sorted(t.root for t in installs), ["C:\\", "W:\\"])
+        bad = next(t for t in installs if t.letter == "W")
+        self.assertIn("unpack requires", bad.info["errors"][0])
+        self.assertIsNone(bad.info["product"])
+        self.assertIsNone(bad.info["build_full"])
+        good = next(t for t in installs if t.letter == "C")
+        self.assertEqual(good.info["product"], "Windows 11")
+
+
 class OutputLocation(unittest.TestCase):
     def make(self, tmp, online=False, letter=None, root=None):
         case = Case(os.path.join(tmp, "cases"))

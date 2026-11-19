@@ -83,9 +83,9 @@ audit.log           every command attempted, with exit code; full output in audi
 - **Core engine** (`engine.py`): one engine holds every operation (scan, case, files, suggestions, repair proposals, run step, bundle). It has no UI. It runs modules in a fixed order, records status per section (`ok`, `missing`, `error`, `skipped`), owns the audit log and case folder, and runs one operation at a time.
 - **Front ends are thin**: the plain-text menu, the headless CLI (`--scan --auto`), the agent API and the control server. All call the engine.
 - **Module** = a Python file with `collect()` (read-only, returns data and files) and optionally `repair_steps()` (returns proposed steps, never runs them itself).
-- **Command wrapper** (`core/runner.py`): the only place that starts external programs (never through a shell). It is a positive allowlist: each tool has spelled-out read-only forms, repair forms and host forms; anything not matched is refused. Tools are named by bare name and resolved only from `%SystemRoot%\System32` or verified `tools/`: no PATH, no current directory. It runs with a timeout, captures output and exit code, and writes the audit entry. Modules cannot call subprocess.
+- **Command wrapper** (`core/runner.py`): the only place that starts external programs (never through a shell). It is a positive allowlist: each tool has spelled-out read-only forms, repair forms and host forms; anything not matched is refused. Tools are named by bare name and resolved only from `%SystemRoot%\System32` or verified `tools/`: no PATH, no current directory. It runs with a timeout, captures output and exit code, and writes the audit entry. Built-in modules do not import `subprocess` or `ctypes` (a test enforces it). One other place starts a process: on the control host only, `tlsca.py` runs the certificate script with a fixed argument list.
 - **UI**: a plain-text numbered menu on `print`/`input`, ASCII only. No third-party UI library; `lib/` holds no dependencies. GUI is out of scope for the agent; the control server serves one browser page (6.6).
-- **Plugins**: modules from `plugins/` follow the same interface; none can bypass the command wrapper or the forbidden list. Plugins load only when listed with a matching SHA-256 in `plugins/manifest.sha256`; the source check is a guard against mistakes, not a sandbox.
+- **Plugins**: modules from `plugins/` follow the same interface and are expected to run commands only through the command wrapper. A plugin is trusted code: nothing technically stops listed plugin code from doing otherwise. Plugins load only when listed with a matching SHA-256 in `plugins/manifest.sha256`; the source check is a guard against mistakes, not a sandbox.
 - **APIs**: the agent API (JSON over HTTP, `/api/v1`) runs on 127.0.0.1 of the target and nowhere else. The server API runs on the main machine, serves the operator and relays agent calls. Both work without the other: the kit is fully usable with no server (serverless) and with nobody at the keyboard (headless). Routes: `docs/api.md`.
 
 ## 6. Modules
@@ -137,7 +137,7 @@ Staged and confirmed one at a time, each followed by "test boot, then record the
 - Off by default; on only when the operator runs `run.cmd --connect` on the target. The session ends on a keypress on the target, after `--session-minutes` (default 60), or when the server revokes it.
 - **The agent connects out** to the server on the main machine (HTTP, long-poll; no WebSocket). No inbound ports on the target. The agent API itself listens on 127.0.0.1 only.
 - The server binds to the interface named with `--bind` (default 127.0.0.1; give the LAN address), never `0.0.0.0` by default.
-- Authentication: a pre-shared agent token (generated on the server in `config/token-server.json`) plus a per-session 6-digit pairing code shown on the target that the operator enters on the server before any job is relayed. Every message is signed with HMAC-SHA256 over path, nonce and body in both directions. TLS is used when `config/server-cert.pem` and `config/server-key.pem` exist and the agent pins the certificate with `--pin`; without them traffic is authenticated but not encrypted (trusted LAN only). Certificate generation is not part of the kit.
+- Authentication: a pre-shared agent token (generated on the server in `config/token-server.json`) plus a per-session 6-digit pairing code shown on the target that the operator enters on the server before any job is relayed. Every message is signed with HMAC-SHA256 over path, nonce and body in both directions. After pairing the signing key is derived from the pairing code, so the agent token alone cannot speak for a paired session. TLS is the default: the control host PC is the certificate authority, `--server` issues its certificate from the CA in `%LOCALAPPDATA%\ITwork\CA` via `New-ItworkCertificates.ps1`, and agents verify it against the CA certificate that `Install-ToUsb.ps1` put on the stick (`--pin` is the alternative). An `https://` connection is never made unverified; the server refuses to start without TLS unless `--no-tls` is given (then traffic is authenticated but not encrypted: trusted LAN only).
 - Modes: **read-only** (GET routes, scan, bundle, answers, source check) by default; **repairs** only when the target session was started with `--allow-remote-repairs` (`--allow-repairs` for the loopback API). A repair request carries `confirm: "yes"` and the single-use token returned for that exact command line; the token dies with the next scan or listing. The command wrapper still applies every rule. No arbitrary-shell route exists.
 - Every remote action goes into `audit.log` with the operator name. The API token and the pairing code are shown on the console only and never written to a log. Server log: `<store>\_server-logs\`.
 - Server stores received bundles under `--store` (named by the server, verified as zip, never overwritten), can copy them to a vault intake folder, and lists stored cases. It serves one browser page at `/`. Fleet history beyond that is not built.
@@ -161,6 +161,7 @@ Staged and confirmed one at a time, each followed by "test boot, then record the
 - The USB may contain case and device data: offer `--wipe-case` and warn on leaving it with a customer. `--wipe-case` does not remove `devices\<ID>` or the `%TEMP%` copy of the log.
 - No secrets in `config/` committed to git; the server token is generated per install and git-ignored. BitLocker keys, API tokens and pairing codes are never logged or stored in the case.
 - Vendored dependencies (none) and `tools/` binaries are pinned and checksummed. The bundled Python is pinned by SHA-256 in `Install-ToUsb.ps1`.
+- The control host is the certificate authority: the CA key stays on that PC (never on a stick); sticks carry only the CA certificate; no unverified TLS connection is ever made.
 - Forbidden-command list (section 1.4) is enforced in the command wrapper, not just by convention.
 - Plugins are trusted code with the kit's rights. A plugin loads only with a matching SHA-256 in `plugins/manifest.sha256`.
 
@@ -173,7 +174,7 @@ Every phase below is built and unit-tested on the development PC. None has been 
 | 1 | Discovery + log collection + report | On a stock WinRE boot, `run.cmd` finds the offline install, picks the correct disk without any hard-coded letter, produces a case folder where every section is `ok`/`missing`/`error` with reasons, and nothing on the target changed (verified by timestamps/hashes) | Built. Tested on a fake offline Windows and on the running Windows of the dev PC. Not run in WinRE |
 | 2 | Repair helpers | Source-mismatch check blocks the lt-LT/en-US case; each repair shows its command, asks, logs, and exports before changing BCD | Built. Source check proven on the lt-LT/en-US case; repairs run in dry-run only |
 | 3 | Assistant | Given the idea 1 case inputs, suggests the same next steps in the same order | Built. Idea 1 case fixture yields branches A to E in order |
-| 4 | Control server | Pair, read-only stream, bundle retrieval and revocation work over LAN; no inbound port on target | Built. Proven over 127.0.0.1 only; no LAN, no TLS tested |
+| 4 | Control server | Pair, read-only stream, bundle retrieval and revocation work over LAN; no inbound port on target | Built. Proven over 127.0.0.1 only, with and without TLS (real handshakes against a test CA); not yet between two machines on a LAN |
 | 5 | Plugins and extras | Third-party module loads through the command wrapper only, with a matching checksum | Built (loader, manifest, source check). No plugin shipped |
 | 6 | Registry diffing | A second scan lists what changed in the startup-relevant keys | Built |
 | 7 | Driver rollback | Recent third-party drivers listed; removal of one is a confirmed step | Built; removal in dry-run only |
@@ -183,7 +184,7 @@ Every phase below is built and unit-tested on the development PC. None has been 
 | 11 | GUI | Browser front end on the same API | First cut: one page served by the server; not yet seen in a browser |
 | 12 | Plugin marketplace | Signed plugin index, install and update from the server | Planned |
 
-Deferred (not built): server-side scheduled scans (needs a decision on unattended sessions), plugin marketplace (needs a signature scheme; the standard library has no asymmetric signing), TLS certificate handling (generation and a tested TLS path), custom WinPE image.
+Deferred (not built): server-side scheduled scans (needs a decision on unattended sessions), plugin marketplace (needs a signature scheme; the standard library has no asymmetric signing), client certificates for agents (mutual TLS), custom WinPE image.
 
 ## 9. Known issues carried over from `log-extractor.ps1`
 
@@ -205,7 +206,7 @@ Answered:
 
 Open:
 1. What does a real WinRE boot show: does the bundled Python start, which tools exist (`wevtutil`, `manage-bde`, `robocopy`), does the console show the menu correctly?
-2. TLS certificates for the control server: how are they made, stored and pinned?
+2. Client certificates (mutual TLS) for agents: wanted or not? Server certificates are settled: the control host is the CA and sticks carry its certificate.
 3. Should the project journal and decision records (`.project/`, currently git-ignored) be committed?
 4. Should the old test case and device entry on the USB (`cases\ITW-99999-...`, `devices\`) be kept?
 5. Should the commit that contained `.mcp.json` (a private network address and a local path) be removed from the public history?

@@ -3,6 +3,7 @@
 Read-only. Files are only copied into the case folder; external programs run through ctx.runner.
 """
 import os
+import re
 import shutil
 
 from ..core import evtx
@@ -10,6 +11,9 @@ from ..core.log import LOG
 
 MB = 2 ** 20
 ADMIN_HINT = " (needs administrator / WinRE)"
+MAX_BCD_BYTES = 64 * MB
+MAX_DUMP_ENTRIES = 2000
+_RESERVED = re.compile(r"^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$", re.I)
 LEVEL_QUERY = "*[System[(Level=1 or Level=2 or Level=3)]]"
 
 
@@ -31,6 +35,17 @@ def _why(e):
 
 def _file_item(sec, name, e, **extra):
     return sec.item(name, e["status"], _why(e), size=e.get("size"), dest=e.get("dest"), **extra)
+
+
+def _safe_leaf(name, n):
+    """(leaf to use in the case folder, replaced). A hostile name is replaced by file-<n>[.ext]."""
+    bad = (any(c in name for c in "\\/:") or ".." in name or any(ord(c) < 32 for c in name)
+           or bool(_RESERVED.match(name)) or name != name.rstrip(". "))
+    if not bad:
+        return name, False
+    ext = os.path.splitext(name)[1]
+    ext = ext if re.fullmatch(r"\.[A-Za-z0-9]{1,5}", ext) else ""
+    return "file-%d%s" % (n, ext), True
 
 
 def _lim(ctx):
@@ -63,24 +78,44 @@ def _logs_target(ctx, sec):
     todo = [(rel, os.path.join(t.windir, _win(rel))) for rel in lcfg.get("target", [])]
     todo += [(rel, os.path.join(t.root, _win(rel))) for rel in lcfg.get("target_root", [])]
     for rel, src in todo:
-        e = case.collect_file(src, "logs/target-" + _flat(rel), source="target", max_bytes=max_log)
+        e = case.collect_file(src, "logs/target-" + _flat(rel), source="target", max_bytes=max_log, root=t.root)
         _file_item(sec, rel, e)
 
     # minidumps
     mdir = os.path.join(t.windir, "Minidump")
     try:
-        found = []
+        found, seen, other = [], 0, 0
         with os.scandir(mdir) as it:
             for d in it:
-                if d.name.lower().endswith(".dmp") and d.is_file():
-                    found.append((d.stat().st_mtime, d.name, d.path))
+                seen += 1
+                if seen > MAX_DUMP_ENTRIES:
+                    sec.item("minidumps cap", "skipped", "only the first %d entries of the Minidump folder were considered" % MAX_DUMP_ENTRIES)
+                    break
+                if not d.name.lower().endswith(".dmp"):
+                    continue
+                try:
+                    if (d.is_symlink() or getattr(d, "is_junction", lambda: False)()
+                            or not d.is_file(follow_symlinks=False)
+                            or getattr(d.stat(follow_symlinks=False), "st_file_attributes", 0) & 0x400):
+                        other += 1
+                        continue
+                    found.append((d.stat(follow_symlinks=False).st_mtime, d.name, d.path))
+                except (OSError, OverflowError, ValueError):
+                    other += 1
+        if other:
+            sec.item("minidumps not regular", "skipped", "%d .dmp entr(ies) that are links or not regular files were not copied" % other)
         found.sort(reverse=True)
         keep = found[:lim.get("max_minidumps", 10)]
         if not keep:
             sec.item("minidumps", "missing", "Minidump folder exists but holds no .dmp files")
-        for _, name, path in keep:
-            e = case.collect_file(path, "logs/target-minidump-" + name, source="target", max_bytes=max_dump)
-            _file_item(sec, "minidump " + name, e)
+        for i, (_, name, path) in enumerate(keep, 1):
+            leaf, replaced = _safe_leaf(name, i)
+            e = case.collect_file(path, "logs/target-minidump-" + leaf, source="target", max_bytes=max_dump,
+                                  root=t.root)
+            extra = "; unsafe file name replaced by %s" % leaf if replaced else ""
+            it_ = _file_item(sec, "minidump " + (leaf if replaced else name), e)
+            if extra:
+                it_["reason"] = (it_["reason"] or "copied") + extra
         if len(found) > len(keep):
             sec.item("minidumps older", "skipped", "%d older dump(s) not copied (max_minidumps)" % (len(found) - len(keep)))
     except (FileNotFoundError, NotADirectoryError):
@@ -111,7 +146,8 @@ def _event_logs(ctx, sec):
         src = os.path.join(t.windir, "System32", "winevt", "Logs", name + ".evtx")
         fname = name.replace("%4", "-")
         dest = "logs/target-evtx-%s.evtx" % fname
-        e = case.collect_file(src, dest, source="target", max_bytes=lim.get("max_log_mb", 200) * MB)
+        e = case.collect_file(src, dest, source="target", max_bytes=lim.get("max_log_mb", 200) * MB,
+                              root=t.root)
         copy_txt = "copy %s%s" % (e["status"], ": " + _why(e) if _why(e) else "")
         argv = None
         if e["status"] == "ok":
@@ -158,13 +194,19 @@ def _event_logs(ctx, sec):
 
 
 # ------------------------------------------------------------------ 3. BCD
-def _bcd_store(ctx, sec, label, src, on_target):
-    """Copy one BCD store into the case, enumerate the working copy. Returns True if copied."""
+def _bcd_store(ctx, sec, label, src, on_target, root=None):
+    """Copy one BCD store into the case, enumerate the working copy. Returns True if copied.
+
+    A store above MAX_BCD_BYTES is not copied and not enumerated; the working copy is only made
+    when the backup copy succeeded. `root` is the volume the store lives on (it may not be the target)."""
     case = ctx.case
     bak_rel, work_rel = "exports/bcd-%s.bak" % label, "exports/bcd-%s.work" % label
-    e = case.collect_file(src, bak_rel, source="target")
+    e = case.collect_file(src, bak_rel, source="target", max_bytes=MAX_BCD_BYTES, root=root)
     if e["status"] != "ok":
-        sec.item("bcd-" + label, e["status"], _why(e) or "not copied", src=src)
+        why = _why(e) or "not copied"
+        if e["status"] == "skipped":
+            why += "; bcdedit enumeration skipped"
+        sec.item("bcd-" + label, e["status"], why, src=src)
         return False
     bak, work = case.path(*bak_rel.split("/")), case.path(*work_rel.split("/"))
     noted = ""
@@ -199,14 +241,14 @@ def _bcd(ctx, sec):
             sec.item("bcd-" + label, "error", "EFI System partition has no volume path (not mounted/readable)" + ADMIN_HINT)
             continue
         src = os.path.join(p["volume"], "EFI", "Microsoft", "Boot", "BCD")
-        copied += _bcd_store(ctx, sec, label, src, bool(p.get("on_target_disk")))
+        copied += _bcd_store(ctx, sec, label, src, bool(p.get("on_target_disk")), root=p["volume"])
     if t.disk and t.disk.get("style") == "MBR":
         for v in ctx.inventory.get("volumes", []):
             if v.get("disk") != t.disk.get("number") or not v.get("fs"):
                 continue
             root = v["letter"] + ":\\" if v.get("letter") else v["guid_path"]
             label = "bios-disk%s-part%s" % (v.get("disk"), v.get("partition"))
-            copied += _bcd_store(ctx, sec, label, os.path.join(root, "Boot", "BCD"), True)
+            copied += _bcd_store(ctx, sec, label, os.path.join(root, "Boot", "BCD"), True, root=root)
     if not copied and t.online and ctx.env.get("admin"):
         res = ctx.runner.run(["bcdedit", "/enum", "all", "/v"], "list BCD entries of the running system", timeout=60)
         if res.ok:
@@ -309,7 +351,7 @@ def _pending(ctx, sec):
     t, case = ctx.target, ctx.case
     for fname in ("pending.xml", "reboot.xml"):
         e = case.collect_file(os.path.join(t.windir, "WinSxS", fname), "logs/target-%s" % fname, source="target",
-                              max_bytes=_lim(ctx).get("max_log_mb", 200) * MB)
+                              max_bytes=_lim(ctx).get("max_log_mb", 200) * MB, root=t.root)
         if e["status"] == "missing":
             sec.item(fname, "missing", "not present (normal)")
         else:

@@ -143,12 +143,14 @@ def load_manifest(pdir):
     if not os.path.isfile(path):
         return None
     out = {}
-    with open(path, encoding="utf-8") as f:
-        for line in f:
-            parts = line.split()
-            if len(parts) < 2 or line.lstrip().startswith("#"):
-                continue
-            out[" ".join(parts[1:]).lstrip("*")] = parts[0].lower()
+    from .core.runner import read_manifest_lines
+    for line in read_manifest_lines(path):
+        parts = line.split()
+        if len(parts) < 2 or line.lstrip().startswith("#"):
+            continue
+        if len(parts[0]) != 64 or any(c not in "0123456789abcdefABCDEF" for c in parts[0]):
+            continue                                   # not a SHA-256: the file stays unlisted
+        out[" ".join(parts[1:]).lstrip("*")] = parts[0].lower()
     return out
 
 

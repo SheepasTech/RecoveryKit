@@ -24,6 +24,7 @@ def _gb(n):
 def collect(ctx):
     """Run all discovery sections. Sets ctx.inventory and ctx.target (None if no install found)."""
     case, ui = ctx.case, ctx.ui
+    ctx.options.pop("abort_scan", None)      # a verdict of an earlier scan must not outlive this one
     rescan = bool(case.data.get("case_id"))
     snapshot = copy.deepcopy({k: case.data.get(k) for k in ("environment", "sections")}) if rescan else None
     for t in list(ctx.inventory.get("installs", [])) + [ctx.target]:   # hive handles of a previous scan
@@ -104,9 +105,9 @@ def collect(ctx):
                 sec.set("ok", "the target is the running Windows: writing the case to this disk is expected")
             else:
                 sec.set("ok", "case output is not on the target volume")
-        if not why:
-            ctx.options.pop("abort_scan", None)
-            _assign_case(ctx, snapshot)
+        if why:
+            return target       # nothing else is run or asked: every further file would land on the target
+        _assign_case(ctx, snapshot)
 
     with case.section("target", "Chosen target") as sec:
         if not target:
@@ -201,8 +202,12 @@ def find_installs(ctx):
         disk = by_num.get(v.get("disk"))
         part = next((p for p in disk["partitions"] if p["number"] == v.get("partition")), None) if disk else None
         t = Target(root=root, windir=windir, online=online, letter=v["letter"], volume=v, disk=disk, partition=part)
-        t.reg = RegView(windir, online)
-        t.info = install_info(t)
+        try:
+            t.reg = RegView(windir, online)
+            t.info = install_info(t)
+        except Exception as e:  # noqa: BLE001 - one volume's broken hives must not hide the other installs
+            LOG.error("DISCOVERY| reading the registry of %s failed: %s: %s", root, type(e).__name__, e)
+            t.info = _unreadable_info("registry hives could not be parsed (%s: %s)" % (type(e).__name__, e))
         out.append(t)
     explicit = ctx.options.get("target_path")
     if explicit:
@@ -235,27 +240,46 @@ def _exclude_self(ctx, root):
     LOG.info("DISCOVERY| %s", note)
 
 
+def _real(p):
+    return os.path.normcase(os.path.realpath(p))
+
+
+def _inside(p, root):
+    try:
+        return os.path.commonpath([p, root]) == root
+    except ValueError:       # different drives
+        return False
+
+
 def check_output_location(ctx):
-    """Reason string when the case output (or the devices folder) is on the TARGET volume of an offline
-    target (a scan would write to the target); None when it is fine or the target is the running Windows."""
+    """Reason string when the case output (or the devices folder) is on the TARGET of an offline target (a
+    scan would write to the target); None when it is fine or the target is the running Windows. Paths are
+    compared after realpath, so a junction or subst drive that leads to the target is caught; a target given
+    by --target-path counts as the folder itself, a target that is a whole volume as the whole volume."""
     t = ctx.target
     if t is None or t.online:
         return None
     out_root = os.path.abspath(ctx.case.out_root)
     paths = [out_root, os.path.abspath(ctx.options.get("devices_dir")
                                        or os.path.join(os.path.dirname(out_root), "devices"))]
-    troot = os.path.normcase(t.root)
+    troot = _real(t.root)
     for p in paths:
-        drive = os.path.splitdrive(p)[0]
-        hit = bool(t.letter and drive[:1].upper() == t.letter.upper())
-        hit = hit or os.path.normcase(p).startswith(troot)
-        if not hit and drive:
-            try:
-                hit = os.path.samefile(drive + "\\", t.root)
-            except OSError:
-                pass
+        rp = _real(p)
+        drive = os.path.splitdrive(rp)[0]
+        hit = _inside(rp, troot)
+        whole_volume = bool(t.letter) or not t.info.get("explicit_path")
+        if not hit and drive and whole_volume:
+            hit = bool(t.letter and drive[:1].upper() == t.letter.upper())
+            if not hit:
+                try:
+                    hit = os.path.samefile(drive + "\\", t.root)
+                except OSError:
+                    pass
         if hit:
-            return "case output is on the target volume: scanning would write to the target"
+            return ("case output is on the target volume: scanning would write to the target (%s resolves to %s). "
+                    "Already written there before this check: the run folder %s (debug.log, case.json and the "
+                    "inventory files of the disks) and the write-test probe .rk-write-test in %s. Nothing further "
+                    "was run or collected." % (p, rp, ctx.case.dir, out_root))
     return None
 
 
@@ -337,6 +361,14 @@ def install_info(t):
         "machine_guid_sha": hashlib.sha256(guid.encode()).hexdigest()[:16] if isinstance(guid, str) else None,
         "errors": errors,
     }
+    return info
+
+
+def _unreadable_info(error):
+    keys = ("product", "edition", "display_version", "build", "ubr", "build_full", "architecture", "language",
+            "install_language_lcid", "computer_name", "control_set", "machine_guid_sha")
+    info = {k: None for k in keys}
+    info.update(ui_languages=[], errors=[error])
     return info
 
 

@@ -22,6 +22,7 @@ import os
 import time
 
 from ..core import hwinfo
+from ..core.mdsafe import code as _code, text as _text
 from ..core.log import LOG
 from . import discovery
 
@@ -237,11 +238,12 @@ def _write_index(ddir):
         if not dev:
             continue
         segs = dev.get("segments") if isinstance(dev.get("segments"), list) else []
-        d = {s["segment"]: s.get("detail") or "-" for s in segs if isinstance(s, dict) and "segment" in s}
-        rows.append("| `%s` | %s | %s | %s | %s | %s | %s | %s | %s | %d |" % (
-            dev.get("id"), d.get("CPU", "-"), d.get("RAM", "-"), d.get("RSPD", "-"), d.get("MOBO", "-"),
-            d.get("GPU", "-"), d.get("USER", "-"), d.get("DISK", "-"), dev.get("last_seen", "-"),
-            len(dev["runs"]) if isinstance(dev.get("runs"), list) else 0))
+        d = {s["segment"]: _text(s.get("detail"), 120) or "-" for s in segs if isinstance(s, dict) and "segment" in s}
+        runs = dev.get("runs")
+        rows.append("| %s | %s | %s | %s | %s | %s | %s | %s | %s | %d |" % (
+            _code(dev.get("id") or name, 80) or "-", d.get("CPU", "-"), d.get("RAM", "-"), d.get("RSPD", "-"),
+            d.get("MOBO", "-"), d.get("GPU", "-"), d.get("USER", "-"), d.get("DISK", "-"),
+            _text(dev.get("last_seen"), 40) or "-", len(runs) if isinstance(runs, list) else 0))
     text = ["# Devices seen by this kit", "",
             "ID = " + "-".join(s for s, _ in SEGMENTS) + ". One 4-letter code per component; XXXX = not readable. "
             "`components.json` maps every code back to its component. Device-specific settings are in "

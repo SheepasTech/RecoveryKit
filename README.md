@@ -7,7 +7,7 @@ Portable USB toolkit that diagnoses, collects evidence from and (only with confi
 
 > **Status.** Implemented and covered by automated tests on one development PC (Windows 11, not elevated). **Not yet exercised: a real WinRE boot, an administrator session, a real offline disk, any real repair command, and two machines on a LAN.** Scanning is read-only, so a first try on a real machine is safe; treat the repair helpers as untested until one has been walked through on a disposable install.
 >
-> What was checked: the unit tests (they build a fake offline Windows with real hive files; repairs only in dry run); scans of the development PC's own running Windows, also from the USB stick with the bundled Python; the control server, pairing, relayed scan, bundle retrieval and revocation between two processes over 127.0.0.1. Not checked: TLS (no certificate was made), the browser page in a real browser, boot-time behaviour of the bundled Python, which tools WinRE has.
+> What was checked: the unit tests (they build a fake offline Windows with real hive files; repairs only in dry run); scans of the development PC's own running Windows, also from the USB stick with the bundled Python; the control server, pairing, relayed scan, bundle retrieval and revocation between two processes over 127.0.0.1, with and without TLS (real handshakes against a test CA); two independent security reviews and the fixes for their findings. Not checked: two machines on a LAN, the browser page in a real browser, boot-time behaviour of the bundled Python, which tools WinRE has.
 
 The design is in [RecoveryKit-spec.md](RecoveryKit-spec.md), progress in [roadmap.md](roadmap.md), changes in [CHANGELOG.md](CHANGELOG.md). No customer data or keys are stored in this repository.
 

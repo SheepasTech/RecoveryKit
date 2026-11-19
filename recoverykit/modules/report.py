@@ -3,9 +3,15 @@
 Structure from the hand-worked case: confirmed facts, not yet established,
 actions and results, current state, suggested next step. The report never says
 the machine is fixed: only an operator-confirmed boot is reported as booted.
+
+The report is read in Obsidian and most strings in it come from the inspected
+disk, the operator, a remote client or a log: every interpolated value goes
+through core.mdsafe (text for prose and cells, code for paths and commands).
 """
 import json
 import os
+
+from ..core.mdsafe import code as C, text as T
 
 GB = 2 ** 30
 
@@ -21,7 +27,11 @@ ANSWER_TEXT = {
 
 
 def _gb(n):
-    return "%.1f GB" % (n / GB) if isinstance(n, (int, float)) else "unknown"
+    return "%.1f GB" % (n / GB) if isinstance(n, (int, float)) and not isinstance(n, bool) else "unknown"
+
+
+def _mb(n):
+    return str(n // 2 ** 20) if isinstance(n, int) else "?"
 
 
 def _audit(case_dir):
@@ -30,7 +40,8 @@ def _audit(case_dir):
         with open(os.path.join(case_dir, "audit.log"), encoding="utf-8") as f:
             for line in f:
                 try:
-                    out.append(json.loads(line))
+                    e = json.loads(line)
+                    out.append(e if isinstance(e, dict) else {"seq": "?", "kind": "unreadable", "command": line.strip()[:200]})
                 except ValueError:
                     out.append({"seq": "?", "kind": "unreadable", "command": line.strip()[:200]})
     except OSError:
@@ -47,17 +58,17 @@ def render(data, audit):
     info = tgt.get("info") or {}
     env = data.get("environment") or {}
 
-    add("# RecoveryKit case %s" % (data.get("case_id") or "(no target)"))
+    add("# RecoveryKit case %s" % (T(data.get("case_id"), 80) or "(no target)"))
     add("")
     dev = data.get("device") or {}
     if dev.get("id"):
-        add("- Device ID: `%s`" % dev["id"])
-    add("- Ticket: %s" % (data.get("ticket") or "not given"))
-    add("- Run started: %s" % data.get("started"))
-    add("- Kit version: %s, case schema %s" % (data.get("kit_version"), data.get("schema")))
+        add("- Device ID: %s" % C(dev["id"]))
+    add("- Ticket: %s" % (T(data.get("ticket"), 40) or "not given"))
+    add("- Run started: %s" % (T(data.get("started"), 40) or "?"))
+    add("- Kit version: %s, case schema %s" % (T(data.get("kit_version"), 40), T(data.get("schema"), 40)))
     add("- Run from: %s (%s firmware, %s), administrator: %s" % (
-        env.get("kind", "?"), env.get("firmware", "?"),
-        (env.get("os") or {}).get("product") or "?", "yes" if env.get("admin") else "NO"))
+        T(env.get("kind", "?"), 40), T(env.get("firmware", "?"), 40),
+        T((env.get("os") or {}).get("product")) or "?", "yes" if env.get("admin") else "NO"))
     add("")
 
     add("## 1. Confirmed facts")
@@ -68,34 +79,36 @@ def render(data, audit):
         d, p, v = tgt.get("disk") or {}, tgt.get("partition") or {}, tgt.get("volume") or {}
         add("| Item | Value |")
         add("|---|---|")
-        add("| Target | `%s`%s |" % (tgt.get("root"), " (the RUNNING Windows, not an offline install)" if tgt.get("online") else " (offline install)"))
-        add("| Disk | Disk %s, %s, %s, %s, %s |" % (d.get("number", "?"), d.get("model") or "model unknown", _gb(d.get("size")), d.get("bus") or "?", d.get("style") or "?"))
-        add("| Partition | %s, %s (%s) |" % (p.get("number", "?"), _gb(p.get("size")), p.get("type") or "?"))
-        add("| File system | %s, %s free of %s |" % (v.get("fs") or "?", _gb(v.get("free")), _gb(v.get("size"))))
-        add("| Windows | %s, edition %s, version %s |" % (info.get("product") or "unknown", info.get("edition") or "unknown", info.get("display_version") or "?"))
-        add("| Build | %s |" % (info.get("build_full") or "unknown"))
-        add("| Architecture | %s |" % (info.get("architecture") or "unknown"))
-        add("| Language | %s (UI languages: %s) |" % (info.get("language") or "unknown", ", ".join(info.get("ui_languages") or []) or "unknown"))
+        add("| Target | %s%s |" % (C(tgt.get("root")) or "?", " (the RUNNING Windows, not an offline install)" if tgt.get("online") else " (offline install)"))
+        add("| Disk | Disk %s, %s, %s, %s, %s |" % (T(d.get("number", "?"), 20), T(d.get("model")) or "model unknown", _gb(d.get("size")), T(d.get("bus"), 40) or "?", T(d.get("style"), 40) or "?"))
+        add("| Partition | %s, %s (%s) |" % (T(p.get("number", "?"), 20), _gb(p.get("size")), T(p.get("type"), 60) or "?"))
+        add("| File system | %s, %s free of %s |" % (T(v.get("fs"), 40) or "?", _gb(v.get("free")), _gb(v.get("size"))))
+        add("| Windows | %s, edition %s, version %s |" % (T(info.get("product")) or "unknown", T(info.get("edition")) or "unknown", T(info.get("display_version"), 60) or "?"))
+        add("| Build | %s |" % (T(info.get("build_full"), 60) or "unknown"))
+        add("| Architecture | %s |" % (T(info.get("architecture"), 40) or "unknown"))
+        add("| Language | %s (UI languages: %s) |" % (T(info.get("language"), 60) or "unknown", ", ".join(T(x, 60) for x in info.get("ui_languages") or [] if isinstance(x, str)) or "unknown"))
         boot = (sections.get("boot_structure") or {}).get("data") or {}
         efi = boot.get("efi_partitions") or []
         rec = boot.get("recovery_partitions") or []
-        add("| EFI System partitions | %s |" % (", ".join("disk %s part %s (%d MB)%s" % (e["disk"], e["partition"], e["size"] // 2**20, ", target disk" if e.get("on_target_disk") else "") for e in efi) or "none found"))
-        add("| Recovery partitions | %s |" % (", ".join("disk %s part %s (%d MB)" % (e["disk"], e["partition"], e["size"] // 2**20) for e in rec) or "none found"))
+        add("| EFI System partitions | %s |" % (", ".join("disk %s part %s (%s MB)%s" % (T(e.get("disk"), 20), T(e.get("partition"), 20), _mb(e.get("size")), ", target disk" if e.get("on_target_disk") else "") for e in efi) or "none found"))
+        add("| Recovery partitions | %s |" % (", ".join("disk %s part %s (%s MB)" % (T(e.get("disk"), 20), T(e.get("partition"), 20), _mb(e.get("size"))) for e in rec) or "none found"))
         if boot.get("note"):
             add("")
-            add("Note: %s." % boot["note"])
+            add("Note: %s." % T(boot["note"]))
         for e in info.get("errors") or []:
             add("")
-            add("Not readable: %s." % e)
+            add("Not readable: %s." % T(e))
     add("")
 
     if dev.get("segments"):
-        add("Device `%s` (one code per component; the hardware is that of the PC the kit ran on):" % dev["id"])
+        add("Device %s (one code per component; the hardware is that of the PC the kit ran on):" % C(dev.get("id")))
         add("")
         add("| Code | Component | Value |")
         add("|---|---|---|")
         for sg in dev["segments"]:
-            add("| %s | %s | %s |" % (sg.get("code"), sg.get("label"), str(sg.get("detail") or "not readable").replace("|", "/")))
+            if not isinstance(sg, dict):
+                continue
+            add("| %s | %s | %s |" % (T(sg.get("code"), 40), T(sg.get("label"), 80), T(sg.get("detail")) or "not readable"))
         add("")
 
     add("## 2. Not yet established")
@@ -106,7 +119,7 @@ def render(data, audit):
     for k, v in ans.items():
         if not v:
             continue
-        add("- %s: %s" % (ANSWER_TEXT.get(k, k), "**not established**" if v == "unknown" else v))
+        add("- %s: %s" % (ANSWER_TEXT.get(k) or T(k, 60), "**not established**" if v == "unknown" else T(v)))
     b = data.get("booted_after_repair")
     add("- Target boots: %s" % ("operator confirmed it booted" if b is True else "operator reports it did NOT boot" if b is False else "**not tested / not confirmed**"))
     add("")
@@ -122,25 +135,23 @@ def render(data, audit):
         add("| # | Kind | Command | Exit code | Note |")
         add("|---|---|---|---|---|")
         for a in audit:
-            cmd = str(a.get("command", ""))
-            if len(cmd) > 110:
-                cmd = cmd[:107] + "..."
-            note = a.get("error") or a.get("note") or ""
+            note = T(a.get("error") or a.get("note"))
             if a.get("timed_out"):
                 note = "TIMED OUT. " + note
-            add("| %s | %s | `%s` | %s | %s |" % (a.get("seq"), a.get("kind"), cmd.replace("|", "\\|"),
-                                              a.get("exit_code") if a.get("exit_code") is not None else "-", note.replace("|", "/")))
+            add("| %s | %s | %s | %s | %s |" % (
+                T(a.get("seq"), 20), T(a.get("kind"), 40), C(a.get("command", ""), 110) or "-",
+                T(a.get("exit_code"), 20) if a.get("exit_code") is not None else "-", note))
         add("")
     for r in data.get("repair_log") or []:
-        add("- Repair step `%s` (%s): exit code %s%s%s%s" % (
-            r.get("id"), r.get("kind"), r.get("rc"),
-            ", finding: %s" % r["finding"] if r.get("finding") else "",
-            ", error %s" % r["error_code"] if r.get("error_code") else "",
-            ". Note: %s" % r["note"] if r.get("note") else ""))
+        add("- Repair step %s (%s): exit code %s%s%s%s" % (
+            C(r.get("id")) or "?", T(r.get("kind"), 60), T(r.get("rc"), 20),
+            ", finding: %s" % T(r["finding"]) if r.get("finding") else "",
+            ", error %s" % T(r["error_code"], 60) if r.get("error_code") else "",
+            ". Note: %s" % T(r["note"]) if r.get("note") else ""))
     sc = data.get("source_check")
     if sc:
-        add("- Repair source `%s` index %s: %s" % (sc.get("path"), sc.get("index"), "matches the target" if sc.get("ok") else "REFUSED: " + "; ".join(
-            "%s target=%s source=%s" % (m.get("field"), m.get("target"), m.get("source")) for m in sc.get("mismatches") or [])))
+        add("- Repair source %s index %s: %s" % (C(sc.get("path")) or "?", T(sc.get("index"), 20), "matches the target" if sc.get("ok") else "REFUSED: " + "; ".join(
+            "%s target=%s source=%s" % (T(m.get("field"), 60), T(m.get("target"), 100), T(m.get("source"), 100)) for m in sc.get("mismatches") or [])))
     add("")
 
     add("## 4. Current state")
@@ -150,24 +161,24 @@ def render(data, audit):
     for name, s in sections.items():
         if name == "assistant":
             continue
-        add("| %s | %s | %s |" % (s.get("title") or name, s.get("status"), (s.get("reason") or "").replace("|", "/")))
+        add("| %s | %s | %s |" % (T(s.get("title") or name, 100), T(s.get("status"), 40), T(s.get("reason"), 700)))
     add("")
     problems = [(s.get("title") or n, i) for n, s in sections.items() for i in s.get("items") or [] if i.get("status") != "ok"]
     if problems:
         add("Items that were not collected, and why:")
         add("")
         for title, i in problems:
-            add("- %s / %s: %s%s" % (title, i.get("name"), i.get("status"), " - " + i["reason"] if i.get("reason") else " - (no reason recorded)"))
+            add("- %s / %s: %s%s" % (T(title, 100), T(i.get("name"), 120), T(i.get("status"), 40), " - " + T(i["reason"]) if i.get("reason") else " - (no reason recorded)"))
         add("")
     look = []
     for h in ((sections.get("log_findings") or {}).get("data") or {}).get("headline") or []:
-        look.append("Logs: %s" % h)
+        look.append("Logs: %s" % T(h))
     for n in ((sections.get("registry") or {}).get("data") or {}).get("notable") or []:
-        look.append("Registry: %s" % n)
+        look.append("Registry: %s" % T(n))
     drv = (sections.get("drivers") or {}).get("data") or {}
     if drv.get("recent"):
         look.append("Drivers added in the %s days before the install's last activity: %s" % (
-            drv.get("recent_days", 30), ", ".join(str(x) for x in drv["recent"][:12])))
+            T(drv.get("recent_days", 30), 20), ", ".join(T(x, 80) for x in drv["recent"][:12])))
     for name, label in (("autoruns", "autorun"), ("services", "service"), ("tasks", "scheduled task")):
         fl = ((sections.get(name) or {}).get("data") or {}).get("flagged") or []
         if fl:
@@ -179,7 +190,7 @@ def render(data, audit):
         add("Things to look at (findings, not verdicts):")
         add("")
         for x in look:
-            add("- %s" % str(x).replace("|", "/"))
+            add("- %s" % x)
         add("")
     files = data.get("files") or []
     add("Files collected: %d ok, %d missing, %d error, %d metadata only." % tuple(
@@ -187,7 +198,7 @@ def render(data, audit):
     ro = data.get("read_only_check")
     if ro:
         add("")
-        add("Read-only check: %s" % ro.get("summary"))
+        add("Read-only check: %s" % T(ro.get("summary"), 600))
     add("")
     add("A clean SFC or DISM result does not mean the machine boots. This report does not claim the target is fixed.")
     add("")
@@ -204,20 +215,20 @@ def render(data, audit):
         if s.get("branch") != last:
             last = s.get("branch")
             add("")
-            add("**Branch %s**" % last)
+            add("**Branch %s**" % T(last, 60))
             add("")
         n += 1
-        add("%d. **%s** %s" % (n, s.get("title"), s.get("text")))
+        add("%d. **%s** %s" % (n, T(s.get("title"), 150), T(s.get("text"), 1200)))
         ev = s.get("evidence") or {}
         if ev:
-            add("   - Because: %s" % "; ".join("%s = %s" % (k, v) for k, v in ev.items()))
+            add("   - Because: %s" % "; ".join("%s = %s" % (T(k, 60), T(v, 200)) for k, v in ev.items()))
     wc = assist.get("what_changed") or []
     if wc:
         add("")
         add("### Changed since the previous run of this case")
         add("")
         for c in wc:
-            add("- %s" % c)
+            add("- %s" % T(c))
     add("")
     return "\n".join(L)
 

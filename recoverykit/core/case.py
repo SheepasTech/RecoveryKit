@@ -158,8 +158,19 @@ class Case:
             f.write(text)
         return p
 
-    def collect_file(self, src, rel_dest, source="target", max_bytes=None):
+    @staticmethod
+    def _inside(path, base):
+        """True when the real path of `path` is `base` or below it (both resolved, case-folded)."""
+        try:
+            b = os.path.normcase(os.path.realpath(base))
+            return os.path.commonpath([b, os.path.normcase(os.path.realpath(path))]) == b
+        except (ValueError, OSError):
+            return False
+
+    def collect_file(self, src, rel_dest, source="target", max_bytes=None, root=None):
         """Copy one file into the case, read-only on the source.
+
+        `root`: when given, the real path of `src` must be inside it (parent junctions are not followed out).
 
         Returns {src, dest, source, status, reason, size, mtime, sha256}. Status is
         ok, missing, error, or skipped (larger than max_bytes: metadata only).
@@ -173,27 +184,38 @@ class Case:
                 LOG.info("FILE  | %s -> %s: %s %s", src, rel_dest, e["status"], e["reason"])
                 self.data["files"].append(e)
                 return e
+            if root is not None and not self._inside(src, root):
+                e["status"], e["reason"] = "skipped", "resolves outside the target: not followed"
+                LOG.info("FILE  | %s -> %s: %s %s", src, rel_dest, e["status"], e["reason"])
+                self.data["files"].append(e)
+                return e
             st = os.stat(src)
-            e["size"], e["mtime"] = st.st_size, time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(st.st_mtime))
-            e["_mtime_ns"] = st.st_mtime_ns
+            e["size"], e["_mtime_ns"] = st.st_size, st.st_mtime_ns
+            try:
+                e["mtime"] = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(st.st_mtime))
+            except (OSError, OverflowError, ValueError):
+                e["mtime"] = None   # timestamp outside what the C library can format: the file is still copied
             if max_bytes is not None and st.st_size > max_bytes:
                 e["status"], e["reason"] = "skipped", "larger than %d MB, metadata only" % (max_bytes // 2**20)
             else:
                 dest = self.path(*rel_dest.split("/"))
-                os.makedirs(os.path.dirname(dest), exist_ok=True)
-                h = hashlib.sha256()
-                with open(src, "rb") as fi, open(dest, "wb") as fo:
-                    while True:
-                        chunk = fi.read(1 << 20)
-                        if not chunk:
-                            break
-                        h.update(chunk)
-                        fo.write(chunk)
-                e["sha256"] = h.hexdigest()
+                if not self._inside(dest, self.dir):
+                    e["status"], e["reason"] = "error", "destination is outside the case folder: not written"
+                else:
+                    os.makedirs(os.path.dirname(dest), exist_ok=True)
+                    h = hashlib.sha256()
+                    with open(src, "rb") as fi, open(dest, "wb") as fo:
+                        while True:
+                            chunk = fi.read(1 << 20)
+                            if not chunk:
+                                break
+                            h.update(chunk)
+                            fo.write(chunk)
+                    e["sha256"] = h.hexdigest()
         except FileNotFoundError:
             e["status"], e["reason"] = "missing", "not found"
-        except OSError as ex:
-            e["status"], e["reason"] = "error", "%s: %s" % (type(ex).__name__, ex.strerror or ex)
+        except (OSError, ValueError) as ex:
+            e["status"], e["reason"] = "error", "%s: %s" % (type(ex).__name__, getattr(ex, "strerror", None) or ex)
         LOG.info("FILE  | %s -> %s: %s %s", src, rel_dest, e["status"], e["reason"])
         self.data["files"].append(e)
         return e
@@ -216,7 +238,19 @@ class Case:
         tmp = self.path("case.json.tmp")
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(self.data, f, indent=2, ensure_ascii=False, default=str)
-        os.replace(tmp, self.path("case.json"))
+        # On Windows the replace fails while another program (a status poll, an antivirus scan, an editor)
+        # has case.json open. That must never end a scan: retry briefly, then keep the .tmp and say so.
+        last = None
+        for attempt in range(20):
+            try:
+                os.replace(tmp, self.path("case.json"))
+                return True
+            except PermissionError as e:
+                last = e
+                time.sleep(0.05 * (attempt + 1))
+        LOG.error("CASE  | case.json is held open by another program and could not be replaced (%s); "
+                  "the current state is in case.json.tmp and will be written at the next save", last)
+        return False
 
     def close(self):
         self.data["finished"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")

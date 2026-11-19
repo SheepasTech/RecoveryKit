@@ -3,15 +3,18 @@
 Nothing here runs a repair command: everything goes through classify(), classify_diskpart()
 and Runner(..., dry_run=True), or a Runner whose _exec is replaced.
 """
+import hashlib
 import json
 import os
+import random
 import tempfile
 import types
 import unittest
 
 from recoverykit.core.case import Case
 from recoverykit.core.runner import (FORBIDDEN, HOST, READ, REPAIR, UNKNOWN, Refused, RepairStep, Result, Runner,
-                                     classify, classify_diskpart, normalise_diskpart)
+                                     classify, classify_diskpart, normalise_diskpart,
+                                     read_manifest_lines, _redact)
 from recoverykit.modules import repair
 from tests.test_core import ROOT, ScriptedUI
 
@@ -316,6 +319,187 @@ class RecordRedaction(Tmp):                                  # C1
         self.case.close()
         with open(self.case.path("case.json"), encoding="utf-8") as f:
             self.assertNotIn(self.KEY, f.read())
+
+
+class SecondReview(Tmp):
+    """Second review 2026-11-19: A1, A6, A8, A9, A12, look-alike switches, A10 (runner part)."""
+
+    def bad(self, *argvs, **kw):
+        for argv in argvs:
+            self.assertIn(classify(argv, **kw)[0], NOT_RUNNABLE, argv)
+
+    def test_a6_malformed_and_lookalikes(self):
+        self.bad([], ["bcdedit", "/export:foo", "bar"], ["ipconfig", "/all\x00"], ["ipconfig", "/all\n"],
+                 ["ipconfig", "\x7f"], ["ipconfig", 'a"b'], ["ipconfig", None], ["ipconfig", b"/all"],
+                 ["bcdedit", "\uFF0Fimport", "x"], ["bcdedit", "/store", "x", "/enum", "\uFF0Fimport", "y"],
+                 ["ipconfig", "\uFF0Frelease"], ["manage-bde", "-status", "\u2013off"],
+                 ["manage-bde", "-status", "\u2212off"], ["ipconfig", "/\u0430ll"], ["ipconfig", " /all"],
+                 ["CH\u212aDS\u212a", "W:"], ["ipconfig", "\u2215all"], ["ipconfig", "\u2044all"],
+                 ["ipconfig", "\u29f8all"], "ipconfig /all", None)
+        self.assertEqual(classify(["ipconfig", 5])[0], UNKNOWN)       # an int is text, but not an ipconfig argument
+        self.assertEqual(classify([os.fspath("ipconfig"), "/all"])[0], READ)
+
+    def test_a1_bcdedit_store(self):
+        d = self.tmp.name
+        inside = os.path.join(d, "exports", "w.work")
+        self.assertEqual(classify(["bcdedit", "/store", inside, "/enum", "all", "/v"], case_dir=d)[0], READ)
+        self.assertEqual(classify(["bcdedit", "/store", inside, "/export", os.path.join(d, "a.bak")], case_dir=d)[0],
+                         READ)
+        self.bad(["bcdedit", "/store", "W:\\Boot\\BCD", "/enum", "all", "/v"],
+                 ["bcdedit", "/store", "W:\\Boot\\BCD", "/enum"], ["bcdedit", "/store"], ["bcdedit", "/store", "/enum"],
+                 ["bcdedit", "/store", "/v", "/enum"], ["bcdedit", "/store", inside, "/store", inside, "/enum"],
+                 ["bcdedit", "/store", "W:\\Boot\\BCD", "/export", os.path.join(d, "a.bak")],
+                 ["bcdedit", "/enum", "add"], ["bcdedit", "add"], ["bcdedit", "/export", "x", "y"],
+                 ["bcdedit", "/store", "W:\\Boot\\BCD", "/export", "W:\\x"],
+                 ["bcdedit", "/store", os.path.join(d + "2", "x"), "/enum"], case_dir=d)
+        self.assertEqual(classify(["bcdedit", "/store", "W:\\Boot\\BCD", "/enum"], case_dir=d)[1],
+                         "bcdedit may only open a copy of the store inside the case folder")
+        self.assertEqual(classify(["bcdedit", "/store", "x", "/enum"])[0], FORBIDDEN)
+
+    def test_a1_repair_store_on_system_drive_refused(self):
+        r = Runner(self.case, ScriptedUI(["yes", "yes"]), ROOT, dry_run=True)
+        r.repairs_enabled = True
+        r.bcd_backup = os.path.join(self.tmp.name, "b.bak")
+        with open(r.bcd_backup, "wb") as f:
+            f.write(b"x")
+        sysdrive = os.environ.get("SystemDrive", "C:")
+        step = RepairStep(id="b", title="b", effect="e",
+                          argv=["bcdedit", "/store", sysdrive + "\\Boot\\BCD", "/set", "{default}", "a", "b"])
+        with self.assertRaises(Refused) as cm:
+            r.repair(step)
+        self.assertIn("running Windows", str(cm.exception))
+        step.argv[2] = "\\Boot\\BCD"
+        with self.assertRaises(Refused):
+            r.repair(step)
+
+    def test_a8_robocopy(self):
+        d = self.tmp.name
+        log = os.path.join(d, "logs", "r.log")
+        ok = ["robocopy", "W:\\Users", "E:\\b\\Users", "/E", "/LOG:" + log]
+        self.assertEqual(classify(ok, case_dir=d)[0], HOST)
+        self.bad(ok)                                                                   # no case dir
+        self.bad(["robocopy", "W:\\Users", "E:\\b", "/LOG:W:\\Windows\\x.log"],
+                 ["robocopy", "W:\\Users", "E:\\b", "/LOG:"],
+                 ["robocopy", "W:\\Users", "W:\\Users", "/E"],
+                 ["robocopy", "W:\\Users", "w:\\users\\", "/E"],
+                 ["robocopy", "W:\\Users", "W:\\Users\\sub", "/E"],
+                 ["robocopy", "W:\\Users\\sub", "W:\\Users", "/E"], case_dir=d)
+        self.assertEqual(classify(["robocopy", "W:\\Users", "W:\\Users2", "/E"], case_dir=d)[0], HOST)
+
+    def test_a8_runner_passes_case_dir(self):
+        r = Runner(self.case, ScriptedUI(["yes", "yes"]), ROOT, dry_run=True)
+        r.repairs_enabled = True
+        argv = ["robocopy", "W:\\Users", "E:\\b\\Users", "/E", "/LOG:" + self.case.path("logs", "r.log")]
+        self.assertEqual(r.repair(RepairStep(id="c", title="c", effect="e", argv=argv)).kind, "dry-run")
+        argv[-1] = "/LOG:W:\\Windows\\x.log"
+        with self.assertRaises(Refused):
+            r.repair(RepairStep(id="c", title="c", effect="e", argv=argv))
+
+    def test_a9_network_reads(self):
+        self.bad(["reg", "query", "\\\\remotehost\\HKLM\\Software"], ["reg", "query", "//host/x"],
+                 ["reg", "query", "HKLM\\Software", "/s", "/y"], ["reg", "query"], ["reg", "query", "save"],
+                 ["reg", "query", "HKLM\\x", "-v", "a"],
+                 ["wevtutil", "qe", "System", "/r:otherhost", "/u:x", "/p:y"], ["wevtutil", "qe", "System", "/r:h"],
+                 ["wevtutil", "qe", "\\\\evil\\share\\x.evtx"], ["wevtutil", "qe", "//evil/share/x.evtx"],
+                 ["wevtutil", "qe", "System", "/lf"], ["wevtutil", "qe", "System", "/ow:true"],
+                 ["wevtutil", "qe", "System", "/uni:true"], ["wevtutil", "qe", "a", "b"], ["wevtutil", "qe"],
+                 ["wevtutil", "el", "/r:h"], ["wevtutil", "el", "x"], ["wevtutil", "gl", "System", "/r:h"],
+                 ["wevtutil", "gli", "System", "/u:x"], ["wevtutil", "gl", "\\\\h\\x"],
+                 ["reagentc", "/info", "/target", "W:\\Windows"], ["reagentc", "/info", "/x"], ["reagentc"])
+        for argv in (["reg", "query", "HKLM\\Software\\X", "/v", "Name", "/reg:64"], ["wevtutil", "el"],
+                     ["wevtutil", "gl", "System", "/lf:true"], ["wevtutil", "gli", "System"], ["reagentc", "/info"],
+                     ["wevtutil", "qe", "System", "/q:*", "/c:5", "/rd:true", "/f:text", "/lf:false"]):
+            self.assertEqual(classify(argv)[0], READ, argv)
+
+    def test_a12_utf16_manifest(self):
+        h = hashlib.sha256(b"x").hexdigest()
+        text = "# c\r\n%s  a.py\r\nnothex  b.py\r\n%s *c.py\r\n" % (h, h.upper())
+        for name, raw in (("le", b"\xff\xfe" + text.encode("utf-16-le")), ("be", b"\xfe\xff" + text.encode("utf-16-be")),
+                          ("u8", b"\xef\xbb\xbf" + text.encode()), ("bad", b"\xff\xfe\x00\xd8x" + b"\x80\x81" * 3),
+                          ("odd", b"\xff\xfe" + text.encode("utf-16-le") + b"\x41")):
+            p = os.path.join(self.tmp.name, name + ".sha256")
+            with open(p, "wb") as f:
+                f.write(raw)
+            self.assertIsInstance(read_manifest_lines(p), list)            # never raises
+        self.assertEqual(read_manifest_lines(os.path.join(self.tmp.name, "le.sha256"))[1], "%s  a.py" % h)
+        with self.assertRaises(OSError):
+            read_manifest_lines(os.path.join(self.tmp.name, "missing"))
+        kit = os.path.join(self.tmp.name, "kit")
+        os.makedirs(os.path.join(kit, "tools"))
+        os.makedirs(os.path.join(kit, "plugins"))
+        data = b"tool"
+        with open(os.path.join(kit, "tools", "good.exe"), "wb") as f:
+            f.write(data)
+        man = "%s  good.exe\r\nnothex  bad.exe\r\n" % hashlib.sha256(data).hexdigest()
+        for sub in ("tools", "plugins"):
+            with open(os.path.join(kit, sub, "manifest.sha256"), "wb") as f:
+                f.write(b"\xff\xfe" + man.encode("utf-16-le"))
+        r = Runner(self.case, ScriptedUI([]), kit)
+        st = r.verify_tools()
+        self.assertEqual(st["good.exe"], "ok")
+        self.assertIn("ignored", st["bad.exe"])
+        self.assertIn("good", r.verified_tools)
+        from recoverykit.plugins import load_manifest
+        self.assertEqual(list(load_manifest(os.path.join(kit, "plugins"))), ["good.exe"])
+
+    def test_a10_redact_helper(self):
+        key = "111111-222222-333333-444444-555555-666666-777777-888888"
+        self.assertEqual(_redact("key %s ok %s" % (key, key), (key, "")), "key <redacted> ok <redacted>")
+        self.assertEqual(_redact("plain", ("",)), "plain")
+
+    def test_a10_repair_result_is_redacted(self):
+        key = "111111-222222-333333-444444-555555-666666-777777-888888"
+        r = Runner(self.case, ScriptedUI(["yes"]), ROOT)
+        r.repairs_enabled = True
+        r._exec = lambda argv, timeout, **kw: Result(list(argv), rc=0, out="echo " + key)
+        res = r.repair(RepairStep(id="unlock", title="u", effect="e", secrets=(key,),
+                                  argv=["manage-bde", "-unlock", "W:", "-RecoveryPassword", key]))
+        self.assertNotIn(key, res.out)
+
+    def test_exec_catches_value_error(self):
+        r = Runner(self.case, ScriptedUI([]), ROOT)
+        res = r._exec(["ipconfig", "/all\x00"], 5)
+        self.assertTrue(res.error and res.rc is None)
+
+
+WRITE_TOKENS = ["/set", "/delete", "/deletevalue", "/import", "/createstore", "/mir", "/purge", "/move", "/fixmbr",
+                "/fixboot", "/rebuildbcd", "/off", "/r", "/offline", "/apply-image", "/remove-package",
+                "/scannow", "save", "add", "call", "clean", "format", "restore", "delete", "export", "-unlock"]
+CHKDSK_WRITE = {"/f", "/x", "/scan"}                 # chkdsk repair switches: REPAIR, never READ
+TOOLS = ["bcdedit", "bcdboot", "bootrec", "dism", "sfc", "reg", "chkdsk", "wevtutil", "wmic", "smartctl",
+         "robocopy", "ipconfig", "manage-bde", "reagentc", "diskpart", "format", "cmd", "powershell", "drvload",
+         "BCDEDIT.EXE", "CH\u212aDS\u212a"]
+VOCAB = TOOLS + ["/store", "/enum", "/v", "/export", "/all", "/info", "/status", "-status", "/Image:W:\\", "/E",
+                 "/LOG:W:\\x.log", "W:", "W:\\Windows", "query", "qe", "el", "gl", "get", "all", "{default}",
+                 "HKLM\\Software", "System", "/q:*", "/c:5", "/lf:true", "/dev/pd0", "-a", "-j", "--scan", "/l",
+                 "\uFF0Fimport", "\u2013off", "\u2215set", "\u0430", "", " ", "\x00", "\n", "\x7f", '"', "a\x01b",
+                 "\\\\host\\share", "//host/x", "\u00a0/set"] + WRITE_TOKENS + sorted(CHKDSK_WRITE)
+
+
+class Property(unittest.TestCase):
+    def test_20000_random_argvs(self):
+        rng = random.Random(20261119)
+        write_low = {t.lower() for t in WRITE_TOKENS}
+        n_read = 0
+        for _ in range(20000):
+            argv = [rng.choice(VOCAB) for _ in range(rng.randint(0, 7))]
+            if argv and rng.random() < 0.6:
+                argv[0] = rng.choice(TOOLS)
+            kind, why = classify(argv, case_dir=rng.choice([None, "W:\\case", os.path.abspath(".")]))   # never raises
+            self.assertIn(kind, (READ, REPAIR, HOST, FORBIDDEN, UNKNOWN))
+            self.assertIsInstance(why, str)
+            if kind == READ:
+                n_read += 1
+                low = {str(a).lower() for a in argv[1:]}
+                self.assertFalse(low & write_low, argv)
+                if argv[0].lower().startswith("chkdsk"):
+                    self.assertFalse(low & CHKDSK_WRITE, argv)
+        self.assertGreater(n_read, 0)
+
+    def test_never_raises_on_odd_types(self):
+        for argv in ([None], [object()], [["a"]], ["bcdedit", "/export:foo", "bar"], ["bcdedit", "/export:", "/store"],
+                     [1, 2], ["ipconfig", 1.5], "text", 5, {"a": 1}, ["wevtutil", "qe", "\u0000"]):
+            self.assertIn(classify(argv)[0], NOT_RUNNABLE, argv)
 
 
 if __name__ == "__main__":

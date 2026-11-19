@@ -2,6 +2,24 @@
 
 Newest first. "Verified" says how a change was checked; anything not listed there was not checked.
 
+## 0.5.0 - 2026-11-19
+
+Added
+- The control host PC is the certificate authority. `New-ItworkCertificates.ps1` creates one private CA per user (outside the repository, no certificate store, no administrator) and issues the server certificate. `--server` uses TLS by default and refuses to start without it unless `--no-tls` is given. `Install-ToUsb.ps1` puts only the CA certificate on the stick. Agents verify the server against it; an `https://` connection with neither CA nor `--pin` is refused.
+- After pairing, agent and server sign with a session key derived from the pairing code, so the shared agent token alone cannot take over a paired session.
+
+Security (second independent review)
+- A corrupted or hostile target disk can no longer hang or blind a scan: the hive parser bounds every count and size and raises one error type only (3000-mutation fuzz test); the log analyser clips long lines and uses linear patterns; the event-log reader has a work budget per record; folder walks do not follow links and are capped; one unreadable install no longer hides the others.
+- Files are collected only if they resolve inside the target and land inside the case folder; odd file names are replaced by safe ones.
+- Every value written into `report.md` and `devices/index.md` is escaped, so a registry string or file name cannot inject headings, links, images or code blocks into the report. Control characters are stripped from console output.
+- `bcdedit` may only open a store that is a copy inside the case folder. More read-only forms tightened (`reg query`, `wevtutil qe`, `reagentc`, robocopy paths); arguments with control characters, quotes or look-alike switch characters are refused; checksum manifests in UTF-16 are read.
+- A scan now stops immediately when the case output is on the target volume, including through a junction.
+- Server: requests are authenticated from their headers before the body is read; connection cap and request deadline; stale agents expire; bundles are checked for size before being unpacked.
+
+Verified
+- Real TLS handshakes against a temporary CA, including a CA created under Windows PowerShell 5.1 and used under PowerShell 7 and the reverse.
+- Not verified: two machines on a LAN, anything in WinRE, the browser page in a browser.
+
 ## 0.4.1 - 2026-11-19
 
 Security (after an independent review; details in the ADR on hardening)
@@ -21,7 +39,7 @@ Changed
 Verified
 - 339 unit tests, twice on Python 3.15 and once on the bundled 3.14, not elevated. They include every input from the review that used to be accepted.
 - Missing tools are simulated by replacing the tool resolver; a scan with no external tools at all still completes with a reason for every gap.
-- Not verified: the TLS path (no certificate), anything in WinRE, the browser page in a browser.
+- Not verified at that point: the TLS path, anything in WinRE, the browser page in a browser.
 
 ## 0.4.0 - 2026-11-19
 

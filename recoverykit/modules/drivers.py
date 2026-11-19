@@ -14,6 +14,8 @@ from ..core.runner import RepairStep, Refused
 from . import repair
 
 MAX_INF_BYTES = 2 * 1024 * 1024
+MAX_INF_FILES = 2000
+MAX_STR = 300
 RECENT_DAYS = 30
 BOOT_CRITICAL = {"scsiadapter", "hdc", "diskdrive", "volume", "system"}
 OEM_RE = re.compile(r"oem\d+\.inf", re.IGNORECASE)
@@ -79,11 +81,11 @@ def _parse_inf(text):
     for name in sorted(secs, key=lambda n: (n != "strings", n)):
         if name == "strings" or name.startswith("strings."):
             for k, v in secs[name]:
-                strings.setdefault(k, _unquote(v))
+                strings.setdefault(k, _unquote(v)[:MAX_STR])
 
     def resolve(v):
-        v = _unquote(v)
-        return re.sub(r"%([^%]+)%", lambda m: strings.get(m.group(1).lower(), m.group(0)), v)
+        v = _unquote(v)[:4 * MAX_STR]
+        return re.sub(r"%([^%]+)%", lambda m: strings.get(m.group(1).lower(), m.group(0)), v)[:MAX_STR]
 
     ver = {}
     for k, v in secs.get("version", []):
@@ -95,27 +97,50 @@ def _parse_inf(text):
         m = re.fullmatch(r"\s*(\d{1,2})/(\d{1,2})/(\d{4})\s*", d)
         if m:
             date = "%s-%02d-%02d" % (m.group(3), int(m.group(1)), int(m.group(2)))
-        version = version.strip() or None
+        version = version.strip()[:MAX_STR] or None
     return {"provider": ver.get("provider") or None, "class": ver.get("class") or None,
             "class_guid": ver.get("classguid") or None, "driver_date": date, "driver_version": version,
             "catalog": ver.get("catalogfile") or None}
 
 
 def _iso(ts):
-    return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(ts))
+    try:
+        return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(ts))
+    except (OSError, OverflowError, ValueError):
+        return None
 
 
 def _inf_dir(windir):
     return os.path.join(windir, "INF")
 
 
+def _plain_infs(inf_dir, pattern=None):
+    """Names of regular, non-link files in inf_dir (at most MAX_INF_FILES). Raises OSError if unreadable."""
+    names = []
+    with os.scandir(inf_dir) as it:
+        for d in it:
+            if pattern is not None and not pattern.fullmatch(d.name):
+                continue
+            if not d.name.lower().endswith(".inf"):
+                continue
+            try:
+                if d.is_symlink() or getattr(d, "is_junction", lambda: False)() or not d.is_file(follow_symlinks=False):
+                    continue
+                if getattr(d.stat(follow_symlinks=False), "st_file_attributes", 0) & 0x400:
+                    continue
+            except OSError:
+                continue
+            names.append(d.name)
+            if len(names) >= MAX_INF_FILES:
+                break
+    return names
+
+
 def inventory(windir):
     """Third-party drivers of the install at windir, newest installed_ts first. Raises OSError if INF is unreadable."""
     inf_dir = _inf_dir(windir)
     out = []
-    for name in os.listdir(inf_dir):
-        if not OEM_RE.fullmatch(name):
-            continue
+    for name in _plain_infs(inf_dir, OEM_RE):
         path = os.path.join(inf_dir, name)
         e = {"inf": name, "provider": None, "class": None, "driver_date": None, "driver_version": None,
              "installed": None, "installed_ts": 0.0, "size": None, "boot_critical": False}
@@ -130,8 +155,8 @@ def inventory(windir):
             info = _parse_inf(_read_text(path))
             e.update(info)
             e["boot_critical"] = (info["class"] or "").lower() in BOOT_CRITICAL
-        except (OSError, ValueError) as ex:
-            e["error"] = "%s: %s" % (type(ex).__name__, getattr(ex, "strerror", None) or ex)
+        except (OSError, ValueError, OverflowError, MemoryError, RecursionError) as ex:
+            e["error"] = ("%s: %s" % (type(ex).__name__, getattr(ex, "strerror", None) or ex))[:MAX_STR]
         out.append(e)
     out.sort(key=lambda d: d["installed_ts"], reverse=True)
     return out
@@ -140,13 +165,12 @@ def inventory(windir):
 def _newest_inf_mtime(windir):
     newest = None
     inf_dir = _inf_dir(windir)
-    for name in os.listdir(inf_dir):
-        if name.lower().endswith(".inf"):
-            try:
-                ts = os.stat(os.path.join(inf_dir, name)).st_mtime
-            except OSError:
-                continue
-            newest = ts if newest is None else max(newest, ts)
+    for name in _plain_infs(inf_dir):
+        try:
+            ts = os.stat(os.path.join(inf_dir, name)).st_mtime
+        except OSError:
+            continue
+        newest = ts if newest is None else max(newest, ts)
     return newest
 
 

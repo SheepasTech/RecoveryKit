@@ -275,13 +275,12 @@ class ServerAndAgent(Base):
 
         def post(path, meta, body=b"", tok=token):
             m = net._pack(meta)
-            return net._request(self.url + path, "POST", body, {"X-RK-Meta": m, "X-RK-Sig": net._sig(tok, path, m, body),
-                                                                "Content-Length": str(len(body))})
+            return net._request(self.url + path, "POST", body, net._signed_headers(tok, path, m, body))
         hello = {"agent_id": "aaaa1111", "n": 1, "nonce": "n1", "name": "x", "code_hash": "h"}
         self.assertEqual(post("/agent/v1/hello", hello)[0], 200)
         self.assertEqual(post("/agent/v1/hello", hello)[0], 409)                      # replay
         self.assertEqual(post("/agent/v1/poll", {"agent_id": "aaaa1111", "n": 2, "nonce": "n2"}, tok="bad")[0], 401)
-        self.assertEqual(post("/agent/v1/poll", {"agent_id": "zzzz", "n": 1, "nonce": "n"})[0], 404)
+        self.assertEqual(post("/agent/v1/poll", {"agent_id": "bbbb2222", "n": 1, "nonce": "n"})[0], 404)
         status, headers, data = post("/agent/v1/poll", {"agent_id": "aaaa1111", "n": 2, "nonce": "n2", "wait": 0})
         self.assertEqual(status, 200)
         self.assertEqual(net._unpack(headers["X-RK-Meta"])["nonce"], "n2")            # answer bound to our nonce

@@ -64,7 +64,8 @@ Remote session (the agent dials out; no port is opened on the target):
 |---|---|
 | `--connect <url>` | Control server URL, for example `http://192.168.1.10:8765` |
 | `--token <T>` | Agent token of the server (`agent_token` in the server's `config\token-server.json`). Needed with `--connect` |
-| `--pin <sha256>` | Expected SHA-256 fingerprint of the server's TLS certificate |
+| `--ca <file>` | CA certificate that signed the server (default `config\ca-cert.pem` on the stick). Used for `https://` URLs |
+| `--pin <sha256>` | Expected SHA-256 fingerprint of the server's TLS certificate, for a server whose CA is not on the stick. Replaces the CA check |
 | `--session-minutes <n>` | Session length (default 60) |
 | `--allow-remote-repairs` | Let the remote operator run confirmed repair steps in this session. Default: read-only |
 
@@ -72,7 +73,9 @@ Control server (on the main machine):
 
 | Switch | Effect |
 |---|---|
-| `--server` | Run the control server |
+| `--server` | Run the control server. HTTPS by default: the certificate is issued from this PC's CA (see "TLS" below); it refuses to start if that fails, unless `--no-tls` is given |
+| `--no-tls` | Run the server over plain HTTP (authenticated but not encrypted: trusted LAN only) |
+| `--ca-dir <dir>` | Folder of the certificate authority (default `%LOCALAPPDATA%\ITwork\CA`) |
 | `--bind <ip>` | Interface to bind (default 127.0.0.1; give the LAN address to be reachable) |
 | `--store <dir>` | Where received bundles are stored (default `cases\_server`) |
 | `--intake <dir>` | Also copy bundles to `<dir>\ITW <ticket>\` (vault intake) |
@@ -220,6 +223,19 @@ Nothing here has been run in WinRE. Treat the first real boot as a test and writ
 
 - No server, nobody at the keyboard: `run.cmd --scan --auto --bundle`.
 - A program on the same machine: `run.cmd --serve` and call the agent API on 127.0.0.1 with the token it prints.
-- From the main machine: start `run.cmd --server --bind <LAN address>` there, then on the target run `run.cmd --connect http://<address>:8765 --token <agent_token>` and tell the operator the pairing code shown on the target's screen. Open `http://<address>:8765/` in a browser, or use `run.cmd --ctl`.
+- From the main machine: start `run.cmd --server --bind <LAN address>` there, then on the target run `run.cmd --connect https://<address>:8765 --token <agent_token>` and tell the operator the pairing code shown on the target's screen. Open `https://<address>:8765/` in a browser (it will warn about the certificate unless this PC's CA is installed in the browser; the page is only a front end, every call still needs the operator token), or use `run.cmd --ctl`.
 
-The target never opens a LAN port: it dials out. A remote session is read-only unless it was started with `--allow-remote-repairs`, and ends on a keypress on the target, after `--session-minutes` (default 60), or when revoked. Without TLS certificates the traffic is authenticated but not encrypted: trusted LAN only. All routes are in `docs\api.md`.
+The target never opens a LAN port: it dials out. A remote session is read-only unless it was started with `--allow-remote-repairs`, and ends on a keypress on the target, after `--session-minutes` (default 60), or when revoked. Traffic is encrypted with TLS unless the server was started with `--no-tls` (then it is authenticated but not encrypted: trusted LAN only). All routes are in `docs\api.md`.
+
+## TLS
+
+The technician's main PC (the control host) is the certificate authority (CA) for all ITwork tools (ADR 0020).
+
+- **Where it lives.** `%LOCALAPPDATA%\ITwork\CA\` on the server PC: `ca-cert.pem` (public), `ca-key.pem` (the private key), `issued.log` and a `README.txt`. It is created the first time it is needed, by `New-ItworkCertificates.ps1` (Windows PowerShell 5.1 or PowerShell 7, no administrator rights, nothing is added to the Windows certificate store). Use `--ca-dir <dir>` for another folder.
+- **The key stays on the server PC.** Never copy `ca-key.pem` to a USB stick, a share or a ticket: whoever has it can impersonate the server. `Install-ToUsb.ps1` copies only `ca-cert.pem` and refuses to finish if a key or token file is under the destination. If the CA folder is lost, a new CA is made and every stick needs `Install-ToUsb.ps1` again.
+- **Server certificate.** `run.cmd --server` issues `config\server-cert.pem` and `config\server-key.pem` (git-ignored) from the CA when they are missing, expire within 30 days, or do not cover this PC's name and addresses (computer name, `localhost`, `127.0.0.1`, the LAN addresses and `--bind`). It prints the server URL and the CA fingerprint. If PowerShell or the script is missing the server does not start; fix that or use `--no-tls`.
+- **Sticks.** Run `Install-ToUsb.ps1` on the server PC: it puts `config\ca-cert.pem` on the stick (and prints its fingerprint; use `-CaDir` for a CA elsewhere). The agent (`--connect https://...`) trusts a server only if its certificate chains to that file and the address you typed is in the certificate. A stick without the file refuses an `https://` connection; it never falls back to an unverified one. `--ca <file>` uses another CA file; `--pin <sha256>` trusts exactly one server certificate instead (for a server whose CA is not on the stick).
+- **The server's address changed** (new DHCP lease, another network): restart `run.cmd --server`. It sees the address is not in the certificate and issues a new one from the same CA; sticks need no change.
+- **Clocks in WinRE.** WinRE often starts with a wrong date. A certificate is only valid between its dates (the server certificate starts 5 minutes before it was issued), so a clock that is far off makes the connection fail with a message that shows the local date. Set it first, in the WinRE command prompt: `date 2026-11-19` and `time 14:30` (use today's date and the time in your format), then connect again.
+- **The operator client** `run.cmd --ctl` on the server PC finds the CA certificate in the CA folder by itself and uses `https://127.0.0.1:8765` when there is one (pass `--url http://...` for a `--no-tls` server, or `--ca <file>`).
+- Not built: client certificates for agents (mutual TLS). The agent token and the pairing code still authenticate the agent.

@@ -6,6 +6,7 @@ EventData/UserData strings of each record; it does not render message text.
 Never raises on a damaged chunk or record: the damaged part is counted in the stats and
 skipped. `EvtxError` is raised only when the file cannot be opened or is not an evtx file.
 """
+import heapq
 import mmap
 import struct
 from datetime import datetime, timedelta, timezone
@@ -19,6 +20,7 @@ FIRST_REC = 0x200
 MAX_DEPTH = 32
 MAX_RECORDS = 2000000
 MAX_DATA = 10
+MAX_STEPS = 100000      # per-record work budget (tokens, elements, attributes, substitutions)
 MAX_DATA_LEN = 300
 LEVEL_NAMES = {0: "LogAlways", 1: "Critical", 2: "Error", 3: "Warning", 4: "Information", 5: "Verbose"}
 
@@ -122,6 +124,12 @@ class _Chunk:
         self.buf = buf
         self.names = {}
         self.defs = {}
+        self.steps = 0
+
+    def tick(self, n=1):
+        self.steps += n
+        if self.steps > MAX_STEPS:
+            raise _BinXmlError("record exceeds the work budget (%d steps)" % MAX_STEPS)
 
     # -- names
     def _name(self, ref, pos):
@@ -152,6 +160,7 @@ class _Chunk:
         end = min(end, len(buf))
         nodes = []
         while pos < end:
+            self.tick()
             tok = buf[pos]
             base = tok & 0xbf
             if tok == 0x00:
@@ -209,6 +218,7 @@ class _Chunk:
         if tok & 0x40:
             pos += 4
             while pos < len(buf) and (buf[pos] & 0xbf) == 0x06:
+                self.tick()
                 aref = struct.unpack_from("<I", buf, pos + 1)[0]
                 aname, pos = self._name(aref, pos + 5)
                 vt = buf[pos]
@@ -265,6 +275,7 @@ class _Chunk:
         if depth > MAX_DEPTH:
             raise _BinXmlError("BinXml nesting too deep")
         for n in nodes:
+            self.tick()
             k = n[0]
             if k == "t":
                 out.append(n[1])
@@ -281,6 +292,7 @@ class _Chunk:
                     continue
                 vt, off, size = subs[n[1]]
                 if vt == 0x21:
+                    self.tick(max(1, size // 8))
                     self.resolve(self.parse_stream(off, off + size, depth + 1), None, depth + 1, out)
                 elif vt != 0 and size:
                     out.append(_value_text(vt, bytes(self.buf[off:off + size])))
@@ -334,6 +346,30 @@ def _event_from(tree, record_id, ft):
     return ev
 
 
+class _Keep:
+    """Keeps only the best `limit` events (largest record ids when newest_first) while reading."""
+
+    def __init__(self, limit, newest_first):
+        self.limit, self.sign, self.heap, self.seq, self.matched = limit, (1 if newest_first else -1), [], 0, 0
+
+    def append(self, ev):
+        self.matched += 1
+        if self.limit is None:
+            self.heap.append((0, 0, ev))
+            return
+        if self.limit <= 0:
+            return
+        self.seq += 1
+        item = (self.sign * ev["record_id"], self.seq, ev)
+        if len(self.heap) < self.limit:
+            heapq.heappush(self.heap, item)
+        elif item[:2] > self.heap[0][:2]:
+            heapq.heapreplace(self.heap, item)
+
+    def events(self):
+        return [x[2] for x in self.heap]
+
+
 def read_events(path, levels=(1, 2, 3), limit=200, newest_first=True):
     """Return (events, stats). Level filtering happens before the limit."""
     path = str(path)
@@ -358,7 +394,7 @@ def read_events(path, levels=(1, 2, 3), limit=200, newest_first=True):
             stats["dirty"] = bool(struct.unpack_from("<I", m, 0x78)[0] & 1)
             hdr_chunks = struct.unpack_from("<H", m, 0x2A)[0]
             levels = set(levels)
-            found = []
+            found = _Keep(limit, newest_first)
             pos, idx = HEADER_SIZE, 0
             while pos < len(m) and stats["records_seen"] < MAX_RECORDS:
                 buf = m[pos:pos + CHUNK_SIZE]
@@ -381,9 +417,10 @@ def read_events(path, levels=(1, 2, 3), limit=200, newest_first=True):
                     stats["chunks_bad"] += 1
         finally:
             m.close()
-    found.sort(key=lambda e: e["record_id"], reverse=newest_first)
-    stats["records_matched"] = len(found)
-    return (found[:limit] if limit is not None else found), stats
+    events = found.events()
+    events.sort(key=lambda e: e["record_id"], reverse=newest_first)
+    stats["records_matched"] = found.matched
+    return events, stats
 
 
 def _read_chunk(buf, idx, levels, found, stats, err):
@@ -412,6 +449,7 @@ def _read_chunk(buf, idx, levels, found, stats, err):
             continue
         stats["records_seen"] += 1
         try:
+            chunk.steps = 0
             nodes = chunk.parse_stream(off + 24, off + size - 4, 0)
             tree = []
             chunk.resolve(nodes, None, 0, tree)

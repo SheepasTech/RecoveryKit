@@ -184,7 +184,7 @@ function badItemRows(sec) {
 }
 /* Which agent ids to add and remove, given the ids currently shown and the new list. */
 function planRows(shownIds, list) {
-  var want = {}, have = {};
+  var want = Object.create(null), have = Object.create(null);
   list.forEach(function (a) { want[a.id] = true; });
   shownIds.forEach(function (id) { have[id] = true; });
   return {
@@ -265,7 +265,7 @@ async function loadVersion() {
   var s = await call("GET", srv("/status"));
   $("ver").textContent = "version: " + (s.version || "unknown");
 }
-var agentRows = {};   /* agent id -> {tr, cells, act, a, pair, rev, ob} */
+var agentRows = Object.create(null);   /* agent id -> {tr, cells, act, a, pair, rev, ob} */
 function makeAgentRow(a) {
   var row = { a: a, pair: null, rev: null };
   row.tr = el("tr");
@@ -347,7 +347,7 @@ async function loadAgents() {
 function refreshAll() { guard(loadVersion()); guard(loadAgents()); guard(loadCases()); }
 
 /* Relayed jobs run one at a time per agent: while a scan runs, buttons that would queue behind it are disabled. */
-var scans = {}, tick = null;
+var scans = Object.create(null), tick = null;
 var QUEUED = ["b-scan", "b-report", "b-sugg", "b-steps", "b-audit", "b-files", "b-log", "b-fetch"];
 var PANEL_BTNS = ["b-report", "b-sugg", "b-steps", "b-audit", "b-files", "b-log", "b-fetch"];
 function applyBusy() {
@@ -564,7 +564,7 @@ async function loadCases() {
     box.appendChild(table(["Started", "Device ID", "Environment", "Target", "Disk", "Booted after repair", "Sections by status", "Bundle", "Size (bytes)"],
       (c.runs || []).map(function (r) {
         if (r.error) { return [r.started, "", "", "", "", "", r.error, r.bundle, r.size]; }
-        var counts = {};
+        var counts = Object.create(null);
         Object.keys(r.sections || {}).forEach(function (k) { var s = r.sections[k] || "unknown"; counts[s] = (counts[s] || 0) + 1; });
         var summary = Object.keys(counts).map(function (k) { return k + ": " + counts[k]; }).join(", ");
         var boot = r.booted_after_repair === true ? "yes" : (r.booted_after_repair === false ? "no" : "not confirmed");
