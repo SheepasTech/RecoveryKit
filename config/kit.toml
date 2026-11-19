@@ -1,0 +1,40 @@
+# RecoveryKit settings. No secrets in this file.
+
+[limits]
+free_space_warn_gb = 10          # warn when the target volume has less free space than this
+free_space_warn_percent = 10     # or less than this share of its size
+max_log_mb = 200                 # a single log larger than this is recorded as metadata only
+max_dump_mb = 8                  # minidumps up to this size are copied; MEMORY.DMP is metadata only
+max_minidumps = 10
+event_max = 200                  # events per log AFTER filtering by level
+chkdsk_timeout_s = 3600
+
+[logs]
+# Paths relative to the target's Windows directory.
+target = [
+  "System32/LogFiles/Srt/SrtTrail.txt",
+  "System32/LogFiles/Srt/SrtTrail.log",
+  "Logs/CBS/CBS.log",
+  "Logs/DISM/dism.log",
+  "Panther/setupact.log",
+  "Panther/setuperr.log",
+  "inf/setupapi.dev.log",
+  "ntbtlog.txt",
+  "bootstat.dat",
+  "WindowsUpdate.log",
+]
+# Paths relative to the target volume root.
+target_root = [
+  "$WINDOWS.~BT/Sources/Panther/setupact.log",
+  "$WINDOWS.~BT/Sources/Panther/setuperr.log",
+]
+# Event log files under System32/winevt/Logs (file name without .evtx).
+event_logs = [
+  "System",
+  "Application",
+  "Microsoft-Windows-Kernel-Boot%4Operational",
+  "Microsoft-Windows-Kernel-PnP%4Configuration",
+  "Microsoft-Windows-Diagnostics-Performance%4Operational",
+]
+# Host (the environment running the kit), relative to its Windows directory.
+host = ["Logs/CBS/CBS.log", "Logs/DISM/dism.log"]
