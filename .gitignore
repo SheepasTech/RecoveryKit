@@ -30,3 +30,6 @@ desktop.ini
 *.code-workspace
 __pycache__/
 *.pyc
+
+# Local MCP client config (machine-specific paths)
+.mcp.json
