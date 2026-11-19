@@ -126,7 +126,7 @@ class Engine:
                 ui.say("Scan stopped: %s. Choose another output location with --out." % abort)
                 self.scanned = False        # no report: report.md and case.json would land on the target volume
                 return self.sections()
-            ui.say("Target:%s" % (discovery.describe(ctx.target) if ctx.target else "none"))
+            ui.say("Target: %s" % (discovery.describe(ctx.target) if ctx.target else "none"))
             self.module("device", "collect")
             ui.header("Collecting logs (read-only)")
             self.module("logs", "collect")

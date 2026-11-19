@@ -42,6 +42,9 @@ def kind():
 def detect():
     cv = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion"
     tools = {t: shutil.which(t) for t in TOOLS}
+    product, build = _reg(cv, "ProductName"), _reg(cv, "CurrentBuild")
+    if product and str(build or "").isdigit() and int(build) >= 22000:
+        product = product.replace("Windows 10", "Windows 11")   # the registry still says 10 on Windows 11
     return {
         "kind": kind(),
         "admin": winapi.is_admin(),
@@ -49,8 +52,8 @@ def detect():
         "system_drive": os.environ.get("SystemDrive", ""),
         "windir": os.environ.get("SystemRoot", ""),
         "arch": platform.machine(),
-        "os": {"product": _reg(cv, "ProductName"), "display_version": _reg(cv, "DisplayVersion"),
-               "build": _reg(cv, "CurrentBuild"), "ubr": _reg(cv, "UBR"), "edition": _reg(cv, "EditionID")},
+        "os": {"product": product, "display_version": _reg(cv, "DisplayVersion"),
+               "build": build, "ubr": _reg(cv, "UBR"), "edition": _reg(cv, "EditionID")},
         "python": {"version": platform.python_version(), "executable": sys.executable,
                    "bits": 64 if sys.maxsize > 2**32 else 32},
         "powershell": tools.get("powershell") or tools.get("pwsh"),
