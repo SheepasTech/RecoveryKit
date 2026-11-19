@@ -793,6 +793,57 @@ class HiveLookups(TmpCase):
             names_values = services.child_values()
             self.assertEqual(names_values, ([("a/b", {"Start": 2})], False))
 
+    def children_hive(self, count, vks_fn):
+        raw = RawHive()
+        vks = vks_fn(raw)
+        vl = raw.cell(b"".join(struct.pack("<I", o) for o in vks))
+        leaf = raw.nk("a", nval=len(vks), vallist=vl)
+        lst = raw.cell(b"lf" + struct.pack("<H", count) + struct.pack("<II", leaf, 0) * count)
+        services = raw.nk("Services", nsub=count, sublist=lst)
+        cs_list = raw.cell(b"lf" + struct.pack("<H", 1) + struct.pack("<II", services, 0))
+        cs = raw.nk("ControlSet001", nsub=1, sublist=cs_list)
+        root_list = raw.cell(b"lf" + struct.pack("<H", 1) + struct.pack("<II", cs, 0))
+        root = raw.nk("ROOT", nsub=1, sublist=root_list)
+        win = os.path.join(self.tmp, "Windows")
+        raw.write(os.path.join(win, "System32", "config", "SYSTEM"), root)
+        return win
+
+    def children_peak(self, win):
+        import tracemalloc
+        rv = RegView(win, online=False)
+        self.addCleanup(rv.close)
+        t0 = time.time()
+        tracemalloc.start()
+        try:
+            kids = rv.children("SYSTEM", r"ControlSet001\Services")
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        return kids, peak, time.time() - t0
+
+    def test_children_share_one_byte_budget(self):
+        def vks(raw):
+            cell = raw.cell(bytes(1 << 20))
+            return [raw.vk("v%03d" % i, 1 << 20, cell) for i in range(300)]
+        kids, peak, took = self.children_peak(self.children_hive(60, vks))
+        print("RegView.children, 60 x 300 values on one 1 MiB cell: peak %.1f MiB, %.2f s" % (peak / 2 ** 20, took))
+        self.assertLess(peak, 100 * 2 ** 20)
+        self.assertLess(took, 3.0)
+        self.assertEqual(len(kids), 60)
+        full = sum(1 for _, v in kids for x in v.values() if len(x) == 1 << 20)
+        self.assertLessEqual(full, 64)
+
+    def test_multi_sz_is_capped_by_decoded_size(self):
+        def vks(raw):
+            cell = raw.cell(b"a\x00b\x00\x00\x00" * ((1 << 20) // 6))
+            return [raw.vk("m%04d" % i, 1 << 20, cell, vtype=7) for i in range(300)]
+        kids, peak, took = self.children_peak(self.children_hive(1, vks))
+        print("RegView.children, MULTI_SZ 1 MiB cell x 300: peak %.1f MiB, %.2f s" % (peak / 2 ** 20, took))
+        self.assertLess(peak, 20 * 2 ** 20)
+        for _, v in kids:
+            for x in v.values():
+                self.assertLessEqual(len(x), 4096)
+
     def test_values_stops_at_16_mib_and_keeps_memory_low(self):
         import tracemalloc
         raw = RawHive()

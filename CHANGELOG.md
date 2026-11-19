@@ -2,6 +2,25 @@
 
 Newest first. "Verified" says how a change was checked; anything not listed there was not checked.
 
+## 0.5.2 - 2026-11-19
+
+Fixed (from a short verification of the 0.5.1 fixes)
+- The remote path now also survives a name on the target that is not valid Unicode: API answers, the bundle and relayed jobs no longer fail on it, and a job that cannot produce its result is answered with an error while the session goes on.
+- One byte budget for a whole enumeration of registry keys (a crafted 1 MB hive could still use hundreds of MB); multi-string values are bounded by their decoded size.
+- The control server and the loopback API refuse unknown paths and unauthenticated requests before reading a body.
+- Only 20 invalid signatures in a row revoke an agent; a valid message resets the count.
+- Device-namespace spellings of network and system paths are recognised by the command wrapper.
+- The check that keeps the case output off the target stops the scan when the check itself fails.
+- The certificate script puts the CA key back to owner-only access at every run. The installer's secret check reads files up to 4 MB.
+
+Known and not fixed
+- The installer's secret check is a guard against mistakes: it does not look into `python`, into large or nested archives, or for tokens in forms other than JSON.
+- On `--no-tls`, someone on the LAN who knows an agent's id can end its session with invalid messages; they cannot take it over.
+- A scan can still be slowed by a very large damaged event log: the built-in reader stops after 60 seconds per file.
+
+Verified
+- 544 unit tests on Python 3.15, not elevated.
+
 ## 0.5.1 - 2026-11-19
 
 Security and robustness (third independent review)

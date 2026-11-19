@@ -116,14 +116,12 @@ def is_network_path(p):
     two backslashes once "/" is read as "\" (so `//host/share` and `\/host\share` count, as Windows reads them),
     and `\\?\UNC\...`. The local prefixes `\\?\X:\`, `\\?\Volume{` and `\\.\` are not network paths."""
     s = str(p).strip().strip("\"'").strip().replace("/", "\\")
+    low = s.lower()
+    if low.startswith("\\??\\"):
+        return True
     if not s.startswith("\\\\"):
         return False
-    low = s.lower()
-    if low.startswith(("\\\\?\\unc\\", "\\\\.\\unc\\")):
-        return True
-    if low.startswith("\\\\.\\"):
-        return False
-    if low.startswith("\\\\?\\"):
+    if low.startswith(("\\\\?\\", "\\\\.\\")):
         rest = low[4:]
         return not (re.match(r"[a-z]:(\\|$)", rest) or rest.startswith("volume{"))
     return True
@@ -154,6 +152,12 @@ def _same_or_inside(a, b):
 
 def _protected_destination(raw, dst):
     """Reason when `dst` is the system drive root or inside the running system's protected trees, else None."""
+    raw = str(raw).strip().strip("\"'").strip().replace("/", "\\")
+    if re.match(r"\\\\[?.]\\[A-Za-z]:(\\|$)", raw):
+        raw = raw[4:]
+        dst = _norm(raw)
+    elif raw.startswith(("\\\\?\\", "\\\\.\\", "\\??\\")):
+        return "robocopy destination is in the device namespace"
     prot = []
     for var in ("SystemRoot", "windir", "ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "ProgramData"):
         v = os.environ.get(var)

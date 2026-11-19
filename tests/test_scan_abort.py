@@ -57,6 +57,18 @@ class ScanAbort(unittest.TestCase):
         lines = engine.ctx.ui.lines
         self.assertTrue(any("Scan stopped" in ln and "on the target volume" in ln for ln in lines), lines)
 
+    def test_check_that_raises_fails_closed(self):
+        from unittest import mock
+        td, target = self.target()
+        with mock.patch("recoverykit.modules.discovery._resolve", side_effect=OSError("boom")):
+            engine, secs = self.scan_with_out(target, os.path.join(td.name, "cases"))
+        self.assertEqual(secs["output_location"]["status"], "error")
+        reason = engine.ctx.options.get("abort_scan")
+        self.assertIn("could not verify that the case output is off the target volume: boom", reason)
+        for name in ("logs_target", "device", "registry"):
+            self.assertNotIn(name, secs)
+        self.assertFalse(engine.scanned)
+
     def test_nothing_is_run_after_the_check_fails(self):
         td, target = self.target()
         engine = Engine(ROOT, os.path.join(target, "cases"), QuietUI(), dry_run=True,

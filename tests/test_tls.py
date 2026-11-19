@@ -764,9 +764,9 @@ class InstallerSecretCheck(unittest.TestCase):
             os.makedirs(os.path.dirname(os.path.join(d, name)), exist_ok=True)
             with open(os.path.join(d, name), "w") as f:
                 f.write(text)
-        # outside the check: customer data, device records, the interpreter, and anything of 64 KB or more
+        # outside the check: customer data, device records, the interpreter, and anything of 4 MB or more
         for name, text in (("cases/c1/notes.txt", KEY_BLOCK), ("devices/D1/device.json", TOKENS), ("python/x.txt", KEY_BLOCK),
-                           ("docs/big.txt", KEY_BLOCK + "x" * 70000)):
+                           ("docs/big.txt", KEY_BLOCK + "x" * 4300000)):
             os.makedirs(os.path.dirname(os.path.join(d, name)), exist_ok=True)
             with open(os.path.join(d, name), "w") as f:
                 f.write(text)

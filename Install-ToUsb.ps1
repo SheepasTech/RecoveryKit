@@ -11,8 +11,8 @@
        there is none. Only the certificate: a ca-cert.pem that contains a PRIVATE KEY block is refused. From the
        project's config\ folder only kit.toml and assistant.toml are copied (an allowlist: a token file, a key or a
        backup that happens to lie there stays behind).
-       The final check looks at CONTENT: any file under the destination smaller than 64 KB, outside cases\,
-       devices\ and python\, that contains "PRIVATE KEY-----", "operator_token" or "agent_token" (also inside a
+       The final check looks at CONTENT: any file under the destination smaller than 4 MB, outside cases\,
+       devices\ and python\, that contains private key material or a token value in JSON form (also inside a
        small .zip) fails the install and is named; files called ca-key.pem, server-key.pem or token-server.json
        fail it wherever they are.
     4. Write kit-version.txt and run <dest>\run.cmd --version.
@@ -154,7 +154,7 @@ function Find-SecretFiles {
         $parts = $rel -split '\\'
         $skip = ($parts.Count -gt 1) -and ($parts[0] -in 'cases', 'devices', 'python')
         if ($f.Name -in 'ca-key.pem', 'server-key.pem', 'token-server.json') { $found.Add("$($f.FullName) (secret file name)"); continue }
-        if ($skip -or $f.Length -ge 65536) { continue }
+        if ($skip -or $f.Length -ge 4194304) { continue }   # the kit's own files are far smaller than 4 MB
         try {
             $bytes = [IO.File]::ReadAllBytes($f.FullName)
             if (& $hasSecret $bytes) { $found.Add("$($f.FullName) (contains a private key or a token)"); continue }

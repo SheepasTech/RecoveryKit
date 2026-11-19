@@ -224,7 +224,8 @@ def _payload(result):
     """(bytes, content_type) for a route() payload."""
     if isinstance(result, tuple):
         return result[0], result[1]
-    return json.dumps(result, ensure_ascii=False, default=str).encode("utf-8"), "application/json; charset=utf-8"
+    return json.dumps(result, ensure_ascii=False, default=str).encode("utf-8", "backslashreplace"), \
+        "application/json; charset=utf-8"
 
 
 class _DeadlineReader:
@@ -558,10 +559,25 @@ def local_app(engine, token):
     return app
 
 
+def _local_vet(token):
+    def vet(method, path, headers, n):
+        auth = headers.get("Authorization") or ""
+        if not hmac.compare_digest(auth.encode("utf-8", "replace"), ("Bearer " + token).encode("utf-8", "replace")):
+            return 401, "missing or wrong bearer token"
+        if path != API and not path.startswith(API + "/"):
+            return 404, "not found"
+        if method == "GET" and n > 0:
+            return 400, "a GET request must not have a body"
+        if n > MAX_BODY:
+            return 413, "body too large"
+        return None
+    return vet
+
+
 def serve_local(engine, port=8766, ready=None, stop=None):
     """Headless agent: the agent API on 127.0.0.1 only. Blocks until stop is set or Ctrl+C."""
     token = secrets.token_urlsafe(24)
-    srv = _http_server(local_app(engine, token), "127.0.0.1", port)
+    srv = _http_server(local_app(engine, token), "127.0.0.1", port, vet=_local_vet(token))
     port = srv.server_address[1]
     token_file = os.path.join(engine.ctx.case.out_root, "_api-token.txt")
     try:
@@ -664,6 +680,8 @@ class Server:
     def vet(self, method, path, headers, n):
         """Called before the body is read: None to go on, or (status, message). Operator routes need the bearer token
         here; agent routes need a valid X-RK-Head."""
+        if path not in ("/", "/index.html") and not path.startswith((API + "/", "/agent/v1/")):
+            return 404, "not found"
         if path.startswith(API + "/"):
             if not self._operator_ok(headers):
                 return 401, "missing or wrong bearer token"
@@ -711,6 +729,8 @@ class Server:
         now = time.time()
         with self.lock:
             a = self.agents.get(aid)
+            if a is not None:
+                a["bad_macs"] = 0                  # only CONSECUTIVE bad signatures revoke
             if a is not None and a.get("skey") is not None:
                 if key != a["skey"]:           # paired, and the agent has not switched yet: answer the poll, change nothing
                     if path != "/agent/v1/poll":
@@ -876,12 +896,15 @@ class Server:
             if a is None:
                 return js(404, {"error": "unknown agent"})
             if verb == "pair" and method == "POST":
-                code = _normalize_code(b.get("code", ""))
+                raw_code, stored = b.get("code", ""), a.get("code_hash", "")
+                plain = (isinstance(raw_code, str) and raw_code.isascii()
+                         and isinstance(stored, str) and stored.isascii())
+                code = _normalize_code(raw_code) if plain else ""
                 want = _code_hash(code, aid)
                 with self.lock:                  # check and increment as one step
                     if a["pair_failures"] >= 5:
                         return js(429, {"error": "too many wrong codes; restart the session on the target"})
-                    if not hmac.compare_digest(want, a.get("code_hash", "")):
+                    if not plain or not hmac.compare_digest(want, stored):
                         a["pair_failures"] += 1
                         LOG.info("SERVER| wrong pairing code for agent %s by %s", aid, operator)
                         return js(403, {"error": "wrong pairing code"})
@@ -1215,10 +1238,15 @@ def connect(engine, url, token, pin=None, minutes=60, name="", stop=None, on_cod
         elif time.monotonic() - received >= ttl:
             status, data, ctype = 410, b'{"error": "the job had expired; it was not executed"}', "application/json"
         else:
-            ui.say("Remote request by %s: %s %s" % (operator, job.get("method"), job.get("path")))
-            status, result = route(engine, job["method"], job["path"], query or {}, jbody or {},
-                                   remote=True, operator=operator)
-            data, ctype = _payload(result)
+            try:
+                ui.say("Remote request by %s: %s %s" % (operator, job.get("method"), job.get("path")))
+                status, result = route(engine, job["method"], job["path"], query or {}, jbody or {},
+                                       remote=True, operator=operator)
+                data, ctype = _payload(result)
+            except Exception as e:  # noqa: BLE001 - one bad job must not end the session
+                LOG.exception("AGENT | job %s failed", job.get("id"))
+                msg = ("%s: %s" % (type(e).__name__, e)).encode("ascii", "backslashreplace").decode("ascii")
+                status, data, ctype = 500, json.dumps({"error": msg[:300]}).encode(), "application/json"
         meta = {"job_id": job.get("id"), "status": status, "ctype": ctype}
 
         def deliver_error(code_, text):
@@ -1336,7 +1364,8 @@ def ctl(kit_root, argv, out=print, pin=None, ca_file=None, ca_dir=None):
     ctype = headers.get("Content-Type", "")
     if ctype.startswith("application/json"):
         try:
-            out(_clean_console(json.dumps(json.loads(data.decode("utf-8")), indent=2, ensure_ascii=False)))
+            txt = json.dumps(json.loads(data.decode("utf-8")), indent=2, ensure_ascii=False)
+            out(_clean_console(txt.encode("utf-8", "backslashreplace").decode("utf-8")))
         except ValueError:
             out(_clean_console(data.decode("utf-8", "replace")))
     elif ctype.startswith("text/"):

@@ -411,6 +411,21 @@ class SecondReview(Tmp):
                      ["wevtutil", "qe", "System", "/q:*", "/c:5", "/rd:true", "/f:text", "/lf:false"]):
             self.assertEqual(classify(argv)[0], READ, argv)
 
+    def test_device_namespace_paths_are_network_or_forbidden(self):
+        for argv in (["wevtutil", "qe", "\\\\.\\GLOBALROOT\\Device\\Mup\\evil\\share\\x.evtx", "/lf:true"],
+                     ["dism", "/Get-WimInfo", "/WimFile:\\\\.\\GLOBALROOT\\Device\\Mup\\evil\\share\\x.wim"],
+                     ["wevtutil", "qe", "\\??\\UNC\\evil\\share\\x.evtx", "/lf:true"],
+                     ["wevtutil", "qe", "\\\\?\\GLOBALROOT\\Device\\Mup\\evil\\x.evtx", "/lf:true"]):
+            self.assertNotEqual(classify(argv)[0], READ, argv)
+        with tempfile.TemporaryDirectory() as d:
+            d = os.path.realpath(d)
+            self.assertEqual(classify(["wevtutil", "qe", "\\\\?\\" + os.path.join(d, "y.evtx"), "/lf:true"],
+                                      case_dir=d)[0], READ)
+        sysroot = os.environ["SystemRoot"]
+        for dest in ("\\\\?\\" + os.path.join(sysroot, "System32"),
+                     "\\\\.\\GLOBALROOT\\Device\\HarddiskVolume3\\Windows\\System32"):
+            self.assertEqual(classify(["robocopy", "D:\\payload", dest, "/E"])[0], FORBIDDEN, dest)
+
     def test_a12_utf16_manifest(self):
         h = hashlib.sha256(b"x").hexdigest()
         text = "# c\r\n%s  a.py\r\nnothex  b.py\r\n%s *c.py\r\n" % (h, h.upper())

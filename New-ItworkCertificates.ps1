@@ -318,6 +318,8 @@ try {
         $caKind = Get-KindOfCert $caCert
         $caKp = Import-KeyPair $caKind (ConvertFrom-Pem ([IO.File]::ReadAllText($caKeyPath)) 'PRIVATE KEY')
         if ($caCert.NotAfter -lt (Get-Date)) { throw "The CA certificate expired on $($caCert.NotAfter). Create a new CA (move the CA folder away) and run Install-ToUsb.ps1 for every stick." }
+        # Every run puts the CA key back to owner-only access: someone may have widened it since it was created.
+        [void](Protect-KeyFile $caKeyPath)
         Write-Host "CA reused: $caCertPath"
     } else {
       try {

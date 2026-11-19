@@ -150,12 +150,13 @@ class RegView:
             try:
                 key = h.open(path) if h else None
                 if key:
+                    shared = [regf.CHILDREN_BUDGET]
                     for k in key.children():
                         if len(out) >= max_children:
                             out.truncated = True
                             break
                         try:
-                            vals = k.values()
+                            vals = k.values(shared)
                         except regf.HiveError:
                             vals = {}
                         out.append((k.name, vals))

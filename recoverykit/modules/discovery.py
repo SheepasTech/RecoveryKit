@@ -98,7 +98,10 @@ def collect(ctx):
         ctx.runner.target_online = target.online
         why = None
         with case.section("output_location", "Where the case is written") as sec:
-            why = check_output_location(ctx)
+            try:
+                why = check_output_location(ctx)
+            except Exception as e:      # fail closed: an unverifiable location is treated as a hit
+                why = "could not verify that the case output is off the target volume: %s" % e
             if why:
                 sec.set("error", why)
                 ctx.options["abort_scan"] = why

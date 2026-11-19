@@ -185,6 +185,12 @@ class MdsafeUnits(unittest.TestCase):
         self.assertEqual(mdsafe.text("a|b"), "a\\|b")
         self.assertEqual(mdsafe.text("", empty="-"), "-")
 
+    def test_dataview_field_and_bare_www(self):
+        self.assertEqual(mdsafe.text("key:: value"), "key:\\: value")
+        self.assertNotIn("::", mdsafe.text("a::b:::c"))
+        self.assertEqual(mdsafe.text("see www.evil.com"), "see www\\.evil.com")
+        self.assertEqual(mdsafe.text("awww.x"), "awww.x")
+
     def test_code(self):
         self.assertEqual(mdsafe.code("a`b|c\nd"), "`a'b|c d`")
         self.assertEqual(mdsafe.code("a`b|c\nd", table=True), "`a'b\\|c d`")

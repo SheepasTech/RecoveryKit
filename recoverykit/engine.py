@@ -199,7 +199,7 @@ class Engine:
                 raise ApiError(400, "unknown question %s" % k)
         with self._op("answers"):
             cur = dict(self.ctx.case.data.get("operator_answers") or {})
-            cur.update({k: str(v) for k, v in answers.items()})
+            cur.update({k: str(v).encode("utf-8", "replace").decode("utf-8") for k, v in answers.items()})
             with self.ctx.case.section("operator", "Not yet established (asked from the operator)") as sec:
                 sec.data = cur
                 self.ctx.case.data["operator_answers"] = cur
@@ -212,7 +212,7 @@ class Engine:
             raise ApiError(400, "booted must be true, false or null")
         with self._op("boot-result"):
             self.ctx.case.data["booted_after_repair"] = booted
-            self.ctx.case.data["boot_note"] = str(note)
+            self.ctx.case.data["boot_note"] = str(note).encode("utf-8", "replace").decode("utf-8")
             self.module("assistant", "collect")
             self.report()
             return {"booted_after_repair": booted}
@@ -228,10 +228,16 @@ class Engine:
                     dirs[:] = [d for d in dirs if d != "scratch"]
                     for name in files:
                         full = os.path.join(root, name)
+                        arc = os.path.relpath(full, os.path.dirname(case.dir))
                         try:
-                            z.write(full, os.path.relpath(full, os.path.dirname(case.dir)))
-                        except OSError as e:
-                            LOG.error("BUNDLE| could not add %s: %s", full, e)
+                            try:
+                                arc.encode("utf-8")
+                            except UnicodeError:
+                                arc = arc.encode("utf-8", "backslashreplace").decode("ascii", "replace")
+                                LOG.info("BUNDLE| member stored under the sanitised name %s", arc)
+                            z.write(full, arc)
+                        except (OSError, ValueError, UnicodeError) as e:
+                            LOG.error("BUNDLE| could not add %r: %s", full, e)
             LOG.info("BUNDLE| %s (%d bytes)", dest, os.path.getsize(dest))
             self.last_bundle = dest
             return dest

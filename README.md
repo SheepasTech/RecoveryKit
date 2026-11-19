@@ -107,7 +107,7 @@ Logging is always on. Details are in [docs/logging.txt](docs/logging.txt). On a 
 | Path | Purpose |
 |---|---|
 | `run.cmd` | Launcher. Pure `cmd`, relative to its own location |
-| `Install-ToUsb.ps1` | Fetches the embeddable Python and copies the kit to a stick. Never touches `cases\` there. Copies only `kit.toml` and `assistant.toml` from `config\` (allowlist), adds the CA certificate (`config\ca-cert.pem`, public part only; creates the CA on this PC if there is none), and ends with a check of file contents: it fails and names the files if it finds a private key or a token value. `-CaDir` names another CA folder; `-CheckOnly <folder>` runs only the check |
+| `Install-ToUsb.ps1` | Fetches the embeddable Python and copies the kit to a stick. Never touches `cases\` there. Copies only `kit.toml` and `assistant.toml` from `config\` (allowlist), adds the CA certificate (`config\ca-cert.pem`, public part only; creates the CA on this PC if there is none), and ends with a check of file contents: it fails and names the files if it finds private key material or a token value in a file under 4 MB outside `cases`, `devices` and `python` (a check against mistakes, not a guarantee). `-CaDir` names another CA folder; `-CheckOnly <folder>` runs only the check |
 | `New-ItworkCertificates.ps1` | Creates this PC's certificate authority (once, in `%LOCALAPPDATA%\ITwork\CA`) and issues the control server's TLS certificate with it. Run by `--server` and by `Install-ToUsb.ps1` when needed |
 | `python/` | Embeddable 64-bit Python 3.14, git-ignored |
 | `lib/` | Empty: no third-party dependencies |

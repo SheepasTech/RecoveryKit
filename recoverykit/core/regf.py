@@ -99,6 +99,9 @@ MAX_VALUES = 4096
 MAX_VALUE_BYTES = 1 << 20
 MAX_BIG_DATA = 16 << 20
 VALUES_BUDGET = 16 << 20   # data bytes one Key.values() call may read
+CHILDREN_BUDGET = 64 << 20  # data bytes one children()/child_values() call may read in total
+MAX_MULTI_SZ_BYTES = 256 << 10
+MAX_MULTI_SZ_ITEMS = 4096
 DB_SEGMENT = 16344
 _PARSE_ERRORS = (struct.error, IndexError, ValueError, OverflowError, MemoryError, RecursionError)
 
@@ -197,12 +200,13 @@ class Key:
     def child_values(self, max_children=5000):
         """Return (list of (name, values dict), truncated) for the subkeys, one walk, at most max_children."""
         out, truncated = [], False
+        shared = [CHILDREN_BUDGET]
         for k in self.children():
             if len(out) >= max_children:
                 truncated = True
                 break
             try:
-                vals = k.values()
+                vals = k.values(shared)
             except HiveError:
                 vals = {}
             out.append((k.name, vals))
@@ -265,7 +269,7 @@ class Key:
             used += len(data)
             yield name, vtype, data
 
-    def _data(self, vk_start, dsize, doff):
+    def _data(self, vk_start, dsize, doff, cap=None):
         m = self.hive._m
         try:
             if dsize & 0x80000000:
@@ -276,7 +280,7 @@ class Key:
             if dsize > MAX_BIG_DATA:
                 self.hive.notes.append("value data of %d bytes not read (limit %d)" % (dsize, MAX_BIG_DATA))
                 return b""
-            want = min(dsize, MAX_VALUE_BYTES)
+            want = min(dsize, MAX_VALUE_BYTES, cap or MAX_VALUE_BYTES)
             s, n = self.hive._cell(doff)
             if dsize > DB_SEGMENT and n >= 8 and m[s:s + 2] == b"db":
                 count, = _u("<H", m, s + 2, s + n)
@@ -296,8 +300,47 @@ class Key:
         except _PARSE_ERRORS as e:
             raise HiveError("bad value data: %s" % e)
 
-    def values(self):
-        return {name: decode(vtype, data) for name, vtype, data in self._values_raw(VALUES_BUDGET)}
+    def values(self, shared=None):
+        """{name: decoded value}. `shared` is a one-item list [bytes left] spanning several calls
+        (children()); the per-call budget still applies. Budgets count DECODED size."""
+        out, used, noted = {}, 0, False
+        for name, vtype, s, dsize, doff in self._vk_records():
+            left = VALUES_BUDGET - used
+            if shared is not None:
+                left = min(left, shared[0])
+            if left <= 0:
+                if not noted:
+                    noted = True
+                    if used >= VALUES_BUDGET or shared is None:
+                        self.hive.notes.append("values of key %s: more than %d bytes of data, the rest not read"
+                                               % (self.name, VALUES_BUDGET))
+                    else:
+                        note = ("values of the subkeys: more than %d bytes of data in one pass, the rest not read"
+                                % CHILDREN_BUDGET)
+                        if note not in self.hive.notes:
+                            self.hive.notes.append(note)
+                out[name] = b""
+                continue
+            try:
+                data = self._data(s, dsize, doff, MAX_MULTI_SZ_BYTES if vtype == REG_MULTI_SZ else None)
+            except HiveError:
+                data = b""
+            val = decode(vtype, data)
+            if isinstance(val, list):
+                if len(val) > MAX_MULTI_SZ_ITEMS:
+                    val = val[:MAX_MULTI_SZ_ITEMS]
+                cost = sum(len(x) * 2 + 64 for x in val)
+            elif isinstance(val, str):
+                cost = len(val) * 2
+            elif isinstance(val, bytes):
+                cost = len(val)
+            else:
+                cost = 8
+            used += cost
+            if shared is not None:
+                shared[0] -= cost
+            out[name] = val
+        return out
 
     def value(self, name, default=None):
         low = name.lower()

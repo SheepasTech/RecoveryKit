@@ -12,6 +12,10 @@ _SPECIAL = re.compile(r"([\\`*_\[\]<>|#!~$=^{}%])")
 _LEAD = re.compile(r"^(?:[-+](?=\s|$)|>|\d+[.)](?=\s|$))")
 
 
+_DVFIELD = re.compile(r":(?=:)")                    # Dataview inline field "key:: value"
+_WWW = re.compile(r"(?<![A-Za-z0-9])(www)\.", re.I)  # bare www. is auto-linked
+
+
 def _clean_chars(s):
     """Drop format characters (bidi overrides, zero-width, BOM: category Cf) and private-use ones (Co);
     a lone surrogate (Cs) becomes U+FFFD."""
@@ -42,6 +46,8 @@ def text(value, limit=300, empty=""):
     if not s:
         return empty
     s = _SPECIAL.sub(lambda m: "\\" + m.group(1), s).replace("://", ":\\//")
+    s = _DVFIELD.sub(":\\\\", s)
+    s = _WWW.sub(lambda m: m.group(1) + "\\.", s)
     if _LEAD.match(s) or s.startswith("---"):      # list item, quote, numbered item, horizontal rule
         s = "\\" + s
     return s

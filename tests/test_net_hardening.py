@@ -1079,14 +1079,25 @@ class BadMacRevocation(ServerCase):
         entry = self.server.agents[a.aid]
         self.assertFalse(entry["revoked"])
         self.assertTrue(entry["paired"])
-        self.assertEqual(a.call(POLL, {"wait": 0})[0], 200)       # the real agent is still served at 19
-        self.assertEqual(self.bad(a.aid, 200, "head"), 401)       # a counted bad MAC again: 20
+        self.assertEqual(self.bad(a.aid, 200, "head"), 401)       # the 20th in a row
         listing = {x["id"]: x for x in self.api("GET", "/agents")[1]}[a.aid]
         self.assertTrue(listing["revoked"])
         self.assertEqual(listing["revoked_reason"], "too many invalid signatures")
         self.assertFalse(listing["paired"])
         self.assertEqual(a.call(POLL, {"wait": 0}), (200, {"revoked": True}))     # the agent is told, signed
         self.assertEqual(self.api("GET", "/agents/%s/api/status" % a.aid)[0], 409)
+
+    def test_only_consecutive_bad_macs_revoke(self):
+        a = FakeAgent(self)
+        a.pair()
+        for i in range(19):
+            self.bad(a.aid, 100 + i, "head")
+        self.assertEqual(a.call(POLL, {"wait": 0})[0], 200)       # a good message resets the count
+        for i in range(19):
+            self.bad(a.aid, 300 + i, "head")
+        self.assertFalse(self.server.agents[a.aid]["revoked"])
+        self.bad(a.aid, 400, "head")                              # the 20th in a row
+        self.assertTrue(self.server.agents[a.aid]["revoked"])
 
     def test_ids_that_do_not_exist_are_not_counted_and_create_nothing(self):
         for i in range(60):
@@ -1116,6 +1127,91 @@ class BadMacRevocation(ServerCase):
         th.join(20)
         self.assertEqual(result.get("reason"), "revoked by the server")
         self.assertTrue(any("start a new session" in l for l in eng.ctx.ui.lines), eng.ctx.ui.lines)
+
+
+def headers_only_status(port, request_head):
+    """Send only a request head (no body byte), return the status code of the answer."""
+    s = socket.create_connection(("127.0.0.1", port), timeout=5)
+    try:
+        s.sendall(request_head)
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+        return int(buf.split(b" ", 2)[1]) if buf else None
+    finally:
+        s.close()
+
+
+class SurrogateNames(Base):
+    def test_lone_surrogates_in_case_data_and_file_names_never_break_the_api(self):
+        self.assertEqual(route(self.engine, "POST", API + "/scan", None, {}, operator="t")[0], 200)
+        self.engine.ctx.case.data["operator_answers"]["symptom_text"] = "bob\udfff"
+        logs = os.path.join(self.engine.ctx.case.dir, "logs")
+        os.makedirs(logs, exist_ok=True)
+        made = True
+        try:
+            with open(os.path.join(logs, "crash\ud800.dmp"), "w") as f:
+                f.write("x")
+        except (OSError, ValueError, UnicodeError) as e:
+            made = False
+            print("surrogate file name not creatable here: %s" % e)
+        for method, path in (("GET", "/case"), ("GET", "/files"), ("GET", "/sections"), ("POST", "/bundle")):
+            status, result = route(self.engine, method, API + path, None, {}, operator="t")
+            self.assertEqual(status, 200, path)
+            data, _ = net._payload(result)
+            self.assertIsInstance(data, bytes)
+        with zipfile.ZipFile(self.engine.last_bundle) as z:
+            names = z.namelist()
+        self.assertTrue(names)
+        if made:
+            self.assertTrue(any("crash" in n and n.endswith(".dmp") for n in names), names)
+        status, _ = route(self.engine, "POST", API + "/answers", None, {"symptom_text": "al\ud800"}, operator="t")
+        self.assertEqual(status, 200)
+        self.assertEqual(self.engine.ctx.case.data["operator_answers"]["symptom_text"].encode("utf-8")[:2], b"al")
+
+
+class PrefilterPaths(ServerCase):
+    def test_unknown_paths_get_404_without_reading_the_body(self):
+        for path in ("/nope", "/AGENT/v1/poll", "/Api/v1/status"):
+            head = ("POST %s HTTP/1.1\r\nHost: x\r\nContent-Length: 67108864\r\n\r\n" % path).encode()
+            self.assertEqual(headers_only_status(self.port, head), 404, path)
+
+    def test_non_ascii_pairing_code_is_a_wrong_code_not_a_500(self):
+        a = FakeAgent(self)
+        a.hello()
+        self.assertEqual(self.api("POST", "/agents/%s/pair" % a.aid, {"code": "ééé"})[0], 403)
+        self.assertEqual(self.server.agents[a.aid]["pair_failures"], 1)
+        self.server.agents[a.aid]["code_hash"] = "é"
+        self.assertEqual(self.api("POST", "/agents/%s/pair" % a.aid, {"code": "K7QF4M2XWP"})[0], 403)
+
+
+class LoopbackPreBody(Base):
+    def test_unauthenticated_64_mib_post_gets_401_with_only_headers_sent(self):
+        got, stop = {}, threading.Event()
+        t = threading.Thread(target=net.serve_local, args=(self.engine, 0),
+                             kwargs={"ready": lambda port, token: got.update(port=port, token=token), "stop": stop})
+        t.start()
+        try:
+            for _ in range(100):
+                if got:
+                    break
+                time.sleep(0.05)
+            port = got["port"]
+            head = "POST /api/v1/scan HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n\r\n" % net.MAX_BODY
+            self.assertEqual(headers_only_status(port, head.encode()), 401)
+            auth = "Authorization: Bearer %s\r\n" % got["token"]
+            head = "POST /nope HTTP/1.1\r\nHost: x\r\n%sContent-Length: %d\r\n\r\n" % (auth, net.MAX_BODY)
+            self.assertEqual(headers_only_status(port, head.encode()), 404)
+            head = "GET /api/v1/status HTTP/1.1\r\nHost: x\r\n%sContent-Length: 5\r\n\r\n" % auth
+            self.assertEqual(headers_only_status(port, head.encode()), 400)
+            head = "POST /api/v1/scan HTTP/1.1\r\nHost: x\r\n%sContent-Length: %d\r\n\r\n" % (auth, net.MAX_BODY + 1)
+            self.assertEqual(headers_only_status(port, head.encode()), 413)
+        finally:
+            stop.set()
+            t.join(10)
 
 
 class DirectionLabels(ServerCase):
