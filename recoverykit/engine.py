@@ -97,7 +97,7 @@ class Engine:
             self.module("device", "collect")
             ui.header("Collecting logs (read-only)")
             self.module("logs", "collect")
-            for extra in ("regdiff", "drivers", "triage"):   # read-only inventories (phases 6-8)
+            for extra in ("loganalysis", "regdiff", "drivers", "triage"):   # read-only findings and inventories
                 self.module(extra, "collect")
             plugins.run_all(ctx)
             self.read_only_check()

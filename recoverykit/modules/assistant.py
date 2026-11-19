@@ -135,6 +135,24 @@ def facts(case_data):
     if seen:
         f["startup.flagged_count"] = flagged
 
+    lf = _g(sections, "log_findings", "data")
+    if isinstance(lf, dict) and lf:
+        srt = lf.get("srttrail") or {}
+        if srt.get("root_cause"):
+            f["logs.srt_root_cause"] = str(srt["root_cause"])
+        if srt:
+            f["logs.srt_boot_ok"] = bool(srt.get("boot_status_ok"))
+        f["logs.bcd_problem_count"] = sum(len(b.get("problems") or []) for b in (lf.get("bcd") or {}).values())
+
+        def ev_count(*cats):
+            return sum(x.get("count", 0) for e in (lf.get("events") or {}).values()
+                       for x in e.get("notable_summary") or [] if x.get("category") in cats)
+        f["logs.storage_event_count"] = ev_count("storage")
+        f["logs.hardware_event_count"] = ev_count("hardware")
+        f["logs.unexpected_shutdowns"] = ev_count("shutdown")
+        f["logs.cbs_corrupt_count"] = int((lf.get("cbs") or {}).get("corrupt_count") or 0)
+        f["logs.headline_count"] = len(lf.get("headline") or [])
+
     if cd.get("booted_after_repair") is not None:
         f["booted"] = cd["booted_after_repair"]
     return f

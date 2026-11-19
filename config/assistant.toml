@@ -368,3 +368,59 @@ title = "Review the flagged startup entries"
 text = "Some autoruns, services or scheduled tasks start from user-writable folders, use script hosts, or point to missing files. They are things to look at, not a verdict. See inventory/autoruns.json, services.json and tasks.json."
 when = ["booted != true", "startup.flagged_count > 0"]
 evidence = ["startup.flagged_count"]
+
+# ---- rules added with the log analysis (recoverykit/modules/loganalysis.py)
+
+[[rule]]
+id = "C-srt-root-cause"
+branch = "C"
+order = 318
+title = "Startup Repair recorded a root cause"
+text = "Startup Repair recorded a root cause: {logs.srt_root_cause}. Act on that before generic steps."
+when = ["exists logs.srt_root_cause", "booted != true"]
+evidence = ["logs.srt_root_cause", "logs.srt_boot_ok"]
+
+[[rule]]
+id = "D-bcd-problems"
+branch = "D"
+order = 405
+title = "The captured BCD listing has problems"
+text = "The captured BCD listing has {logs.bcd_problem_count} problem(s); see the report. The BCD export is in exports/. A rebuild is offered under Repair helpers only after you confirm which EFI partition the firmware uses."
+when = ["logs.bcd_problem_count > 0", "booted != true"]
+evidence = ["logs.bcd_problem_count"]
+
+[[rule]]
+id = "E-storage-events"
+branch = "E"
+order = 505
+title = "Disk or file-system errors in the event log"
+text = "The event log holds {logs.storage_event_count} disk/file-system error event(s) (disk, Ntfs, volmgr, volsnap). Back up first and check disk health before any repair that writes."
+when = ["logs.storage_event_count > 0", "booted != true"]
+evidence = ["logs.storage_event_count"]
+
+[[rule]]
+id = "E-hardware-events"
+branch = "E"
+order = 507
+title = "WHEA hardware errors in the event log"
+text = "The event log holds {logs.hardware_event_count} WHEA hardware error event(s). Test the hardware before repairing Windows."
+when = ["logs.hardware_event_count > 0", "booted != true"]
+evidence = ["logs.hardware_event_count"]
+
+[[rule]]
+id = "B-cbs-corrupt"
+branch = "B"
+order = 205
+title = "CBS lists corrupt component files"
+text = "CBS.log names {logs.cbs_corrupt_count} corrupt component file(s). RestoreHealth with a matching source is the relevant repair."
+when = ["logs.cbs_corrupt_count > 0", "booted != true"]
+evidence = ["logs.cbs_corrupt_count"]
+
+[[rule]]
+id = "E-unexpected-shutdowns"
+branch = "E"
+order = 560
+title = "Unexpected shutdowns are recorded"
+text = "The event log records {logs.unexpected_shutdowns} unexpected shutdown event(s) (Kernel-Power 41 or EventLog 6008). Ask about power loss and forced shutdowns."
+when = ["logs.unexpected_shutdowns > 0", "booted != true"]
+evidence = ["logs.unexpected_shutdowns"]

@@ -5,6 +5,7 @@ Read-only. Files are only copied into the case folder; external programs run thr
 import os
 import shutil
 
+from ..core import evtx
 from ..core.log import LOG
 
 MB = 2 ** 20
@@ -124,14 +125,28 @@ def _event_logs(ctx, sec):
             exp_txt = "export not done: no readable copy and the target is offline"
         else:
             res = ctx.runner.run(argv, "errors/warnings of event log %s" % name, timeout=180)
+            why = None
             if res.error:
                 exp_txt = "export not done: %s (the raw .evtx is still in the case)" % res.error
+                why = res.error
             elif res.rc != 0:
                 exp_txt = "wevtutil exit code %s%s" % (res.rc, (": " + res.out.strip()[:150]) if res.out else "")
+                why = "exit code %s" % res.rc
             else:
                 case.write_text("logs/target-events-%s.txt" % fname, res.out)
                 events = _count_events(res.out)
                 exp_ok, exp_txt = True, "export ok"
+            if why is not None and e["status"] == "ok":
+                try:
+                    evs, st = evtx.read_events(case.path(*dest.split("/")), levels=(1, 2, 3), limit=evmax)
+                    case.write_text("logs/target-events-%s.txt" % fname, evtx.format_text(evs))
+                    events, exp_ok = len(evs), True
+                    exp_txt = "export by built-in reader: %d of %d records matched (wevtutil not available: %s)" % (
+                        st["records_matched"], st["records_seen"], why)
+                    if st["errors"] or st["chunks_bad"]:
+                        exp_txt += "; %d damaged chunk(s), %d error(s)" % (st["chunks_bad"], len(st["errors"]))
+                except (evtx.EvtxError, OSError) as ex:
+                    exp_txt += "; built-in reader failed: %s" % ex
         if e["status"] == "ok" or exp_ok:
             status = "ok"
         else:

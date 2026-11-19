@@ -160,6 +160,8 @@ def render(data, audit):
             add("- %s / %s: %s%s" % (title, i.get("name"), i.get("status"), " - " + i["reason"] if i.get("reason") else " - (no reason recorded)"))
         add("")
     look = []
+    for h in ((sections.get("log_findings") or {}).get("data") or {}).get("headline") or []:
+        look.append("Logs: %s" % h)
     for n in ((sections.get("registry") or {}).get("data") or {}).get("notable") or []:
         look.append("Registry: %s" % n)
     drv = (sections.get("drivers") or {}).get("data") or {}
