@@ -55,6 +55,7 @@ def parse_args(argv):
     g.add_argument("--ctl", nargs=argparse.REMAINDER, metavar="...", help="operator client: agents | pair ID CODE | "
                    "get ID PATH | post ID PATH [JSON] | fetch-bundle ID | bundles | revoke ID")
     g = p.add_argument_group("other")
+    g.add_argument("--decode-id", metavar="DEVICE_ID", help="show which components a device ID stands for and exit")
     g.add_argument("--wipe-case", metavar="CASE_ID", help="delete a case folder from the output location and exit")
     g.add_argument("--version", action="store_true", help="print the version and exit")
     return p.parse_args(argv)
@@ -131,6 +132,7 @@ def menu(engine):
             ("repair", "Repair and backup helpers (every step is shown and confirmed)"),
             ("drivers", "Third-party drivers: newest first, propose removing one"),
             ("answers", "Answer / update the boot-failure questions"),
+            ("device", "Device settings saved on this stick (notes, ticket)"),
             ("bundle", "Bundle this run into a zip"),
             ("quit", "Quit"),
         ], "quit" if engine.scanned else "scan")
@@ -147,12 +149,14 @@ def menu(engine):
             engine.module("repair", "run_menu")
             engine.module("assistant", "collect")
             engine.report()
-        elif choice in ("assistant", "answers", "bundle", "drivers") and not engine.scanned:
+        elif choice in ("assistant", "answers", "bundle", "drivers", "device") and not engine.scanned:
             ui.say("Run the scan first: nothing is known about the target yet.")
         elif choice == "assistant":
             engine.suggestions(refresh=True)
             engine.module("assistant", "show")
             engine.report()
+        elif choice == "device":
+            engine.module("device", "edit_settings")
         elif choice == "drivers":
             engine.module("drivers", "run_menu")
             engine.report()
@@ -175,6 +179,13 @@ def main(argv=None):
     args = parse_args(argv)
     if args.version:
         print("RecoveryKit %s (Python %s, %s)" % (__version__, sys.version.split()[0], sys.executable))
+        return 0
+    if args.decode_id:
+        from .modules import device
+        ddir = os.path.join(os.path.dirname(os.path.abspath(args.out)) if args.out else KIT_ROOT, "devices")
+        for seg in device.decode(ddir, args.decode_id):
+            print("%-4s %s  %s" % (seg["segment"], seg["code"], seg["detail"] or seg["value"] or
+                                   ("not readable" if seg["code"] == device.UNKNOWN else "code not in components.json")))
         return 0
     if args.ctl is not None:
         from . import net

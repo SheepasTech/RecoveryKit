@@ -94,6 +94,7 @@ class Engine:
             ui.header("Discovery")
             discovery.collect(ctx)
             ui.say("Target: %s" % (discovery.describe(ctx.target) if ctx.target else "none"))
+            self.module("device", "collect")
             ui.header("Collecting logs (read-only)")
             self.module("logs", "collect")
             for extra in ("regdiff", "drivers", "triage"):   # read-only inventories (phases 6-8)
@@ -135,7 +136,7 @@ class Engine:
         from .modules import discovery
         return {"version": __version__, "environment": ctx.env["kind"], "admin": ctx.env["admin"],
                 "firmware": ctx.env["firmware"], "busy": self.busy, "scanned": self.scanned,
-                "case_id": ctx.case.data["case_id"], "case_dir": ctx.case.dir, "dry_run": ctx.runner.dry_run,
+                "case_id": ctx.case.data["case_id"], "device_id": (ctx.case.data.get("device") or {}).get("id"), "case_dir": ctx.case.dir, "dry_run": ctx.runner.dry_run,
                 "allow_repairs": self.allow_repairs, "allow_remote_repairs": self.allow_remote_repairs,
                 "target": discovery.describe(t) if t else None, "target_online": bool(t and t.online),
                 "booted_after_repair": ctx.case.data.get("booted_after_repair")}

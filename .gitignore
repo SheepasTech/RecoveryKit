@@ -33,3 +33,6 @@ __pycache__/
 
 # Local MCP client config (machine-specific paths)
 .mcp.json
+
+# Device registry on the stick: hardware, usernames, per-device settings. Never commit.
+devices/

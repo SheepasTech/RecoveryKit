@@ -85,8 +85,8 @@ function Invoke-Robo {
     if ($Files.Count -eq 0) { $a += '/E' }
     if ($Purge) { $a += '/PURGE' }
     $a += @('/FFT', '/R:2', '/W:2', '/NJH', '/NJS', '/NP', '/NDL',
-            '/XD', '.git', '.project', 'debug', 'tests', 'cases', '__pycache__',
-            '/XF', '*.pyc', '*.code-workspace', '.gitkeep')
+            '/XD', '.git', '.project', 'debug', 'tests', 'cases', 'devices', '__pycache__',
+            '/XF', '*.pyc', '*.code-workspace', '.gitkeep', 'token*', 'server-key.pem', '.mcp.json')
     if ($WhatIfPreference) { $a += '/L' }
     & robocopy.exe @a | ForEach-Object { if ($_ -and $_.Trim()) { Write-Host "  $_" } }
     if ($LASTEXITCODE -ge 8) { throw "robocopy failed (exit $LASTEXITCODE): $Src -> $Dst" }
@@ -121,7 +121,7 @@ foreach ($d in 'recoverykit', 'python') {
         Invoke-Robo (Join-Path $Project $d) (Join-Path $destFull $d) -Purge
     }
 }
-foreach ($d in 'lib', 'config', 'tools', 'docs') {
+foreach ($d in 'lib', 'config', 'tools', 'docs', 'plugins') {
     if (Test-Path -LiteralPath (Join-Path $Project $d)) {
         Invoke-Robo (Join-Path $Project $d) (Join-Path $destFull $d)
     }

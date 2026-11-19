@@ -248,6 +248,13 @@ class ServerAndAgent(Base):
         self.assertTrue(b["intake"] and os.path.isfile(b["intake"]))
         self.assertEqual(os.path.basename(os.path.dirname(b["intake"])), "ITW 4242")
         self.assertEqual(len(self.api("GET", "/bundles")[1]), 1)
+        cases = self.api("GET", "/cases")[1]                                           # fleet view from the store
+        self.assertEqual(len(cases), 1)
+        self.assertEqual(cases[0]["ticket"], "4242")
+        run = cases[0]["runs"][0]
+        self.assertIn("10.0.26100.8875", run["target"])
+        self.assertEqual(run["sections"]["target"], "ok")
+        self.assertIsNone(run["booted_after_repair"])
         # the relayed calls are in the agent's own log with the operator's name
         with open(self.engine.ctx.case.path("debug.log"), encoding="utf-8") as f:
             log = f.read()

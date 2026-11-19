@@ -49,6 +49,9 @@ def render(data, audit):
 
     add("# RecoveryKit case %s" % (data.get("case_id") or "(no target)"))
     add("")
+    dev = data.get("device") or {}
+    if dev.get("id"):
+        add("- Device ID: `%s`" % dev["id"])
     add("- Ticket: %s" % (data.get("ticket") or "not given"))
     add("- Run started: %s" % data.get("started"))
     add("- Kit version: %s, case schema %s" % (data.get("kit_version"), data.get("schema")))
@@ -85,6 +88,15 @@ def render(data, audit):
             add("")
             add("Not readable: %s." % e)
     add("")
+
+    if dev.get("segments"):
+        add("Device `%s` (one code per component; the hardware is that of the PC the kit ran on):" % dev["id"])
+        add("")
+        add("| Code | Component | Value |")
+        add("|---|---|---|")
+        for sg in dev["segments"]:
+            add("| %s | %s | %s |" % (sg.get("code"), sg.get("label"), str(sg.get("detail") or "not readable").replace("|", "/")))
+        add("")
 
     add("## 2. Not yet established")
     add("")

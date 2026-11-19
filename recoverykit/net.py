@@ -309,6 +309,8 @@ class Server:
                 out += [{"path": os.path.relpath(os.path.join(root, f), self.store).replace("\\", "/"),
                          "size": os.path.getsize(os.path.join(root, f))} for f in files if f.endswith(".zip")]
             return js(200, out)
+        if p == "/cases" and method == "GET":
+            return js(200, self.cases())
         parts = p.strip("/").split("/", 3)
         if len(parts) >= 3 and parts[0] == "agents":
             aid, verb = parts[1], parts[2]
@@ -371,7 +373,58 @@ class Server:
         LOG.info("SERVER| bundle from %s stored: %s", aid, out)
         return 200, out
 
+    def cases(self):
+        """Fleet view: every stored case with its runs, read from the case.json inside each stored bundle."""
+        import zipfile
+        out = []
+        for case_id in sorted(os.listdir(self.store)):
+            cdir = os.path.join(self.store, case_id)
+            if not os.path.isdir(cdir) or case_id.startswith("_"):
+                continue
+            runs = []
+            for name in sorted(os.listdir(cdir)):
+                if not name.endswith(".zip"):
+                    continue
+                run = {"bundle": "%s/%s" % (case_id, name), "size": os.path.getsize(os.path.join(cdir, name))}
+                try:
+                    with zipfile.ZipFile(os.path.join(cdir, name)) as z:
+                        member = next(n for n in z.namelist() if n.endswith("/case.json") or n == "case.json")
+                        d = json.loads(z.read(member).decode("utf-8"))
+                    info = (d.get("target") or {}).get("info") or {}
+                    disk = (d.get("target") or {}).get("disk") or {}
+                    run.update(device_id=(d.get("device") or {}).get("id"), started=d.get("started"), ticket=d.get("ticket"), kit_version=d.get("kit_version"),
+                               environment=(d.get("environment") or {}).get("kind"),
+                               target="%s %s %s" % (info.get("product") or "?", info.get("build_full") or "",
+                                                    info.get("language") or ""),
+                               disk=disk.get("model"), booted_after_repair=d.get("booted_after_repair"),
+                               sections={n: s.get("status") for n, s in (d.get("sections") or {}).items()},
+                               repairs=[r.get("id") for r in d.get("repair_log") or [] if r.get("kind") != "declined"])
+                except (OSError, ValueError, StopIteration, zipfile.BadZipFile) as e:
+                    run["error"] = "bundle not readable: %s" % e
+                runs.append(run)
+            if runs:
+                out.append({"case_id": case_id, "ticket": next((r.get("ticket") for r in runs if r.get("ticket")), None),
+                            "runs": runs})
+        return out
+
+    def _static(self, path):
+        """The browser front end (one self-contained page). No token needed to load it; every API call needs one."""
+        web = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
+        name = {"/": "index.html", "/index.html": "index.html"}.get(path)
+        if name is None:
+            return 404, {}, b'{"error": "unknown path"}'
+        try:
+            with open(os.path.join(web, name), "rb") as f:
+                data = f.read()
+        except OSError:
+            return 404, {}, b'{"error": "the web page is not installed"}'
+        return 200, {"Content-Type": "text/html; charset=utf-8", "X-Content-Type-Options": "nosniff",
+                     "Content-Security-Policy": "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
+                                                "connect-src 'self'; img-src data:; frame-ancestors 'none'"}, data
+
     def app(self, method, path, q, headers, body):
+        if method == "GET" and path in ("/", "/index.html"):
+            return self._static(path)
         if path.startswith("/agent/v1/") and method == "POST":
             return self._agent_call(path, headers, body)
         if path.startswith(API + "/"):

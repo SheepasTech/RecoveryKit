@@ -73,3 +73,45 @@ Details of the logs: `docs\logging.txt`.
 ## Customer data
 
 The USB can hold customer data (names, PINs, disk contents) in `cases\`. Before leaving the USB with a customer, delete the cases with `run.cmd --wipe-case <case-id>` (or remove the `cases\` contents). Nothing is sent over the network.
+
+## Device ID
+
+Every scan prints a device ID made of eight 4-letter codes, one per component:
+
+```
+CPU -RAM -RSPD-MOBO-GPU -USER-DISK-UNIT
+YWUC-EHQX-DZBG-LWAM-TTAD-UFOB-XPJB-SDVR
+```
+
+Each code is a hash of that component, so the same CPU always gives the same CPU code and a RAM swap changes only the RAM codes. `RSPD` is "rated / running" memory speed: when the running speed is below the rated one, the XMP/EXPO profile is not active. `XXXX` means the component could not be read.
+
+The stick keeps a `devices` folder next to `cases`:
+
+| File | Content |
+|---|---|
+| `devices\index.md` | Table of every device seen, with its components in plain words |
+| `devices\components.json` | Every code and the component it stands for |
+| `devices\<ID>\device.json` | That device: components, full hardware details, list of runs |
+| `devices\<ID>\settings.json` | Settings for that device: `notes` (shown at every scan), `ticket` (names the case), `answers` (pre-fills the boot-failure questions) |
+
+`run.cmd --decode-id <ID>` prints the components of an ID. Edit the settings from the menu ("Device settings") or in a text editor.
+
+The hardware codes describe the PC the kit is running on. In WinRE that is the customer's PC. If the customer's disk is attached to another PC, they describe that other PC, and the scan says so.
+
+The folder holds user names and serial numbers. Treat it like `cases`.
+
+## Inventories in every scan
+
+Besides the logs, a scan writes three read-only inventories into `inventory\`:
+
+- `registry-snapshot.json` with a list of startup-relevant findings (safe-boot flag, setup in progress, control-set mismatch, pending servicing, non-default shell). From the second run of a case on, `registry-changes.txt` lists what changed.
+- `drivers.json`: third-party drivers, newest first. Drivers added in the 30 days before the install's last activity are listed in the report. The menu item "Third-party drivers" proposes removing one (a confirmed repair step).
+- `autoruns.json`, `services.json`, `tasks.json`: what starts automatically, with entries worth a look marked. These are findings, not verdicts; nothing is removed.
+
+## Headless and remote use
+
+- No server, nobody at the keyboard: `run.cmd --scan --auto --bundle`.
+- A program on the same machine: `run.cmd --serve` and call the agent API on 127.0.0.1 with the token it prints.
+- From the main machine: start `run.cmd --server --bind <LAN address>` there, then on the target run `run.cmd --connect http://<address>:8765 --token <agent_token>` and tell the operator the pairing code shown on the target's screen. Open `http://<address>:8765/` in a browser, or use `run.cmd --ctl`.
+
+The target never opens a LAN port: it dials out. A remote session is read-only unless it was started with `--allow-remote-repairs`, and ends on a keypress on the target, after 60 minutes, or when revoked. Without TLS certificates the traffic is authenticated but not encrypted: trusted LAN only. All routes are in `docs\api.md`.

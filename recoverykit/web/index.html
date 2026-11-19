@@ -1,0 +1,458 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RecoveryKit control server</title>
+<style>
+:root { --bg:#f6f7f9; --fg:#1b1f24; --card:#ffffff; --line:#c9ced6; --accent:#0b5cad; --muted:#555d68; --bad:#a4161a; --code:#eef0f3; }
+@media (prefers-color-scheme: dark) {
+  :root { --bg:#14171b; --fg:#e6e8eb; --card:#1d2227; --line:#3a424b; --accent:#6aaeff; --muted:#a3abb5; --bad:#ff8a8d; --code:#262c33; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.45 system-ui, "Segoe UI", Roboto, Arial, sans-serif; padding-bottom:3.5rem; }
+header { display:flex; flex-wrap:wrap; gap:.5rem 1rem; align-items:center; padding:.6rem 1rem; background:var(--card); border-bottom:1px solid var(--line); }
+header h1 { font-size:1.15rem; margin:0; }
+header .sp { flex:1; }
+main { max-width:1280px; margin:0 auto; padding:1rem; display:grid; gap:1rem; }
+section.panel { background:var(--card); border:1px solid var(--line); border-radius:6px; padding:.8rem 1rem; min-width:0; }
+section.panel h2 { font-size:1.05rem; margin:0 0 .6rem; }
+h3 { font-size:.95rem; margin:1rem 0 .4rem; }
+button, input, select { font:inherit; color:inherit; background:var(--card); border:1px solid var(--line); border-radius:4px; padding:.3rem .6rem; }
+button { cursor:pointer; }
+button:disabled { opacity:.55; cursor:not-allowed; }
+button:hover:not(:disabled) { border-color:var(--accent); }
+:focus-visible { outline:3px solid var(--accent); outline-offset:2px; }
+.row { display:flex; flex-wrap:wrap; gap:.5rem; align-items:center; margin:.4rem 0; }
+.tablewrap { overflow-x:auto; }
+table { border-collapse:collapse; width:100%; }
+th, td { border:1px solid var(--line); padding:.25rem .5rem; text-align:left; vertical-align:top; }
+th { background:var(--code); }
+pre, code { background:var(--code); font-family:Consolas, "Courier New", monospace; font-size:.9em; }
+pre { padding:.6rem; overflow:auto; max-height:28rem; white-space:pre-wrap; word-break:break-word; margin:.4rem 0; }
+code { padding:.1rem .3rem; word-break:break-all; }
+.muted { color:var(--muted); }
+.err { color:var(--bad); font-weight:600; }
+#login { max-width:30rem; margin:2rem auto; }
+#login label { display:block; margin:.6rem 0 .2rem; }
+#login input { width:100%; }
+#statusline { position:fixed; left:0; right:0; bottom:0; background:var(--card); border-top:1px solid var(--line); padding:.4rem 1rem; font-family:Consolas, monospace; font-size:.85rem; }
+.filelink { background:none; border:none; padding:0; color:var(--accent); text-decoration:underline; }
+li { margin:.3rem 0; }
+[hidden] { display:none !important; }
+</style>
+</head>
+<body>
+<header>
+  <h1>RecoveryKit control server</h1>
+  <span id="ver" class="muted">version: unknown</span>
+  <span class="sp"></span>
+  <span id="opname" class="muted"></span>
+  <button type="button" id="forget" hidden>Forget token</button>
+</header>
+
+<div id="login" hidden>
+  <section class="panel">
+    <h2>Operator sign-in</h2>
+    <p id="loginmsg" class="err" role="alert"></p>
+    <form id="loginform">
+      <label for="tok">Operator token</label>
+      <input id="tok" type="password" autocomplete="off" required>
+      <label for="opn">Operator name</label>
+      <input id="opn" type="text" autocomplete="off" maxlength="40" required>
+      <div class="row"><button type="submit">Continue</button></div>
+    </form>
+    <p class="muted">The token and name are kept for this browser tab only (session storage).</p>
+  </section>
+</div>
+
+<main id="app" hidden>
+  <section class="panel" aria-labelledby="h-agents">
+    <h2 id="h-agents">Agents</h2>
+    <div class="row"><button type="button" id="refresh">Refresh</button><span id="agentsmsg" class="muted"></span></div>
+    <div class="tablewrap" id="agents"></div>
+  </section>
+
+  <section class="panel" aria-labelledby="h-agent" id="agentpanel" hidden>
+    <h2 id="h-agent">Agent</h2>
+    <div id="agentstatus"></div>
+    <h3>Scan</h3>
+    <div class="row">
+      <label for="f-ticket">Ticket</label><input id="f-ticket" type="text" maxlength="40">
+      <label for="f-target">Target letter</label><input id="f-target" type="text" maxlength="2" size="3">
+      <label for="f-symptom">Symptom</label>
+      <select id="f-symptom">
+        <option value="">(not answered)</option>
+        <option value="no_boot_device">no_boot_device</option>
+        <option value="repair_loop">repair_loop</option>
+        <option value="stop_code">stop_code</option>
+        <option value="spinning">spinning</option>
+        <option value="other">other</option>
+        <option value="unknown">unknown</option>
+      </select>
+      <button type="button" id="b-scan">Run scan (read-only)</button>
+    </div>
+    <div id="scanmsg" class="muted" role="status"></div>
+    <div class="tablewrap" id="scanout"></div>
+    <h3>Actions</h3>
+    <div class="row">
+      <button type="button" id="b-report">Report</button>
+      <button type="button" id="b-sugg">Suggestions</button>
+      <button type="button" id="b-steps">Repair steps</button>
+      <button type="button" id="b-audit">Audit log</button>
+      <button type="button" id="b-files">Files</button>
+      <button type="button" id="b-fetch">Fetch bundle</button>
+    </div>
+    <div id="detail"></div>
+  </section>
+
+  <section class="panel" aria-labelledby="h-cases">
+    <h2 id="h-cases">Stored cases</h2>
+    <div class="row"><button type="button" id="b-cases">Reload cases</button></div>
+    <div id="cases"></div>
+  </section>
+</main>
+
+<div id="statusline" role="status" aria-live="polite">No requests yet.</div>
+
+<script>
+"use strict";
+var API = "/api/v1";
+var token = "", operator = "", currentAgent = null, timer = null;
+
+function $(id) { return document.getElementById(id); }
+function el(tag, text, cls) {
+  var e = document.createElement(tag);
+  if (text !== undefined && text !== null) { e.textContent = String(text); }
+  if (cls) { e.className = cls; }
+  return e;
+}
+function clear(node) { while (node.firstChild) { node.removeChild(node.firstChild); } }
+function store(key, val) { try { if (val === null) { sessionStorage.removeItem(key); } else { sessionStorage.setItem(key, val); } } catch (e) { setStatus("Session storage is not available: " + e.message, true); } }
+function load(key) { try { return sessionStorage.getItem(key) || ""; } catch (e) { return ""; } }
+function setStatus(text, bad) {
+  var s = $("statusline");
+  s.textContent = text;
+  s.className = bad ? "err" : "";
+}
+function table(headers, rows) {
+  var t = el("table"), th = el("tr");
+  headers.forEach(function (h) { th.appendChild(el("th", h)); });
+  t.appendChild(th);
+  rows.forEach(function (r) {
+    var tr = el("tr");
+    r.forEach(function (c) {
+      var td = el("td");
+      if (c instanceof Node) { td.appendChild(c); } else { td.textContent = (c === null || c === undefined) ? "" : String(c); }
+      tr.appendChild(td);
+    });
+    t.appendChild(tr);
+  });
+  var w = el("div", null, "tablewrap");
+  w.appendChild(t);
+  return w;
+}
+function yn(v) { return v === true ? "yes" : (v === false ? "no" : "unknown"); }
+
+/* Path helpers. srv: server route. srvAgent: server route for one agent. agent: relayed agent route. */
+function srv(path) { return API + path; }
+function srvAgent(id, verb) { return API + "/agents/" + encodeURIComponent(id) + "/" + verb; }
+function agent(id, path) { return API + "/agents/" + encodeURIComponent(id) + "/api/" + path; }
+
+function showLogin(msg) {
+  if (timer) { clearInterval(timer); timer = null; }
+  $("app").hidden = true; $("login").hidden = false; $("forget").hidden = true;
+  $("loginmsg").textContent = msg || "";
+  $("opname").textContent = "";
+}
+function showApp() {
+  $("login").hidden = true; $("app").hidden = false; $("forget").hidden = false;
+  $("opname").textContent = "Operator: " + operator;
+  refreshAll();
+  if (timer) { clearInterval(timer); }
+  timer = setInterval(function () { guard(loadAgents()); }, 5000);
+}
+
+/* Every call goes through here. Throws Error(message) on failure after showing it in the status line. */
+async function call(method, url, body, wantText) {
+  var headers = { "Authorization": "Bearer " + token, "X-RK-Operator": operator };
+  var opts = { method: method, headers: headers };
+  if (body !== undefined && body !== null) { headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(body); }
+  var label = method + " " + url;
+  var r;
+  try { r = await fetch(url, opts); }
+  catch (e) { setStatus(label + " -> network error: " + e.message, true); throw new Error("network error: " + e.message); }
+  var text = await r.text();
+  var data = null;
+  if (!wantText || !r.ok) { try { data = JSON.parse(text); } catch (e) { data = null; } }
+  if (!r.ok) {
+    var why = (data && data.error) ? data.error : (text.slice(0, 200) || r.statusText);
+    setStatus(label + " -> HTTP " + r.status + ": " + why, true);
+    if (r.status === 401) { token = ""; store("rk_token", null); showLogin("The server rejected the token (401). Enter the operator token again."); }
+    var err = new Error("HTTP " + r.status + ": " + why);
+    err.status = r.status;
+    throw err;
+  }
+  setStatus(label + " -> HTTP " + r.status + " ok", false);
+  return wantText ? text : data;
+}
+/* Catch rejections from fire-and-forget calls; the status line already shows the cause. */
+function guard(p) { return p.catch(function (e) { setStatus("Failed: " + e.message, true); }); }
+
+async function loadVersion() {
+  var s = await call("GET", srv("/status"));
+  $("ver").textContent = "version: " + (s.version || "unknown");
+}
+async function loadAgents() {
+  var list = await call("GET", srv("/agents"));
+  var box = $("agents");
+  clear(box);
+  if (!list.length) { box.appendChild(el("p", "No agents connected.", "muted")); return; }
+  var rows = list.map(function (a) {
+    var state = a.revoked ? "revoked" : (a.paired ? "paired" : "waiting for pairing");
+    var act = el("div", null, "row");
+    if (!a.paired && !a.revoked) {
+      var code = el("input"); code.type = "text"; code.size = 8; code.maxLength = 6; code.setAttribute("aria-label", "Pairing code for " + a.id);
+      var msg = el("span", "", "err");
+      var pb = el("button", "Pair"); pb.type = "button";
+      pb.addEventListener("click", function () {
+        guard(call("POST", srvAgent(a.id, "pair"), { code: code.value.trim() }).then(function () { return loadAgents(); },
+          function (e) { msg.textContent = e.message; throw e; }));
+      });
+      act.appendChild(code); act.appendChild(pb); act.appendChild(msg);
+    }
+    var ob = el("button", "Open"); ob.type = "button";
+    ob.addEventListener("click", function () { openAgent(a); });
+    act.appendChild(ob);
+    if (!a.revoked) {
+      var rb = el("button", "Revoke"); rb.type = "button";
+      rb.addEventListener("click", function () {
+        if (!confirm("Revoke agent " + a.id + "? This ends the session on the target.")) { return; }
+        guard(call("POST", srvAgent(a.id, "revoke"), {}).then(function () {
+          if (currentAgent === a.id) { currentAgent = null; $("agentpanel").hidden = true; }
+          return loadAgents();
+        }));
+      });
+      act.appendChild(rb);
+    }
+    return [a.id, a.name, a.version, state, yn(a.repairs_enabled_on_target), a.seconds_since_seen, act];
+  });
+  box.appendChild(table(["Id", "Name", "Version", "State", "Repairs enabled on target", "Seconds since seen", "Actions"], rows));
+}
+function refreshAll() { guard(loadVersion()); guard(loadAgents()); guard(loadCases()); }
+
+function openAgent(a) {
+  currentAgent = a.id;
+  $("agentpanel").hidden = false;
+  $("h-agent").textContent = "Agent " + a.id + (a.name ? " (" + a.name + ")" : "");
+  clear($("detail")); clear($("scanout")); $("scanmsg").textContent = "";
+  guard(loadAgentStatus());
+}
+async function loadAgentStatus() {
+  var id = currentAgent;
+  var box = $("agentstatus");
+  clear(box);
+  var s = await call("GET", agent(id, "status"));
+  if (id !== currentAgent) { return; }
+  box.appendChild(table(["Environment", "Administrator", "Target", "Case id", "Scanned", "Dry run"],
+    [[s.environment, yn(s.admin), s.target || "none selected", s.case_id, yn(s.scanned), yn(s.dry_run)]]));
+}
+function needAgent() { if (!currentAgent) { throw new Error("no agent is open"); } return currentAgent; }
+function detail(title) { var d = $("detail"); clear(d); d.appendChild(el("h3", title)); return d; }
+
+async function doScan() {
+  var id = needAgent();
+  var body = {};
+  var t = $("f-ticket").value.trim(), l = $("f-target").value.trim(), sy = $("f-symptom").value;
+  if (t) { body.ticket = t; }
+  if (l) { body.target = l; }
+  if (sy) { body.answers = { symptom: sy }; }
+  var b = $("b-scan");
+  b.disabled = true;
+  $("scanmsg").textContent = "Scanning... this can take minutes";
+  clear($("scanout"));
+  try {
+    var res = await call("POST", agent(id, "scan"), body);
+    var out = $("scanout");
+    var names = Object.keys(res);
+    out.appendChild(table(["Section", "Title", "Status", "Reason"], names.map(function (n) {
+      return [n, res[n].title, res[n].status, res[n].reason];
+    })));
+    names.forEach(function (n) {
+      var bad = (res[n].items || []).filter(function (it) { return it && it.status && it.status !== "ok"; });
+      if (!bad.length) { return; }
+      out.appendChild(el("h3", res[n].title || n));
+      out.appendChild(table(["Item", "Status", "Detail"], bad.map(function (it) {
+        return [it.title || it.name || it.id || "", it.status, it.reason || it.detail || it.text || ""];
+      })));
+    });
+    $("scanmsg").textContent = "Scan finished.";
+    await loadAgentStatus();
+  } catch (e) {
+    $("scanmsg").textContent = "Scan failed: " + e.message;
+    $("scanmsg").className = "err";
+    throw e;
+  } finally {
+    b.disabled = false;
+    if ($("scanmsg").textContent.indexOf("failed") < 0) { $("scanmsg").className = "muted"; }
+  }
+}
+async function doReport() {
+  var id = needAgent();
+  var text = await call("GET", agent(id, "report"), null, true);
+  var d = detail("Report (plain text)");
+  d.appendChild(el("pre", text));
+}
+async function doSuggestions() {
+  var id = needAgent();
+  var res = await call("GET", agent(id, "suggestions"));
+  var d = detail("Suggestions");
+  var list = res.suggestions || [];
+  if (!list.length) { d.appendChild(el("p", "No suggestions.", "muted")); return; }
+  var branch = null, ol = null, n = 0;
+  list.forEach(function (s) {
+    if (s.branch !== branch || !ol) {
+      branch = s.branch;
+      d.appendChild(el("h3", "Branch: " + branch));
+      ol = el("ol"); ol.start = n + 1;
+      d.appendChild(ol);
+    }
+    n += 1;
+    var li = el("li");
+    li.appendChild(el("strong", s.title));
+    li.appendChild(el("div", s.text));
+    var ev = s.evidence || {};
+    var parts = Object.keys(ev).map(function (k) {
+      var v = ev[k];
+      return k + " = " + (v === null || v === undefined ? "absent" : (typeof v === "object" ? JSON.stringify(v) : v));
+    });
+    if (parts.length) { li.appendChild(el("div", "Because: " + parts.join("; "), "muted")); }
+    ol.appendChild(li);
+  });
+}
+async function doSteps() {
+  var id = needAgent();
+  var res = await call("GET", agent(id, "repair/steps"));
+  var d = detail("Repair steps");
+  var steps = res.steps || [];
+  if (res.dry_run) { d.appendChild(el("p", "The session is in dry-run mode.", "muted")); }
+  if (!steps.length) { d.appendChild(el("p", "No repair steps are offered.", "muted")); }
+  var ul = el("ul");
+  steps.forEach(function (s) {
+    var li = el("li");
+    li.appendChild(el("strong", s.id + ": " + s.title));
+    var c = el("div"); c.appendChild(el("code", s.command)); li.appendChild(c);
+    li.appendChild(el("div", "Effect: " + s.effect));
+    li.appendChild(el("div", "Risk: " + s.risk));
+    ul.appendChild(li);
+  });
+  d.appendChild(ul);
+  var bl = res.blockers || [];
+  d.appendChild(el("h3", "Blockers"));
+  if (bl.length) { var bu = el("ul"); bl.forEach(function (b) { bu.appendChild(el("li", b)); }); d.appendChild(bu); }
+  else { d.appendChild(el("p", "None.", "muted")); }
+  d.appendChild(el("p", "Steps are run at the target's console, or through the API when the session was started with --allow-remote-repairs."));
+}
+async function doAudit() {
+  var id = needAgent();
+  var list = await call("GET", agent(id, "audit"));
+  var d = detail("Audit log");
+  if (!list.length) { d.appendChild(el("p", "No entries.", "muted")); return; }
+  d.appendChild(table(["Seq", "Kind", "Command", "Exit code", "Note"], list.map(function (e) {
+    return [e.seq, e.kind, e.command, e.exit_code, e.note || e.error || ""];
+  })));
+}
+var TEXTLIKE = /\.(md|txt|json|log)$/i;
+var MAXVIEW = 200 * 1024;
+async function doFiles() {
+  var id = needAgent();
+  var list = await call("GET", agent(id, "files"));
+  var d = detail("Files");
+  if (!list.length) { d.appendChild(el("p", "No files.", "muted")); return; }
+  var ul = el("ul");
+  var view = el("div");
+  list.forEach(function (f) {
+    var li = el("li");
+    if (TEXTLIKE.test(f.path)) {
+      var b = el("button", f.path, "filelink"); b.type = "button";
+      b.addEventListener("click", function () { guard(showFile(id, f.path, view)); });
+      li.appendChild(b);
+    } else { li.appendChild(el("span", f.path)); }
+    li.appendChild(el("span", " (" + f.size + " bytes)", "muted"));
+    ul.appendChild(li);
+  });
+  d.appendChild(ul);
+  d.appendChild(view);
+}
+async function showFile(id, path, view) {
+  var enc = path.split("/").map(encodeURIComponent).join("/");
+  var text = await call("GET", agent(id, "files/" + enc), null, true);
+  clear(view);
+  view.appendChild(el("h3", path));
+  if (text.length > MAXVIEW) {
+    view.appendChild(el("p", "Shown truncated to the first 200 kB of " + text.length + " characters.", "muted"));
+    text = text.slice(0, MAXVIEW);
+  }
+  view.appendChild(el("pre", text));
+}
+async function doFetch() {
+  var id = needAgent();
+  var b = $("b-fetch");
+  b.disabled = true;
+  try {
+    var r = await call("POST", srvAgent(id, "fetch-bundle"), {});
+    var d = detail("Bundle");
+    var rows = [["Stored path", r.stored], ["Size (bytes)", r.size], ["SHA-256", r.sha256],
+                ["Intake path", r.intake || "not copied"]];
+    if (r.intake_error) { rows.push(["Intake error", r.intake_error]); }
+    d.appendChild(table(["Field", "Value"], rows));
+  } finally { b.disabled = false; }
+}
+
+async function loadCases() {
+  var list = await call("GET", srv("/cases"));
+  var box = $("cases");
+  clear(box);
+  if (!list.length) { box.appendChild(el("p", "No stored cases.", "muted")); return; }
+  list.forEach(function (c) {
+    box.appendChild(el("h3", "Case " + c.case_id + " - ticket " + (c.ticket || "none")));
+    box.appendChild(table(["Started", "Environment", "Target", "Disk", "Booted after repair", "Sections by status", "Bundle", "Size (bytes)"],
+      (c.runs || []).map(function (r) {
+        if (r.error) { return [r.started, "", "", "", "", r.error, r.bundle, r.size]; }
+        var counts = {};
+        Object.keys(r.sections || {}).forEach(function (k) { var s = r.sections[k] || "unknown"; counts[s] = (counts[s] || 0) + 1; });
+        var summary = Object.keys(counts).map(function (k) { return k + ": " + counts[k]; }).join(", ");
+        var boot = r.booted_after_repair === true ? "yes" : (r.booted_after_repair === false ? "no" : "not confirmed");
+        return [r.started, r.environment, r.target, r.disk, boot, summary, r.bundle, r.size];
+      })));
+  });
+}
+
+$("loginform").addEventListener("submit", function (ev) {
+  ev.preventDefault();
+  token = $("tok").value.trim(); operator = $("opn").value.trim();
+  $("tok").value = "";
+  if (!token || !operator) { $("loginmsg").textContent = "Enter both the token and your name."; return; }
+  store("rk_token", token); store("rk_operator", operator);
+  showApp();
+});
+$("forget").addEventListener("click", function () {
+  token = ""; store("rk_token", null); store("rk_operator", null);
+  currentAgent = null; $("agentpanel").hidden = true;
+  showLogin("The token was forgotten.");
+});
+$("refresh").addEventListener("click", function () { guard(loadAgents()); });
+$("b-scan").addEventListener("click", function () { guard(doScan()); });
+$("b-report").addEventListener("click", function () { guard(doReport()); });
+$("b-sugg").addEventListener("click", function () { guard(doSuggestions()); });
+$("b-steps").addEventListener("click", function () { guard(doSteps()); });
+$("b-audit").addEventListener("click", function () { guard(doAudit()); });
+$("b-files").addEventListener("click", function () { guard(doFiles()); });
+$("b-fetch").addEventListener("click", function () { guard(doFetch()); });
+$("b-cases").addEventListener("click", function () { guard(loadCases()); });
+
+token = load("rk_token"); operator = load("rk_operator");
+if (token && operator) { showApp(); } else { showLogin(""); }
+</script>
+</body>
+</html>
