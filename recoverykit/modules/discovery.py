@@ -3,8 +3,11 @@
 Read-only. Disks and volumes come from core.winapi (no diskpart, no drive-letter
 assumptions); offline registry data comes from core.context.RegView.
 """
+import copy
 import hashlib
+import json
 import os
+import re
 import shutil
 
 from ..core import winapi
@@ -21,6 +24,14 @@ def _gb(n):
 def collect(ctx):
     """Run all discovery sections. Sets ctx.inventory and ctx.target (None if no install found)."""
     case, ui = ctx.case, ctx.ui
+    rescan = bool(case.data.get("case_id"))
+    snapshot = copy.deepcopy({k: case.data.get(k) for k in ("environment", "sections")}) if rescan else None
+    for t in list(ctx.inventory.get("installs", [])) + [ctx.target]:   # hive handles of a previous scan
+        try:
+            if t is not None and getattr(t, "reg", None) is not None:
+                t.reg.close()
+        except Exception as e:  # noqa: BLE001 - one stuck handle must not stop the scan
+            LOG.error("DISCOVERY| closing hives of %s failed: %s", getattr(t, "root", "?"), e)
 
     with case.section("environment", "Environment running the kit") as sec:
         sec.data = ctx.env
@@ -63,8 +74,11 @@ def collect(ctx):
         sec.data = {"disk_count": len(disks), "volume_count": len(vols)}
 
     with case.section("installs", "Windows installations found") as sec:
+        ctx.inventory["excluded_installs"] = []
         installs = find_installs(ctx)
         ctx.inventory["installs"] = installs
+        for root, note in ctx.inventory["excluded_installs"]:
+            sec.item(root, "skipped", note)
         case.write_json("inventory/installs.json", [_public(i) for i in installs])
         if not installs:
             sec.set("missing", "no volume contains \\Windows\\System32\\Config\\SYSTEM. If the target disk is "
@@ -80,7 +94,19 @@ def collect(ctx):
     ctx.target = target
     if target:
         ctx.runner.target_online = target.online
-        _assign_case(ctx)
+        why = None
+        with case.section("output_location", "Where the case is written") as sec:
+            why = check_output_location(ctx)
+            if why:
+                sec.set("error", why)
+                ctx.options["abort_scan"] = why
+            elif target.online:
+                sec.set("ok", "the target is the running Windows: writing the case to this disk is expected")
+            else:
+                sec.set("ok", "case output is not on the target volume")
+        if not why:
+            ctx.options.pop("abort_scan", None)
+            _assign_case(ctx, snapshot)
 
     with case.section("target", "Chosen target") as sec:
         if not target:
@@ -162,18 +188,16 @@ def find_installs(ctx):
     host_windir = ctx.env.get("windir") or ""
     by_num = {d["number"]: d for d in ctx.inventory.get("disks", [])}
     for v in ctx.inventory.get("volumes", []):
-        if not v.get("fs"):
+        if not v.get("fs") or v.get("drive_type") == "ramdisk":
             continue
         root = v["letter"] + ":\\" if v["letter"] else v["guid_path"]
         windir = root + "Windows"
         if not _is_windows_dir(windir):
             continue
-        online = False
-        if ctx.env["kind"] == "windows" and host_windir:
-            try:
-                online = os.path.samefile(windir, host_windir)
-            except OSError:
-                online = False
+        online = _is_running_windows(windir, host_windir, v["letter"])
+        if online and ctx.env.get("kind") in RE_KINDS:
+            _exclude_self(ctx, root)
+            continue
         disk = by_num.get(v.get("disk"))
         part = next((p for p in disk["partitions"] if p["number"] == v.get("partition")), None) if disk else None
         t = Target(root=root, windir=windir, online=online, letter=v["letter"], volume=v, disk=disk, partition=part)
@@ -183,9 +207,56 @@ def find_installs(ctx):
     explicit = ctx.options.get("target_path")
     if explicit:
         t = explicit_target(ctx, explicit, by_num)
-        if t:
+        if t and t.online and ctx.env.get("kind") in RE_KINDS:
+            _exclude_self(ctx, t.root)
+        elif t:
             out = [x for x in out if os.path.normcase(x.windir) != os.path.normcase(t.windir)] + [t]
     return out
+
+
+RE_KINDS = ("winre", "winpe", "setup")
+
+
+def _is_running_windows(windir, host_windir, letter):
+    """True if windir is the Windows of the running environment: same folder as ctx.env['windir'], and when
+    that cannot be compared, same drive letter as %SystemDrive%."""
+    if host_windir:
+        try:
+            return os.path.samefile(windir, host_windir)
+        except OSError:
+            pass
+    sysdrive = (os.environ.get("SystemDrive") or "")[:1].upper()
+    return bool(letter and sysdrive and letter.upper() == sysdrive)
+
+
+def _exclude_self(ctx, root):
+    note = "%s is the recovery environment itself, not a target" % root
+    ctx.inventory.setdefault("excluded_installs", []).append((root, note))
+    LOG.info("DISCOVERY| %s", note)
+
+
+def check_output_location(ctx):
+    """Reason string when the case output (or the devices folder) is on the TARGET volume of an offline
+    target (a scan would write to the target); None when it is fine or the target is the running Windows."""
+    t = ctx.target
+    if t is None or t.online:
+        return None
+    out_root = os.path.abspath(ctx.case.out_root)
+    paths = [out_root, os.path.abspath(ctx.options.get("devices_dir")
+                                       or os.path.join(os.path.dirname(out_root), "devices"))]
+    troot = os.path.normcase(t.root)
+    for p in paths:
+        drive = os.path.splitdrive(p)[0]
+        hit = bool(t.letter and drive[:1].upper() == t.letter.upper())
+        hit = hit or os.path.normcase(p).startswith(troot)
+        if not hit and drive:
+            try:
+                hit = os.path.samefile(drive + "\\", t.root)
+            except OSError:
+                pass
+        if hit:
+            return "case output is on the target volume: scanning would write to the target"
+    return None
 
 
 def explicit_target(ctx, path, by_num):
@@ -307,13 +378,50 @@ def choose_target(ctx):
                          "not by letter)", opts, default)
 
 
-def _assign_case(ctx):
+def _assign_case(ctx, snapshot=None):
     ticket = ctx.options.get("ticket")
     if ticket is None:
         ticket = ctx.ui.ask("Ticket number (Enter to skip)", "")
     ticket = "".join(ch for ch in str(ticket) if ch.isalnum())
     tid = target_id(ctx.target)
-    ctx.case.assign("ITW-%s-%s" % (ticket, tid) if ticket else "T-%s" % tid, ticket or None)
+    case_id = "ITW-%s-%s" % (ticket, tid) if ticket else "T-%s" % tid
+    case_id = re.sub(r"[^A-Za-z0-9_-]", "", case_id) or "unknown"
+    old_id = ctx.case.data.get("case_id")
+    if old_id and old_id != case_id:
+        _switch_run(ctx, snapshot)
+    if not ctx.case.assign(case_id, ticket or None):
+        ctx.ui.say(ctx.case.data.get("folder_note") or "The run folder could not be moved.")
+
+
+def _switch_run(ctx, snapshot):
+    """Re-scan onto a different target: the scan so far (environment, disks, installs) belongs to the NEW
+    target's run, so it moves into a fresh run folder; the old run folder gets its earlier sections back."""
+    case = ctx.case
+    mine = {k: case.data["sections"][k] for k in ("environment", "disks", "installs", "output_location")
+            if k in case.data["sections"]}
+    env = case.data.get("environment")
+    old_dir = case.dir
+    case.new_run()
+    case.data["environment"] = env
+    case.data["sections"].update(mine)
+    inv = ctx.inventory
+    case.write_json("inventory/disks.json", inv.get("disks", []))
+    case.write_json("inventory/partitions.json",
+                    [dict(p, disk=d["number"]) for d in inv.get("disks", []) for p in d["partitions"]])
+    case.write_json("inventory/volumes.json", inv.get("volumes", []))
+    case.write_json("inventory/installs.json", [_public(i) for i in inv.get("installs", [])])
+    case.save()
+    if snapshot:   # put the previous scan's sections back into the closed old run
+        p = os.path.join(old_dir, "case.json")
+        try:
+            with open(p, encoding="utf-8") as f:
+                old = json.load(f)
+            old["environment"], old["sections"] = snapshot["environment"], snapshot["sections"]
+            with open(p + ".tmp", "w", encoding="utf-8") as f:
+                json.dump(old, f, indent=2, ensure_ascii=False, default=str)
+            os.replace(p + ".tmp", p)
+        except (OSError, ValueError, TypeError) as e:
+            LOG.error("DISCOVERY| could not restore the previous run's sections in %s: %s", p, e)
 
 
 def boot_structure(ctx):

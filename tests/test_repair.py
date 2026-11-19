@@ -336,7 +336,10 @@ class RunnerIntegrationTests(Base):
                 self.runner.repair(step)
 
     def test_bcdboot_refused_without_backup_then_allowed(self):
-        self.runner.bcd_backup = os.path.join(self.tmp, "b")
+        backup = os.path.join(self.tmp, "b")
+        with open(backup, "wb") as f:
+            f.write(b"bcd export")
+        self.assertTrue(self.runner.note_bcd_backup(backup))
         self.ui.answers = ["yes", "yes"]
         for s in repair.bcd_steps(self.ctx):
             self.assertEqual(self.runner.repair(s).error, "dry run: not executed")

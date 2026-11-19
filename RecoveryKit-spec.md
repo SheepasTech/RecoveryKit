@@ -9,7 +9,7 @@ Merges `project idea1.txt` (a hand-worked case and its guardrails) and `project 
 1. **Read-only by default.** Scanning and collecting never write to the target disk. Repairs are a separate, explicit step.
 2. **Never assume.** Identify the target by disk number, partition size and contents (`\Windows\System32\Config\SYSTEM`), never by a fixed letter. Re-verify before every repair step.
 3. **Show, then ask.** Every repair prints the exact command and its effect and waits for a typed yes. No silent retries.
-4. **Forbidden commands** (not implemented, not reachable through any plugin): `diskpart clean`, `format`, `delete partition`, `bootrec /fixmbr`, blind `bcdboot` and `bcdedit /set` without a prior BCD export.
+4. **Forbidden commands** (not implemented in the kit; plugins are trusted code that must be listed with its checksum, see section 5): `diskpart clean`, `format`, `delete partition`, `bootrec /fixmbr`, blind `bcdboot` and `bcdedit /set` without a prior BCD export.
 5. **Back up before changing.** Before any BCD or registry change, export the original to the case folder.
 6. **Record everything.** Every command, its arguments, exit code and output goes to the audit log.
 7. **SFC clean does not mean bootable.** The report never says "fixed" until the target has booted; that is a user-confirmed field.
@@ -73,7 +73,7 @@ audit.log           every command run, with exit code
 - **Module** = a Python file with `collect()` (read-only, returns data and files) and optionally `repair_steps()` (returns proposed steps, never runs them itself).
 - **Command wrapper**: single place that runs external tools with a timeout, captures output and exit code, and writes the audit entry. Modules cannot call subprocess directly.
 - **UI**: TUI first (`textual` if it works in WinRE, plain-text menu fallback). GUI is out of scope for v1.
-- **Plugins**: modules from `config/` or `plugins/` follow the same interface; none can bypass the command wrapper or the forbidden list.
+- **Plugins**: modules from `config/` or `plugins/` follow the same interface; none can bypass the command wrapper or the forbidden list. Plugins load only when listed with a matching SHA-256 in `plugins/manifest.sha256`; the source check is a guard against mistakes, not a sandbox.
 
 ## 6. Modules
 

@@ -58,18 +58,19 @@ class Classify(unittest.TestCase):
 
     def test_read_only(self):
         for argv in (["bcdedit", "/store", "x", "/enum", "all", "/v"], ["bcdedit", "/enum", "all"],
-                     ["bcdedit", "/export", "x.bak"], ["manage-bde", "-status"], ["chkdsk", "W:"],
+                     ["manage-bde", "-status"], ["chkdsk", "W:"],
                      ["wevtutil", "qe", "f.evtx", "/lf:true", "/q:*", "/c:5"], ["ipconfig", "/all"],
                      ["reg", "query", "HKLM\\X"], ["dism", "/Get-WimInfo", "/WimFile:x.wim"],
-                     ["smartctl", "-a", "-j", "/dev/pd0"], ["C:\\Windows\\System32\\BCDEDIT.EXE", "/enum"],
+                     ["smartctl", "-a", "-j", "/dev/pd0"], ["BCDEDIT.EXE", "/enum"],
                      ["bootrec", "/scanos"], ["wmic", "diskdrive", "get", "Status"]):
             self.assertEqual(classify(argv)[0], READ, argv)
+        self.assertEqual(classify(["C:\\Windows\\System32\\BCDEDIT.EXE", "/enum"])[0], FORBIDDEN)
 
     def test_repair_and_host(self):
         self.assertEqual(classify(["dism", "/English", "/Image:W:\\", "/Cleanup-Image", "/RestoreHealth",
                                    "/Source:wim:D:\\i.wim:1", "/LimitAccess"])[0], REPAIR)
         self.assertEqual(classify(["sfc", "/scannow", "/offbootdir=W:\\", "/offwindir=W:\\Windows"])[0], REPAIR)
-        self.assertEqual(classify(["bcdedit", "/set", "{default}", "recoveryenabled", "no"]), (REPAIR, "needs-bcd-backup"))
+        self.assertEqual(classify(["bcdedit", "/store", "x", "/set", "{default}", "recoveryenabled", "no"]), (REPAIR, "needs-bcd-backup"))
         self.assertEqual(classify(["bcdboot", "W:\\Windows", "/s", "S:", "/f", "UEFI"]), (REPAIR, "needs-bcd-backup"))
         self.assertEqual(classify(["robocopy", "W:\\Users", "E:\\b", "/E", "/XJ"])[0], HOST)
         self.assertEqual(classify(["manage-bde", "-unlock", "W:", "-RecoveryPassword", "1-2"])[0], HOST)
@@ -161,7 +162,7 @@ class RunnerBehaviour(unittest.TestCase):
         with open(p, "wb") as f:
             f.write(b"regf")
         self.assertTrue(r.note_bcd_backup(p))
-        self.assertIsNone(r.repair(self._step(argv=["bcdedit", "/set", "{default}", "x", "y"])))  # auto: declined
+        self.assertIsNone(r.repair(self._step(argv=["bcdedit", "/store", "x", "/set", "{default}", "x", "y"])))  # auto: declined
 
     def test_secrets_are_redacted(self):
         r = Runner(self.case, ScriptedUI(["yes"]), ROOT, dry_run=True)
@@ -311,8 +312,57 @@ class Rules(unittest.TestCase):
     def test_plugin_source_check(self):
         self.assertEqual(plugins.check_source("def collect(ctx):\n    return {'a': 1}\n"), [])
         for bad in ("import subprocess", "from ctypes import windll", "import os\nos.system('x')",
-                    "eval('1')", "import socket", "__import__('subprocess')", "def x(:"):
+                    "eval('1')", "import socket", "__import__('subprocess')", "def x(:",
+                    # bypasses from the security review (C14)
+                    "from os import system", "from os import popen as p", "from shutil import rmtree",
+                    "from builtins import exec", "import builtins", "import os as o\no.system('x')",
+                    "import shutil as s\ns.rmtree('x')", "import os\ngetattr(os, 'sys' + 'tem')",
+                    "def collect(ctx):\n    ctx.runner._exec(['x'])", "x = ().__class__", "x = ctx.__dict__",
+                    "def collect(ctx):\n    ctx.runner.repairs_enabled = True",
+                    "def collect(ctx):\n    ctx.ui.confirm_yes = lambda q: True",
+                    "def collect(ctx):\n    ctx.case.data['x'] = 1\n    ctx.options = {}",
+                    "globals()", "locals()", "vars(1)", "setattr(1, 'a', 2)", "delattr(1, 'a')",
+                    "open('x', 'w')", "open('x', 'a')", "open('x', mode='wb')", "open('x', 'r+')",
+                    "f = open\nf('x', 'w')", "open()"):
             self.assertTrue(plugins.check_source(bad), bad)
+        for good in ("open('x')", "open('x', 'rb')", "open('x', encoding='utf-8')", "open('x', mode='r')"):
+            self.assertEqual(plugins.check_source(good), [], good)
+
+    def test_plugins_load_only_when_listed_with_matching_hash(self):
+        import hashlib
+        import types
+        good_src = b"def collect(ctx):\n    return {'answer': 42}\n"
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            pdir = os.path.join(tmp, "plugins")
+            os.makedirs(pdir)
+            for name, data in (("good.py", good_src), ("unlisted.py", good_src), ("tampered.py", good_src),
+                               ("badsrc.py", b"import subprocess\n")):
+                with open(os.path.join(pdir, name), "wb") as f:
+                    f.write(data)
+            ctx = types.SimpleNamespace(kit_root=tmp, case=Case(os.path.join(tmp, "cases")))
+            self.addCleanup(ctx.case.close)
+
+            def secs():
+                return ctx.case.data["sections"]
+            # no manifest at all: nothing runs
+            plugins.run_all(ctx)
+            for n in ("good", "unlisted", "tampered", "badsrc"):
+                self.assertEqual(secs()["plugin_" + n]["status"], "error")
+                self.assertIn("manifest", secs()["plugin_" + n]["reason"])
+            ctx.case.data["sections"].clear()
+            h = lambda b: hashlib.sha256(b).hexdigest()
+            with open(os.path.join(pdir, "manifest.sha256"), "w") as f:
+                f.write("# plugins\n%s  good.py\n%s  tampered.py\n%s  badsrc.py\n" % (
+                    h(good_src), h(good_src + b"# other\n"), h(b"import subprocess\n")))
+            plugins.run_all(ctx)
+            self.assertEqual(secs()["plugin_good"]["status"], "ok")
+            self.assertEqual(secs()["plugin_good"]["data"], {"answer": 42})
+            self.assertIn("not listed in plugins/manifest.sha256", secs()["plugin_unlisted"]["reason"])
+            self.assertEqual(secs()["plugin_unlisted"]["status"], "error")
+            self.assertIn("checksum mismatch", secs()["plugin_tampered"]["reason"])
+            self.assertEqual(secs()["plugin_tampered"]["status"], "error")
+            self.assertEqual(secs()["plugin_tampered"]["data"], {})
+            self.assertIn("subprocess", secs()["plugin_badsrc"]["reason"])   # listed, but the source check still applies
 
     def test_sources_are_ascii(self):
         for root, _, files in os.walk(os.path.join(ROOT, "recoverykit")):

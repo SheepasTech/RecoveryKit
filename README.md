@@ -32,6 +32,7 @@ The menu starts with **Scan**: it finds the Windows installations by disk and co
 |---|---|
 | Discovery | Disks, partitions, volumes, offline Windows installs with edition, build, language and architecture, EFI and Recovery partitions, free space, BitLocker status |
 | Logs | SrtTrail, CBS, DISM, Panther, setupapi, minidumps, event logs (raw `.evtx` plus an export filtered by level first), a copy of the BCD store and its listing, pending operations, disk health |
+| Log findings | Startup Repair root cause, CBS and DISM errors with HRESULTs, corrupt component files, device install failures, notable events, problems in the BCD listing |
 | Inventories | Registry snapshot with the startup-relevant findings and a diff against the previous run; third-party drivers newest first; autoruns, services and scheduled tasks with entries worth a look |
 | Device ID | Eight 4-letter codes, one per component (`CPU-RAM-RSPD-MOBO-GPU-USER-DISK-UNIT`), with a registry on the stick that maps each code to its component and holds device-specific settings |
 | Report | `case.json` and `report.md` from the same data: confirmed facts, not yet established, actions taken, current state, suggested next steps |
@@ -102,7 +103,7 @@ Logging is always on. Details are in [docs/logging.txt](docs/logging.txt). On a 
 | `recoverykit/modules/` | discovery, logs, regdiff, drivers, triage, assistant, repair, report |
 | `recoverykit/engine.py`, `net.py`, `web/` | The engine and its API, the server, the browser page |
 | `config/` | `kit.toml`, `assistant.toml` |
-| `plugins/` | Optional `*.py` with `collect(ctx)`; they can only run commands through the wrapper |
+| `plugins/` | Optional `*.py` with `collect(ctx)`. Loaded only when listed with a matching SHA-256 in `plugins/manifest.sha256`. A listed plugin is trusted code, not sandboxed |
 | `tools/` | Optional third-party binaries (smartctl), used only when listed in `tools/manifest.sha256` |
 | `tests/` | `python -m unittest discover -s tests -t .` |
 | `docs/` | Manual, API, logging, module interface |

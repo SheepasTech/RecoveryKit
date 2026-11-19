@@ -5,8 +5,10 @@ the HTTP agent API (route() below, used for loopback and for relayed calls).
 One lock serializes operations: never two operations on a target at once.
 """
 import hashlib
+import hmac
 import json
 import os
+import secrets
 import threading
 import time
 import tomllib
@@ -86,6 +88,10 @@ class Engine:
         from .modules import discovery
         ctx, ui = self.ctx, self.ctx.ui
         with self._op("scan"):
+            self._steps = {}                  # tokens from an earlier listing must not outlive a rescan
+            reset = getattr(ctx.runner, "reset_for_scan", None)
+            if reset is not None:
+                reset()
             for k in ("ticket", "target", "target_path", "chkdsk", "answers"):
                 if opts.get(k) is not None:
                     ctx.options[k] = opts[k]
@@ -93,7 +99,13 @@ class Engine:
                 ctx.target.reg.close()
             ui.header("Discovery")
             discovery.collect(ctx)
-            ui.say("Target: %s" % (discovery.describe(ctx.target) if ctx.target else "none"))
+            abort = ctx.options.get("abort_scan")
+            if abort:
+                ui.say("Scan stopped: %s. Choose another output location with --out." % abort)
+                self.scanned = False
+                self.report()
+                return self.sections()
+            ui.say("Target:%s" % (discovery.describe(ctx.target) if ctx.target else "none"))
             self.module("device", "collect")
             ui.header("Collecting logs (read-only)")
             self.module("logs", "collect")
@@ -248,6 +260,12 @@ class Engine:
             self.report()
             return res
 
+    def _target_key(self):
+        t = self.ctx.target
+        if t is None:
+            return None
+        return (t.volume or {}).get("guid_path") or t.root
+
     def repair_steps(self):
         """Proposed steps with the exact command and a token bound to that command (ADR 0012)."""
         from .modules import repair
@@ -263,13 +281,15 @@ class Engine:
                 steps += repair.repair_steps(ctx) + repair.bcd_steps(ctx)
                 blockers += ["BCD repair not offered: " + b for b in repair.bcd_blockers(ctx)]
             self._steps = {}
+            nonce = secrets.token_hex(8)       # fresh per listing: a token is valid for this listing only
+            tkey = self._target_key()
             out = []
             for i, s in enumerate(steps):
                 cmd = "diskpart: " + " / ".join(s.diskpart) if s.diskpart is not None else " ".join(
                     '"%s"' % a if " " in str(a) else str(a) for a in s.argv)
                 key = s.id if s.id not in self._steps else "%s-%d" % (s.id, i)
-                token = hashlib.sha256(cmd.encode("utf-8")).hexdigest()[:12]
-                self._steps[key] = (s, token)
+                token = hashlib.sha256((nonce + "|" + cmd).encode("utf-8")).hexdigest()[:12]
+                self._steps[key] = (s, token, ctx.target, tkey)
                 out.append({"id": key, "title": s.title, "command": cmd, "effect": s.effect, "risk": s.risk,
                             "evidence": s.evidence, "touches_target": s.touches_target, "token": token})
             return {"steps": out, "blockers": blockers, "dry_run": ctx.runner.dry_run}
@@ -284,9 +304,13 @@ class Engine:
                 "--allow-remote-repairs" if remote else "--allow-repairs"))
         if step_id not in self._steps:
             raise ApiError(404, "unknown step id; list the steps first")
-        step, want = self._steps[step_id]
-        if confirm != "yes" or token != want:
+        step, want, listed_target, listed_key = self._steps[step_id]
+        if confirm != "yes" or not hmac.compare_digest(str(token), want):
             raise ApiError(409, "not confirmed: send confirm=\"yes\" and the token shown for this exact command")
+        if ctx.target is not listed_target or self._target_key() != listed_key:
+            self._steps = {}
+            raise ApiError(409, "the target changed since the steps were listed; list the steps again")
+        self._steps.pop(step_id, None)        # single use: running it again needs a fresh listing
         with self._op("repair " + step_id):
             ui = ctx.ui
             LOG.info("REPAIR| API confirmation by operator %r for step %s (%s)", operator, step_id,
@@ -382,8 +406,7 @@ def _dispatch(e, method, p, q, b, remote, operator):
                 return f.read(), "application/zip"
         raise ApiError(404, "unknown GET route %s" % p)
     if p == "/scan":
-        if not isinstance(b.get("answers", {}), dict):
-            raise ApiError(400, "answers must be an object")
+        _check_scan_body(b, remote)
         return e.scan(ticket=b.get("ticket"), target=b.get("target"), target_path=b.get("target_path"),
                       chkdsk=b.get("chkdsk"), answers=b.get("answers"))
     if p == "/answers":
@@ -399,5 +422,28 @@ def _dispatch(e, method, p, q, b, remote, operator):
         return e.check_source(str(b["path"]), b.get("index"))
     if p == "/repair/run":
         return e.run_step(str(b.get("id", "")), str(b.get("token", "")), b.get("confirm"),
-                          operator=str(b.get("operator") or operator), remote=remote)
+                          operator=operator if remote else str(b.get("operator") or operator), remote=remote)
     raise ApiError(404, "unknown POST route %s" % p)
+
+
+def _check_scan_body(b, remote):
+    """Type-check a /scan body before anything is stored in the options."""
+    t = b.get("ticket")
+    if t is not None and (isinstance(t, bool) or not isinstance(t, (str, int)) or len(str(t)) > 20):
+        raise ApiError(400, "ticket must be a string or number of at most 20 characters")
+    t = b.get("target")
+    if t is not None and not (isinstance(t, str) and len(t) == 1 and t.isascii() and t.isalpha()):
+        raise ApiError(400, "target must be a single drive letter")
+    tp = b.get("target_path")
+    if tp is not None:
+        if not isinstance(tp, str):
+            raise ApiError(400, "target_path must be a string")
+        if remote:
+            raise ApiError(403, "a relayed scan may not set target_path: an operator must not point the scan "
+                                "at arbitrary folders of the target machine")
+    if b.get("chkdsk") is not None and not isinstance(b["chkdsk"], bool):
+        raise ApiError(400, "chkdsk must be true or false")
+    a = b.get("answers")
+    if a is not None and not (isinstance(a, dict) and all(isinstance(k, str) and isinstance(v, str)
+                                                          for k, v in a.items())):
+        raise ApiError(400, "answers must be an object of strings")

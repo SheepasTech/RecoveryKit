@@ -10,6 +10,10 @@ Python 3.11+ **stdlib only**. The kit must run from an embeddable Python in WinR
 - Every section is wrapped in `with ctx.case.section(name, title) as sec:`. An exception inside marks only that section `error`. Record each source with `sec.item(name, status, reason, **extra)` where status is `ok | missing | error | skipped` and **reason says why** whenever it is not ok. Nothing fails silently; no bare `except: pass`.
 - `collect(ctx)` is read-only. `repair_steps(ctx)` returns `RepairStep` objects and never runs them; the menu passes them to `ctx.runner.repair(step)`.
 
+## Plugins: trusted code, not a sandbox
+
+A plugin (`plugins/*.py`, `collect(ctx)` returning a dict) loads only when `plugins/manifest.sha256` lists it with a matching SHA-256 (same line format as `tools/manifest.sha256`: `<64 hex>  <file name>`, `#` comments). Not listed, no manifest or a changed file: its section is `error` with the reason and it is never imported. `plugins.check_source` additionally refuses obvious dangerous constructs (banned imports and `from os import system`, aliases of `os`/`shutil`, `getattr`, `_private` attribute access, assignments to `ctx` attributes, `open` in a write mode, `eval`/`exec`/`globals`...). That check is a guard against mistakes plus an integrity check, NOT a sandbox: a listed plugin is trusted code and runs with the kit's rights. Write files through `ctx.case.write_text/write_json`.
+
 ## Objects (read the source, it is short)
 
 - `recoverykit/core/context.py`: `Ctx` (`kit_root, cfg, env, case, ui, runner, options, inventory, target`), `Target` (`root, windir, online, letter, volume, disk, partition, info, reg`), `RegView` (`get(hive, path, name, default)`, `subkeys(hive, path)`, `values(hive, path)` (dict), `exists(hive, path)`, `control_set()`; hive is `"SOFTWARE"` or `"SYSTEM"`; works for offline and running installs).

@@ -16,6 +16,18 @@ Added
 - Device ID of eight 4-letter component codes (`CPU-RAM-RSPD-MOBO-GPU-USER-DISK-UNIT`), a `devices/` registry on the stick that maps every code to its component, and device-specific settings (`modules/device.py`, `core/hwinfo.py`). `--decode-id` prints an ID's components.
 - Assistant rules for recent drivers, registry findings and flagged startup entries.
 
+- Built-in reader for `.evtx` files, used when `wevtutil` is missing (as it may be in WinRE), so the level-filtered event export still works (`core/evtx.py`).
+- Findings from the collected logs: Startup Repair root cause, CBS and DISM errors with their HRESULTs, corrupt component files, device install failures, notable events (unexpected shutdowns, storage and hardware errors), problems in the BCD listing (`modules/loganalysis.py`), with assistant rules that cite them.
+
+Security (after an independent review; details in the ADR on hardening)
+- Fixed: a BitLocker recovery key typed for the unlock step was stored in `case.json`. The audit log already redacted it; the repair record now does too.
+- The command wrapper's read-only class is a positive allowlist per tool; tools are resolved only from `System32` or verified `tools/`; diskpart lines with control characters are refused; repairs that address the running Windows are refused by the wrapper itself.
+- API repair tokens are single-use and die with the next scan. The BCD backup must exist at the time of the repair.
+- Server protocol: signature covers the path, no session takeover by re-sending `hello`, job time-to-live, server-chosen bundle names, size and type checks on everything an agent sends.
+- Discovery never offers the recovery environment's own Windows as a target, stops when the case output would land on the target volume, and does not follow links on the target.
+- Plugins load only when listed with a matching SHA-256 in `plugins/manifest.sha256`. The spec no longer claims plugins are sandboxed.
+- Tokens and the pairing code are shown on the console and kept out of the logs.
+
 Changed
 - The spec's deferred items are now roadmap phases 6 to 12.
 

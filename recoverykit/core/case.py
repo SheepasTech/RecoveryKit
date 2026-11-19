@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import time
 import traceback
 from contextlib import contextmanager
@@ -46,6 +47,24 @@ class Section:
 class Case:
     def __init__(self, out_root, kit_version="0"):
         self.out_root = os.path.abspath(out_root)
+        self.kit_version = kit_version
+        self._handler = None
+        self._new_run_folder()
+        self.data = self._fresh_data()
+        LOG.info("CASE  | run folder %s", self.dir)
+        self.save()
+
+    def _fresh_data(self):
+        return {
+            "schema": SCHEMA, "kit_version": self.kit_version, "case_id": None, "ticket": None,
+            "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "finished": None,
+            "environment": {}, "target": {}, "operator_answers": {},
+            "sections": {}, "files": [], "source_check": None,
+            "booted_after_repair": None,  # set only by the operator, never inferred
+        }
+
+    def _new_run_folder(self):
+        """Create _pending/<stamp>[-n] with its sub folders and attach debug.log there."""
         self.stamp = time.strftime("%Y%m%d-%H%M")
         base = os.path.join(self.out_root, "_pending", self.stamp)
         n, self.dir = 1, base
@@ -55,41 +74,56 @@ class Case:
         for sub in ("inventory", "logs", "exports", "audit"):
             os.makedirs(os.path.join(self.dir, sub))
         self._handler = log.add_file(os.path.join(self.dir, "debug.log"))
-        self.data = {
-            "schema": SCHEMA, "kit_version": kit_version, "case_id": None, "ticket": None,
-            "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "finished": None,
-            "environment": {}, "target": {}, "operator_answers": {},
-            "sections": {}, "files": [], "source_check": None,
-            "booted_after_repair": None,  # set only by the operator, never inferred
-        }
-        LOG.info("CASE  | run folder %s", self.dir)
-        self.save()
 
     def path(self, *parts):
         return os.path.join(self.dir, *parts)
 
+    def new_run(self):
+        """Close the current run and start a fresh _pending run folder (a re-scan onto another target).
+        The old folder stays where it is, under its own case ID. Keeps kit_version and tools_manifest."""
+        old = self.dir
+        self.close()
+        keep = {k: self.data[k] for k in ("kit_version", "tools_manifest") if k in self.data}
+        self._new_run_folder()
+        self.data = self._fresh_data()
+        self.data.update(keep)
+        self.data["previous_run"] = old
+        LOG.info("CASE  | new run folder %s (previous run: %s)", self.dir, old)
+        self.save()
+
     def assign(self, case_id, ticket=None):
-        """Move the run folder under its case ID."""
+        """Move the run folder under its case ID. Returns True on success; False when the folder could not
+        be moved (the run continues in the current folder and data["folder_note"] says why)."""
         case_id = re.sub(r"[^A-Za-z0-9_-]", "", case_id) or "unknown"
         if self.data.get("case_id") == case_id:
-            return  # a re-scan of the same target stays in the same run folder
+            return True  # a re-scan of the same target stays in the same run folder
         dest_parent = os.path.join(self.out_root, case_id)
-        os.makedirs(dest_parent, exist_ok=True)
-        dest = os.path.join(dest_parent, os.path.basename(self.dir))
-        n = 1
-        while os.path.exists(dest):
-            n += 1
-            dest = os.path.join(dest_parent, "%s-%d" % (self.stamp, n))
-        log.remove(self._handler)
-        self._handler = None
+        ok = True
         try:
-            os.rename(self.dir, dest)
-            self.dir = dest
-        finally:
-            self._handler = log.add_file(os.path.join(self.dir, "debug.log"))
+            os.makedirs(dest_parent, exist_ok=True)
+            dest = os.path.join(dest_parent, os.path.basename(self.dir))
+            n = 1
+            while os.path.exists(dest):
+                n += 1
+                dest = os.path.join(dest_parent, "%s-%d" % (self.stamp, n))
+            log.remove(self._handler)
+            self._handler = None
+            try:
+                os.rename(self.dir, dest)
+                self.dir = dest
+            finally:
+                self._handler = log.add_file(os.path.join(self.dir, "debug.log"))
+        except OSError as e:
+            ok = False
+            self.data["folder_note"] = "run folder could not be moved to %s: %s; it stays at %s" % (
+                os.path.join(dest_parent, os.path.basename(self.dir)), e, self.dir)
+            LOG.error("CASE  | %s", self.data["folder_note"])
+        else:
+            self.data.pop("folder_note", None)
         self.data["case_id"], self.data["ticket"] = case_id, ticket
         LOG.info("CASE  | assigned %s, folder %s", case_id, self.dir)
         self.save()
+        return ok
 
     @contextmanager
     def section(self, name, title):
@@ -133,6 +167,12 @@ class Case:
         e = {"src": src, "dest": rel_dest, "source": source, "status": "ok", "reason": "",
              "size": None, "mtime": None, "sha256": None}
         try:
+            lst = os.lstat(src)
+            if stat.S_ISLNK(getattr(lst, "st_mode", 0)) or getattr(lst, "st_file_attributes", 0) & 0x400:
+                e["status"], e["reason"] = "skipped", "link or reparse point: not followed"
+                LOG.info("FILE  | %s -> %s: %s %s", src, rel_dest, e["status"], e["reason"])
+                self.data["files"].append(e)
+                return e
             st = os.stat(src)
             e["size"], e["mtime"] = st.st_size, time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(st.st_mtime))
             e["_mtime_ns"] = st.st_mtime_ns

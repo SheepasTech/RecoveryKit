@@ -23,6 +23,7 @@ import time
 
 from ..core import hwinfo
 from ..core.log import LOG
+from . import discovery
 
 SEGMENTS = [
     ("CPU", "Processor"),
@@ -132,20 +133,31 @@ def decode(devices_dir, device_id):
     codes = device_id.upper().split("-")
     out = []
     for (seg, label), c in zip(SEGMENTS, codes):
-        e = (reg.get(seg) or {}).get(c)
-        out.append({"segment": seg, "label": label, "code": c, "value": (e or {}).get("value"),
-                    "detail": (e or {}).get("detail")})
+        slot = reg.get(seg)
+        e = slot.get(c) if isinstance(slot, dict) else None
+        e = e if isinstance(e, dict) else {}
+        out.append({"segment": seg, "label": label, "code": c, "value": e.get("value"),
+                    "detail": e.get("detail")})
     return out
 
 
-def _load(path, default):
+def _load(path, default, expect=dict, problems=None):
+    """Read a JSON file that must hold an `expect` (dict). Unreadable or of another type: the file is moved
+    aside to .bad, `default` is returned and a sentence is appended to `problems` (if given)."""
     try:
         with open(path, encoding="utf-8") as f:
-            return json.load(f)
+            obj = json.load(f)
+        if expect is not None and not isinstance(obj, expect):
+            raise ValueError("expected a JSON %s, found %s" % ("object" if expect is dict else expect.__name__,
+                                                                 type(obj).__name__))
+        return obj
     except FileNotFoundError:
         return default
     except (OSError, ValueError) as e:
         LOG.error("DEVICE| %s not readable (%s): starting from an empty one, the old file is kept as .bad", path, e)
+        if problems is not None:
+            problems.append("%s is corrupt (%s): moved aside to %s.bad, defaults used" % (
+                os.path.basename(path), e, os.path.basename(path)))
         try:
             os.replace(path, path + ".bad")
         except OSError:
@@ -170,15 +182,17 @@ def remember(ddir, device_id, segs, hw, run):
     today = time.strftime("%Y-%m-%d %H:%M")
     notes = []
     reg_path = os.path.join(ddir, "components.json")
-    reg = _load(reg_path, {})
+    reg = _load(reg_path, {}, problems=notes)
     for s in segs:
         if s["code"] == UNKNOWN:
             continue
-        slot = reg.setdefault(s["segment"], {})
+        slot = reg.get(s["segment"])
+        if not isinstance(slot, dict):
+            slot = reg[s["segment"]] = {}
         e = slot.get(s["code"])
-        if e is None:
+        if not isinstance(e, dict) or not isinstance(e.get("devices"), list):
             e = slot[s["code"]] = {"value": s["value"], "detail": s["detail"], "first_seen": today, "devices": []}
-        elif e.get("value", "").lower() != s["value"].lower():
+        elif str(e.get("value", "")).lower() != s["value"].lower():
             notes.append("code %s for %s already stands for %r; this device has %r (hash collision): see "
                          "device.json for the real value" % (s["code"], s["segment"], e.get("value"), s["value"]))
             e.setdefault("also", [])
@@ -190,16 +204,18 @@ def remember(ddir, device_id, segs, hw, run):
     _save(reg_path, reg)
 
     dpath = os.path.join(ddir, device_id, "device.json")
-    dev = _load(dpath, {})
+    dev = _load(dpath, {}, problems=notes)
     dev.setdefault("first_seen", today)
     dev.update(id=device_id, last_seen=today, segments=segs, hardware=hw)
-    runs = dev.setdefault("runs", [])
+    runs = dev.get("runs")
+    if not isinstance(runs, list):
+        runs = dev["runs"] = []
     runs.append(run)
     del runs[:-50]
     _save(dpath, dev)
 
     spath = os.path.join(ddir, device_id, "settings.json")
-    settings = _load(spath, None)
+    settings = _load(spath, None, problems=notes)
     if settings is None:
         settings = dict(DEFAULT_SETTINGS)
         _save(spath, settings)
@@ -220,11 +236,12 @@ def _write_index(ddir):
         dev = _load(os.path.join(ddir, name, "device.json"), None) if os.path.isdir(os.path.join(ddir, name)) else None
         if not dev:
             continue
-        d = {s["segment"]: s.get("detail") or "-" for s in dev.get("segments", [])}
+        segs = dev.get("segments") if isinstance(dev.get("segments"), list) else []
+        d = {s["segment"]: s.get("detail") or "-" for s in segs if isinstance(s, dict) and "segment" in s}
         rows.append("| `%s` | %s | %s | %s | %s | %s | %s | %s | %s | %d |" % (
             dev.get("id"), d.get("CPU", "-"), d.get("RAM", "-"), d.get("RSPD", "-"), d.get("MOBO", "-"),
             d.get("GPU", "-"), d.get("USER", "-"), d.get("DISK", "-"), dev.get("last_seen", "-"),
-            len(dev.get("runs", []))))
+            len(dev["runs"]) if isinstance(dev.get("runs"), list) else 0))
     text = ["# Devices seen by this kit", "",
             "ID = " + "-".join(s for s, _ in SEGMENTS) + ". One 4-letter code per component; XXXX = not readable. "
             "`components.json` maps every code back to its component. Device-specific settings are in "
@@ -269,7 +286,7 @@ def collect(ctx):
             sec.item("device store", "error", "could not write %s: %s" % (ddir, e))
             return device_id
         for n in notes:
-            sec.item("components.json", "error", n)
+            sec.item("device store", "error", n)
         sec.data["store"] = os.path.join(ddir, device_id)
         sec.data["settings"] = settings
         apply_settings(ctx, settings)
@@ -284,7 +301,7 @@ def edit_settings(ctx):
         ctx.ui.say("No device ID yet: run the scan first.")
         return
     spath = os.path.join(devices_dir(ctx), dev["id"], "settings.json")
-    settings = _load(spath, None) or dict(DEFAULT_SETTINGS)
+    settings = _load(spath, None, dict) or dict(DEFAULT_SETTINGS)
     ctx.ui.say("Settings for device %s (%s)" % (dev["id"], spath))
     settings["notes"] = ctx.ui.ask("Notes for this device (shown at every scan)", settings.get("notes", ""))
     settings["ticket"] = ctx.ui.ask("Ticket number to use for this device", settings.get("ticket", ""))
@@ -299,16 +316,27 @@ def apply_settings(ctx, settings):
     """Device-specific settings saved on the flash drive: notes are shown, a saved ticket names the case,
     saved answers pre-fill the boot-failure questions (explicit command-line values win)."""
     ui = ctx.ui
-    if settings.get("notes"):
-        ui.say("  Notes for this device: %s" % settings["notes"])
-    ticket = "".join(ch for ch in str(settings.get("ticket") or "") if ch.isalnum())
+    if not isinstance(settings, dict):
+        settings = {}
+    notes = "".join(ch for ch in str(settings.get("notes") or "") if ch.isprintable())[:500]
+    if notes:
+        ui.say("  Notes for this device: %s" % notes)
+    ticket = "".join(ch for ch in str(settings.get("ticket") or "") if ch.isascii() and ch.isalnum())[:20]
     if ticket and not ctx.case.data.get("ticket"):
         cid = ctx.case.data.get("case_id") or ""
         tid = cid.rsplit("-", 1)[-1] if cid else ""
         if tid:
-            ctx.case.assign("ITW-%s-%s" % (ticket, tid), ticket)
-            ui.say("  Ticket %s taken from this device's settings." % ticket)
+            if ctx.case.assign("ITW-%s-%s" % (ticket, tid), ticket):
+                ui.say("  Ticket %s taken from this device's settings." % ticket)
+            else:
+                ui.say("  " + (ctx.case.data.get("folder_note") or "The run folder could not be moved."))
     saved = settings.get("answers") if isinstance(settings.get("answers"), dict) else {}
+    valid_answers = {k: {o for o, _ in opts} for k, _q, opts in discovery.QUESTIONS}
+    ignored = sorted(str(k) for k, v in saved.items() if not (isinstance(k, str) and isinstance(v, str)
+                                                            and v in valid_answers.get(k, ())))
+    if ignored:
+        ui.say("  Ignored invalid saved answers: %s" % ", ".join(ignored)[:200])
+    saved = {k: v for k, v in saved.items() if isinstance(k, str) and isinstance(v, str) and v in valid_answers.get(k, ())}
     current = ctx.case.data.get("operator_answers") or {}
     filled = {k: v for k, v in saved.items() if current.get(k, "unknown") == "unknown" and v}
     if filled:

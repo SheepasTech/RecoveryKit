@@ -475,13 +475,23 @@ def _emit(ctx):
 
 
 def record(ctx, step, res, note=""):
-    argv = step.argv if step.diskpart is None else None
-    command = _cmdline(argv) if argv is not None else "diskpart: " + " / ".join(step.diskpart)
+    secrets = [s for s in (step.secrets or ()) if s]
+
+    def hide(text):
+        text = str(text)
+        for s in secrets:
+            text = text.replace(s, "<redacted>")
+        return text
+
+    argv = None
+    if step.diskpart is None:
+        argv = ["<redacted>" if any(s in str(a) for s in secrets) else a for a in step.argv]
+    command = _cmdline(argv) if argv is not None else "diskpart: " + " / ".join(hide(ln) for ln in step.diskpart)
     if res is None:
         entry = {"kind": "declined", "rc": None, "error": "declined by operator", "finding": None, "error_code": None}
     else:
         m = re.search(r"0x[0-9A-Fa-f]{8}", res.out or "")
-        entry = {"kind": res.kind, "rc": res.rc, "error": res.error or "", "finding": parse_finding(res.out),
+        entry = {"kind": res.kind, "rc": res.rc, "error": hide(res.error or ""), "finding": parse_finding(res.out),
                  "error_code": m.group(0) if m else None}
     entry.update({"id": step.id, "title": step.title, "command": command,
                   "time": time.strftime("%Y-%m-%dT%H:%M:%S"), "note": note})

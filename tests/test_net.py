@@ -113,6 +113,8 @@ class EngineRoutes(Base):
         status, res = self.call("POST", "/repair/run", body)                         # real target re-check refuses
         self.assertEqual(status, 409)
         self.assertIn("target re-check failed", res["error"])
+        self.assertEqual(self.call("POST", "/repair/run", body)[0], 404)             # tokens are single use
+        body["token"] = self.call("GET", "/repair/steps")[1]["steps"][0]["token"]
         original = repair.target_check
         repair.target_check = lambda ctx: (True, "test")
         try:
@@ -158,7 +160,10 @@ class LoopbackHttp(Base):
             self.assertTrue(hdrs["Content-Type"].startswith("text/markdown"))
             self.assertEqual(net._request(base + "/scan", "POST", b"not json", dict(h, **{"Content-Length": "8"}))[0], 400)
             self.assertEqual(net._request("http://127.0.0.1:%d/" % got["port"], headers=h)[0], 404)
-            self.assertNotIn(got["token"], open(self.engine.ctx.case.path("debug.log"), encoding="utf-8").read())
+            for log in ("debug.log", "audit.log"):
+                p = self.engine.ctx.case.path(log)
+                if os.path.exists(p):
+                    self.assertNotIn(got["token"], open(p, encoding="utf-8").read(), log)
         finally:
             stop.set()
             t.join(10)
@@ -270,7 +275,7 @@ class ServerAndAgent(Base):
 
         def post(path, meta, body=b"", tok=token):
             m = net._pack(meta)
-            return net._request(self.url + path, "POST", body, {"X-RK-Meta": m, "X-RK-Sig": net._sig(tok, m, body),
+            return net._request(self.url + path, "POST", body, {"X-RK-Meta": m, "X-RK-Sig": net._sig(tok, path, m, body),
                                                                 "Content-Length": str(len(body))})
         hello = {"agent_id": "aaaa1111", "n": 1, "nonce": "n1", "name": "x", "code_hash": "h"}
         self.assertEqual(post("/agent/v1/hello", hello)[0], 200)
@@ -280,7 +285,7 @@ class ServerAndAgent(Base):
         status, headers, data = post("/agent/v1/poll", {"agent_id": "aaaa1111", "n": 2, "nonce": "n2", "wait": 0})
         self.assertEqual(status, 200)
         self.assertEqual(net._unpack(headers["X-RK-Meta"])["nonce"], "n2")            # answer bound to our nonce
-        self.assertEqual(headers["X-RK-Sig"], net._sig(token, headers["X-RK-Meta"], data))
+        self.assertEqual(headers["X-RK-Sig"], net._sig(token, "/agent/v1/poll", headers["X-RK-Meta"], data))
         for _ in range(5):                                                            # pairing code guessing is capped
             self.assertEqual(self.api("POST", "/agents/aaaa1111/pair", {"code": "123456"})[0], 403)
         self.assertEqual(self.api("POST", "/agents/aaaa1111/pair", {"code": "123456"})[0], 429)

@@ -36,3 +36,4 @@ __pycache__/
 
 # Device registry on the stick: hardware, usernames, per-device settings. Never commit.
 devices/
+.claude/settings.local.json

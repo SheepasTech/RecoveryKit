@@ -12,7 +12,7 @@ No shell is ever used (shell=False), so arguments cannot smuggle a second comman
 """
 import json
 import os
-import shutil
+import re
 import subprocess
 import threading
 import time
@@ -86,12 +86,78 @@ _SMART_OK = {"-a", "-i", "-h", "-x", "-c", "-l", "-j", "--json", "--scan", "--sc
              "--health", "--xall"}
 
 
-def classify(argv):
-    """Return (class, reason) for a command line. Deny by default."""
+def _switch_values(args, name):
+    """Values of every '<name>:<value>' / '<name>=<value>' argument (name lower-case, with its slash)."""
+    out = []
+    for a in args:
+        a = str(a)
+        if a.lower().startswith(name) and len(a) > len(name) and a[len(name)] in ":=":
+            out.append(a[len(name) + 1:])
+    return out
+
+
+_DISM_PKG_RE = re.compile(r"^[A-Za-z0-9_.~\-]+$")
+_DISM_INF_RE = re.compile(r"^oem\d+\.inf$", re.IGNORECASE)
+_WMIC_PROPS_RE = re.compile(r"^[A-Za-z0-9_,]+$")
+_WMIC_ALIAS_RE = re.compile(r"^[A-Za-z0-9_]+$")
+_CHKDSK_VOL_RE = re.compile(r"^[A-Za-z]:$")
+_CHKDSK_SW_RE = re.compile(r"^/[A-Za-z]+$")
+_SMART_L_OK = {"error", "selftest", "xerror", "xselftest", "devstat", "sataphy", "ssd", "directory", "background"}
+_SMART_D_RE = re.compile(r"^[A-Za-z0-9,+]+$")
+_WEVT_READ = ("qe", "query-events", "el", "enum-logs", "gl", "get-log", "gli", "get-loginfo")
+_ROBO_SWITCHES = {"/e", "/copy", "/dcopy", "/r", "/w", "/xj", "/np", "/tee", "/log", "/fft", "/xd", "/xf"}
+_ROBO_VALUE = {"/copy": {"DAT", "DT", "D"}, "/dcopy": {"DAT", "DA", "T", "D"}}
+_ROBO_NUM = {"/r", "/w"}
+
+
+def _inside(path, folder):
+    """True if absolute, normalised `path` is inside `folder` (never raises)."""
+    try:
+        p = os.path.normcase(os.path.abspath(path))
+        f = os.path.normcase(os.path.abspath(folder))
+        return p != f and os.path.commonpath([p, f]) == f
+    except (ValueError, TypeError):
+        return False
+
+
+def _robocopy(args):
+    if len(args) < 2 or args[0].startswith("/") or args[1].startswith("/"):
+        return FORBIDDEN, "robocopy needs a source and a destination first"
+    prev = None
+    for a in args[2:]:
+        if not a.startswith("/"):
+            if prev in ("/xd", "/xf"):
+                continue
+            return FORBIDDEN, "unexpected robocopy argument %r" % a
+        name, _, val = a.partition(":")
+        name = name.lower()
+        prev = name
+        if name not in _ROBO_SWITCHES:
+            return FORBIDDEN, "robocopy switch %s is not on the allowlist" % name
+        if name in _ROBO_VALUE and val.upper() not in _ROBO_VALUE[name]:
+            return FORBIDDEN, "robocopy %s value %r is not allowed" % (name, val)
+        if name in _ROBO_NUM and not val.isdigit():
+            return FORBIDDEN, "robocopy %s needs a number" % name
+        if name == "/log" and not val:
+            return FORBIDDEN, "robocopy /LOG needs a path"
+        if name in ("/e", "/xj", "/np", "/tee", "/fft") and ":" in a:
+            return FORBIDDEN, "robocopy %s takes no value" % name
+    return HOST, ""
+
+
+def classify(argv, case_dir=None):
+    """Return (class, reason) for a command line. Deny by default.
+
+    case_dir: the case folder; `bcdedit /export <path>` is only read-only when <path> is inside it.
+    """
     if not argv:
         return UNKNOWN, "empty command"
+    if any(c in str(argv[0]) for c in "\\/:"):
+        return FORBIDDEN, "give the tool name only, not a path: %s" % argv[0]
     exe = _base(argv[0])
     args = [str(a) for a in argv[1:]]
+    if exe in ("bcdedit", "bootrec", "bcdboot"):      # '-switch' is '/switch' for these
+        args = ["/" + a[1:] if a.startswith("-") and len(a) > 1 else a for a in args]
     low = [a.lower() for a in args]
     fl = _flags(args)
 
@@ -115,13 +181,22 @@ def classify(argv):
 
     if exe == "dism":
         if "/get-wiminfo" in fl or "/get-imageinfo" in fl:
-            return (READ, "") if "/image" not in fl and "/online" not in fl else (UNKNOWN, "unexpected dism arguments")
+            return (READ, "") if set(fl) <= {"/get-wiminfo", "/get-imageinfo", "/wimfile", "/imagefile", "/index", "/english"} \
+                else (UNKNOWN, "unexpected dism arguments")
         if "/online" in fl:
             return (READ, "") if all(f.startswith("/get-") or f in ("/online", "/english", "/format") for f in fl) \
                 else (FORBIDDEN, "dism /Online changes are not offered: the kit repairs offline targets only")
         if "/export-image" in fl:
             return (REPAIR, "") if set(fl) <= _DISM_EXPORT else (UNKNOWN, "unexpected dism export arguments")
         if "/image" in fl and set(fl) <= _DISM_REPAIR:
+            if "/remove-package" in fl:
+                pk = _switch_values(args, "/packagename")
+                if not pk or not all(_DISM_PKG_RE.fullmatch(v) for v in pk):
+                    return FORBIDDEN, "dism /Remove-Package needs a plain /PackageName: value"
+            if "/remove-driver" in fl:
+                dv = _switch_values(args, "/driver")
+                if not dv or not all(_DISM_INF_RE.fullmatch(v) for v in dv):
+                    return FORBIDDEN, "dism /Remove-Driver needs a /Driver:oemNN.inf value"
             return REPAIR, ""
         return UNKNOWN, "dism arguments not on the allowlist"
 
@@ -131,56 +206,84 @@ def classify(argv):
         return FORBIDDEN, "sfc is only run against an offline target (/offbootdir and /offwindir)"
 
     if exe == "bcdedit":
-        if set(fl) <= {"/enum", "/v", "/store"}:
-            return READ, ""
-        if set(fl) <= {"/export", "/store"}:
-            return READ, ""
         if "/import" in fl or "/createstore" in fl or "/sysstore" in fl:
             return FORBIDDEN, "bcdedit store replacement is not offered"
+        if "/export" in fl:
+            if not set(fl) <= {"/export", "/store"}:
+                return FORBIDDEN, "bcdedit /export takes no other switches"
+            i = low.index("/export")
+            dest = args[i + 1] if i + 1 < len(args) else ""
+            if case_dir and dest and not dest.startswith("/") and _inside(dest, case_dir):
+                return READ, ""
+            return FORBIDDEN, "bcdedit /export is only allowed to a file inside the case folder"
+        if set(fl) <= {"/enum", "/v", "/store"}:
+            return READ, ""
+        if "/store" not in fl:
+            return FORBIDDEN, "bcdedit without /store would edit the BCD of the running environment"
         return REPAIR, "needs-bcd-backup"
 
     if exe == "bcdboot":
+        if not set(fl) <= {"/s", "/f", "/l", "/v"}:
+            return FORBIDDEN, "bcdboot switches are limited to /s /f /l /v"
         if "/s" not in fl:
             return FORBIDDEN, "blind bcdboot (without /s <EFI partition>) is forbidden"
         return REPAIR, "needs-bcd-backup"
 
     if exe == "reg":
-        if low and low[0] in ("query", "export", "save"):
+        if low and low[0] == "query":
             return READ, ""
         return FORBIDDEN, "reg %s is not offered; hives are read with the built-in parser" % (low[0] if low else "")
 
     if exe == "manage-bde":
-        if fl[:1] == ["-status"]:
+        if set(fl) == {"-status"}:
             return READ, ""
-        if fl[:1] == ["-unlock"]:
+        if fl == ["-unlock", "-recoverypassword"]:
             return HOST, ""
-        return FORBIDDEN, "manage-bde is limited to -status and -unlock"
+        return FORBIDDEN, "manage-bde is limited to -status and -unlock -RecoveryPassword"
 
     if exe == "chkdsk":
-        if not fl:
+        if not args or not _CHKDSK_VOL_RE.fullmatch(args[0]):
+            return FORBIDDEN, "chkdsk takes a drive letter such as W: as its first argument"
+        if len(args) == 1:
             return READ, ""  # no switches = read-only mode
-        if set(fl) <= {"/f", "/scan", "/x", "/perf", "/forceofflinefix", "/spotfix", "/offlinescanandfix"}:
+        allowed = {"/f", "/scan", "/x", "/perf", "/forceofflinefix", "/spotfix", "/offlinescanandfix"}
+        if all(_CHKDSK_SW_RE.fullmatch(a) and a.lower() in allowed for a in args[1:]):
             return REPAIR, ""
         return FORBIDDEN, "chkdsk /r and other switches are not offered"
 
     if exe == "wevtutil":
-        if low and low[0] in ("qe", "query-events", "el", "enum-logs", "gl", "get-log", "gli", "get-loginfo", "epl", "export-log"):
+        if low and low[0] in _WEVT_READ:
             return READ, ""
-        return FORBIDDEN, "wevtutil is limited to queries and exports"
+        return FORBIDDEN, "wevtutil is limited to queries (no export, clear or set)"
 
     if exe == "wmic":
-        if any(w in ("call", "set", "delete", "create") for w in low):
+        if any(w in ("call", "set", "delete", "create", "terminate") for w in low):
             return FORBIDDEN, "wmic is limited to queries"
+        if "get" not in low:
+            return FORBIDDEN, "wmic is limited to '<alias> get <properties>'"
+        i = low.index("get")
+        alias, rest = args[:i], args[i + 1:]
+        if not all(_WMIC_ALIAS_RE.fullmatch(a) for a in alias):
+            return FORBIDDEN, "wmic alias words may only be letters, digits and _"
+        if not rest or len(rest) > 2 or not _WMIC_PROPS_RE.fullmatch(rest[0]) or                 (len(rest) == 2 and rest[1].lower() != "/value"):
+            return FORBIDDEN, "wmic get takes one property list and optionally /value"
         return READ, ""
 
     if exe == "smartctl":
         sfl = _flags([a for a in args if not a.lower().startswith("/dev/")])  # /dev/pdN is a device, not a switch
-        return (READ, "") if set(sfl) <= _SMART_OK else (FORBIDDEN, "smartctl is limited to reading")
+        if not set(sfl) <= _SMART_OK or any(a.startswith("-") and a not in _SMART_OK and a.lower() in _SMART_OK
+                                            for a in args):
+            return FORBIDDEN, "smartctl is limited to reading"
+        for i, a in enumerate(args):
+            nxt = args[i + 1] if i + 1 < len(args) else ""
+            if a.lower() == "-l" and nxt.lower() not in _SMART_L_OK:
+                return FORBIDDEN, "smartctl -l value %r is not allowed" % nxt
+            if a.lower() == "-d" and not _SMART_D_RE.fullmatch(nxt):
+                return FORBIDDEN, "smartctl -d value %r is not allowed" % nxt
+        return READ, ""
 
     if exe == "robocopy":
-        if set(fl) & _ROBOCOPY_BAD:
-            return FORBIDDEN, "robocopy switches that move or delete are forbidden"
-        return HOST, ""
+        return _robocopy(args)
 
     if exe in ("ipconfig", "ver", "systeminfo", "hostname", "whoami"):
         return (READ, "") if not (set(fl) - {"/all", "/fo", "/nh"}) else (UNKNOWN, "unexpected arguments")
@@ -189,6 +292,8 @@ def classify(argv):
     if exe == "wpeutil":
         return (HOST, "") if low == ["initializenetwork"] else (FORBIDDEN, "wpeutil is limited to InitializeNetwork")
     if exe == "drvload":
+        if any(a.startswith("/") for a in args):
+            return FORBIDDEN, "drvload switches (such as /offline) are not offered"
         return HOST, ""
     return UNKNOWN, "%s is not on the allowlist" % exe
 
@@ -201,7 +306,12 @@ def classify_diskpart(lines):
     """Class of a diskpart script: forbidden unless every line is on the allowlist."""
     worst = READ
     for raw in lines:
-        line = " ".join(raw.strip().lower().split())
+        if not isinstance(raw, str):
+            return FORBIDDEN, "diskpart line is not text: %r" % (raw,)
+        stripped = raw.strip(" \t")
+        if any(ord(c) < 0x20 or ord(c) == 0x7f for c in stripped):
+            return FORBIDDEN, "diskpart line contains a control character (line break or similar): %r" % raw
+        line = " ".join(stripped.lower().split())
         if not line:
             continue
         if line.startswith(_DP_READ) or line == "rem":
@@ -211,6 +321,16 @@ def classify_diskpart(lines):
             continue
         return FORBIDDEN, "diskpart line not allowed: %r (clean, format, delete and anything not listed are forbidden)" % raw
     return worst, ""
+
+
+def normalise_diskpart(lines):
+    """The lines exactly as they are sent to diskpart: stripped, single spaces, no empty lines.
+    Only call after classify_diskpart() accepted them."""
+    return [n for n in (" ".join(str(ln).strip(" \t").split()) for ln in lines) if n]
+
+
+def _dp_argv(lines):
+    return ["diskpart"] + ["<%s>" % (" ".join(ln.split()) if isinstance(ln, str) else repr(ln)) for ln in lines]
 
 
 # Built-in read-only PowerShell snippets. Parameters arrive as environment variables RK_P_<NAME>,
@@ -224,6 +344,33 @@ PS_SCRIPTS = {
 }
 
 
+def _addresses_running_windows(argv):
+    """True if a dism/sfc/bcdboot/chkdsk command line points at the running Windows install."""
+    exe = _base(argv[0])
+    args = [str(a) for a in argv[1:]]
+    paths = []
+    if exe == "dism":
+        paths = _switch_values(args, "/image")
+    elif exe == "sfc":
+        paths = _switch_values(args, "/offbootdir") + _switch_values(args, "/offwindir")
+    elif exe in ("bcdboot", "chkdsk") and args:
+        paths = [args[0]]
+    sysdrive = os.environ.get("SystemDrive", "").upper()
+    sysroot = os.environ.get("SystemRoot", "")
+    for p in paths:
+        if not p:
+            continue
+        if sysdrive and os.path.splitdrive(os.path.abspath(p))[0].upper() == sysdrive:
+            return True
+        for cand in (p, os.path.join(p, "Windows")):
+            try:
+                if sysroot and os.path.samefile(cand, sysroot):
+                    return True
+            except (OSError, ValueError):
+                pass
+    return False
+
+
 class Runner:
     def __init__(self, case, ui, kit_root, dry_run=False):
         self.case, self.ui, self.kit_root = case, ui, kit_root
@@ -231,6 +378,7 @@ class Runner:
         self.repairs_enabled = False   # set by the repair menu only
         self.target_online = False     # True when the target is the running Windows: no repairs
         self.bcd_backup = None         # path of a verified BCD export made in this run
+        self.bcd_backup_target = None  # id (volume GUID) of the target that export belongs to
         self.verified_tools = {}       # name -> path, filled by verify_tools()
         self._seq = 0
         self._lock = threading.Lock()
@@ -269,15 +417,37 @@ class Runner:
             self._seq += 1
             return self._seq
 
-    def _refuse(self, argv, kind, reason, purpose):
+    def _refuse(self, argv, kind, reason, purpose, secrets=()):
         res = Result(list(argv), error="refused: " + reason, seq=self._next(), kind="refused")
-        self._audit(res, purpose, note=kind)
+        self._audit(res, purpose, note=kind, secrets=secrets)
         raise Refused(reason)
 
     # ---------------------------------------------------------------- execution
     def resolve(self, name):
-        """Full path of a tool: verified tools/ binaries first, then PATH. None if absent."""
-        return self.verified_tools.get(_base(name)) or shutil.which(name)
+        """Full path of a tool: verified tools/ binaries first, then the System32 folder of %SystemRoot% only
+        (no PATH, no current directory, no PATHEXT). None if absent."""
+        if any(c in str(name) for c in "\\/:"):
+            return None
+        base = _base(name)
+        if base in self.verified_tools:
+            return self.verified_tools[base]
+        if not base:
+            return None
+        root = os.environ.get("SystemRoot") or os.environ.get("windir")
+        if not root:
+            return None
+        s32 = os.path.join(root, "System32")
+        dirs = [s32]
+        if base == "powershell":
+            dirs.append(os.path.join(s32, "WindowsPowerShell", "v1.0"))
+        elif base == "wmic":
+            dirs.append(os.path.join(s32, "wbem"))
+        for d in dirs:
+            for ext in (".exe", ".com"):
+                p = os.path.join(d, base + ext)
+                if os.path.isfile(p):
+                    return p
+        return None
 
     def _exec(self, argv, timeout, stdin_text=None, live=False, env=None):
         res = Result(list(argv))
@@ -328,9 +498,9 @@ class Runner:
         retry_rc: exit codes treated as transient and retried once (e.g. DISM error 32).
         A missing tool is not an exception: the Result has rc None and .error set.
         """
-        kind, reason = classify(argv)
+        kind, reason = classify(argv, case_dir=self.case.dir)
         if kind != READ:
-            self._refuse(argv, kind, reason or "not a read-only command; use a repair step", purpose)
+            self._refuse(argv, kind, reason or "not a read-only command; use a repair step", purpose, secrets=secrets)
         res = self._exec(argv, timeout)
         res.seq, res.kind = self._next(), READ
         self._audit(res, purpose, secrets=secrets)
@@ -344,7 +514,10 @@ class Runner:
     def run_ps(self, name, params=None, timeout=90):
         """Run one of the built-in read-only PowerShell snippets, if PowerShell exists."""
         script = PS_SCRIPTS[name]
-        exe = shutil.which("powershell") or shutil.which("pwsh")
+        exe = self.resolve("powershell")
+        if not exe:
+            pw7 = os.path.join(os.environ.get("ProgramFiles", ""), "PowerShell", "7", "pwsh.exe")
+            exe = pw7 if os.environ.get("ProgramFiles") and os.path.isfile(pw7) else None
         argv = ["powershell", "-NoProfile", "-NonInteractive", "-Command", script]
         if not exe:
             res = Result(argv, error="not available in this environment: PowerShell", seq=self._next())
@@ -362,19 +535,25 @@ class Runner:
     def run_diskpart(self, lines, purpose, timeout=120):
         """Run a read-only diskpart script (list/select/detail only)."""
         kind, reason = classify_diskpart(lines)
-        argv = ["diskpart"] + ["<" + ln.strip() + ">" for ln in lines]
+        argv = _dp_argv(lines)
         if kind != READ:
             self._refuse(argv, kind, reason or "diskpart script changes state; use a repair step", purpose)
-        res = self._exec(["diskpart"], timeout, stdin_text="\r\n".join(lines) + "\r\nexit\r\n")
+        res = self._exec(["diskpart"], timeout, stdin_text="\r\n".join(normalise_diskpart(lines)) + "\r\nexit\r\n")
         res.argv, res.seq, res.kind = argv, self._next(), READ
         self._audit(res, purpose)
         return res
 
     # ---------------------------------------------------------------- repairs
-    def note_bcd_backup(self, path):
+    def reset_for_scan(self):
+        """Forget per-target state (the BCD export of a previous scan must not enable repairs for a new one)."""
+        self.bcd_backup = None
+        self.bcd_backup_target = None
+
+    def note_bcd_backup(self, path, target_id=None):
         """Record that the BCD store was exported to `path` in this run (enables BCD repair steps)."""
         if os.path.isfile(path) and os.path.getsize(path) > 0:
             self.bcd_backup = path
+            self.bcd_backup_target = target_id
             LOG.info("BCD   | backup recorded: %s", path)
             return True
         return False
@@ -386,28 +565,35 @@ class Runner:
         forbidden or unknown, the target is the running Windows, a BCD change has no prior
         export, or the target re-check fails.
         """
+        lines = None
         if step.diskpart is not None:
-            argv = ["diskpart"] + ["<" + ln.strip() + ">" for ln in step.diskpart]
+            argv = _dp_argv(step.diskpart)
             kind, reason = classify_diskpart(step.diskpart)
+            if kind in (READ, REPAIR):
+                lines = normalise_diskpart(step.diskpart)
+                argv = ["diskpart"] + ["<%s>" % ln for ln in lines]
         else:
             argv = list(step.argv)
-            kind, reason = classify(argv)
+            kind, reason = classify(argv, case_dir=self.case.dir)
+        sec = step.secrets
         purpose = "repair step %s: %s" % (step.id, step.title)
         if kind in (FORBIDDEN, UNKNOWN):
-            self._refuse(argv, kind, reason, purpose)
+            self._refuse(argv, kind, reason, purpose, sec)
         if kind == READ:
-            self._refuse(argv, kind, "this is a read-only command; run it with run()", purpose)
+            self._refuse(argv, kind, "this is a read-only command; run it with run()", purpose, sec)
         if not self.repairs_enabled:
-            self._refuse(argv, kind, "repairs are not enabled in this session", purpose)
+            self._refuse(argv, kind, "repairs are not enabled in this session", purpose, sec)
         if self.target_online and step.touches_target:
-            self._refuse(argv, kind, "the target is the running Windows; repair helpers only work on offline targets", purpose)
-        if reason == "needs-bcd-backup" and not self.bcd_backup:
-            self._refuse(argv, kind, "no BCD export was made in this run; export the BCD first", purpose)
+            self._refuse(argv, kind, "the target is the running Windows; repair helpers only work on offline targets", purpose, sec)
+        if step.diskpart is None and _addresses_running_windows(argv):
+            self._refuse(argv, kind, "this command addresses the running Windows", purpose, sec)
+        if reason == "needs-bcd-backup" and not (self.bcd_backup and os.path.isfile(self.bcd_backup)):
+            self._refuse(argv, kind, "no BCD export was made in this run; export the BCD first", purpose, sec)
         if step.target_check is not None:
             ok, msg = step.target_check()
             LOG.info("REPAIR| target re-check: %s %s", ok, msg)
             if not ok:
-                self._refuse(argv, kind, "target re-check failed: %s" % msg, purpose)
+                self._refuse(argv, kind, "target re-check failed: %s" % msg, purpose, sec)
 
         shown = [("<hidden>" if any(s and s in str(a) for s in step.secrets) else str(a)) for a in argv]
         ui = self.ui
@@ -416,7 +602,7 @@ class Runner:
             ui.say("Why:      %s" % step.evidence)
         ui.say("Command:  %s" % (subprocess.list2cmdline(shown) if step.diskpart is None else "diskpart script:"))
         if step.diskpart is not None:
-            for ln in step.diskpart:
+            for ln in lines:
                 ui.say("            %s" % ln)
         ui.say("Effect:   %s" % step.effect)
         if step.risk:
@@ -434,12 +620,14 @@ class Runner:
             res = Result(argv, error="dry run: not executed", seq=self._next(), kind="dry-run")
             self._audit(res, purpose, secrets=step.secrets)
             return res
+        seq = self._next()
+        self._audit(Result(argv, seq=seq, kind="started"), purpose, note="started", secrets=step.secrets)
         if step.diskpart is not None:
-            res = self._exec(["diskpart"], step.timeout, stdin_text="\r\n".join(step.diskpart) + "\r\nexit\r\n", live=True)
+            res = self._exec(["diskpart"], step.timeout, stdin_text="\r\n".join(lines) + "\r\nexit\r\n", live=True)
             res.argv = argv
         else:
             res = self._exec(argv, step.timeout, live=True)
-        res.seq, res.kind = self._next(), kind
+        res.seq, res.kind = seq, kind
         self._audit(res, purpose, secrets=step.secrets)
         ui.say("Exit code: %s%s" % (res.rc, "  (%s)" % res.error if res.error else ""))
         return res
@@ -461,7 +649,11 @@ class Runner:
                     continue
                 want, rel = parts[0].lower(), " ".join(parts[1:]).lstrip("*")
                 p = os.path.join(tools_dir, rel.replace("/", os.sep))
-                if os.path.commonpath([os.path.abspath(p), tools_dir]) != tools_dir:
+                try:
+                    escapes = os.path.commonpath([os.path.abspath(p), tools_dir]) != tools_dir
+                except ValueError:
+                    escapes = True
+                if escapes:
                     status[rel] = "path escapes tools/"
                     continue
                 try:

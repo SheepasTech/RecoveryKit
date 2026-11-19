@@ -22,7 +22,8 @@ KIT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 def parse_args(argv):
     p = argparse.ArgumentParser(prog="run.cmd", description="RecoveryKit: diagnose, collect evidence from and "
-                                "(only with confirmation) repair unbootable Windows installations.")
+                                "(only with confirmation) repair unbootable Windows installations.",
+                                allow_abbrev=False)
     g = p.add_argument_group("scan")
     g.add_argument("--scan", action="store_true", help="discovery + log collection + report, then exit (no menu)")
     g.add_argument("--auto", action="store_true", help="never wait for input; defaults are used and no repair is ever confirmed")
@@ -59,6 +60,18 @@ def parse_args(argv):
     g.add_argument("--wipe-case", metavar="CASE_ID", help="delete a case folder from the output location and exit")
     g.add_argument("--version", action="store_true", help="print the version and exit")
     return p.parse_args(argv)
+
+
+def start_line(args):
+    """The START log line, built from the PARSED arguments with secrets masked (never from raw argv)."""
+    shown = {}
+    for k, v in sorted(vars(args).items()):
+        if k in ("token", "pin") and v:
+            v = "<%s>" % k
+        elif k == "ctl" and v:         # the remainder is passed to the ctl client unparsed
+            v = ["<secret>" if i and v[i - 1] in ("--token", "--pin") else a for i, a in enumerate(v)]
+        shown[k] = v
+    return "START | RecoveryKit %s args=%r kit_root=%s" % (__version__, shown, KIT_ROOT)
 
 
 def writable_dir(path):
@@ -99,6 +112,10 @@ def wipe_case(out_root, case_id, ui):
     if os.path.dirname(target) != os.path.abspath(out_root) or not case_id.strip(". "):
         ui.say("Not a case ID: %r" % case_id)
         return 2
+    if case_id.startswith("_"):
+        ui.say("Refused: %r is not a case folder (names starting with _ are kit internals such as _pending or "
+               "_server). Also note that --wipe-case never removes devices\\<ID> or the %%TEMP%% mirror of the log." % case_id)
+        return 2
     if not os.path.isdir(target):
         ui.say("No such case folder: %s" % target)
         return 1
@@ -108,6 +125,7 @@ def wipe_case(out_root, case_id, ui):
         return 1
     shutil.rmtree(target)
     ui.say("Deleted %s. Note: deleted files on a USB stick can still be recoverable with forensic tools." % target)
+    ui.say("Not removed: devices\\<ID> (the device record on the stick) and the copy of the log in %TEMP%.")
     return 0
 
 
@@ -189,7 +207,7 @@ def main(argv=None):
         return 0
     if args.ctl is not None:
         from . import net
-        return net.ctl(KIT_ROOT, args.ctl)
+        return net.ctl(KIT_ROOT, args.ctl, pin=args.pin)
     if args.server:
         from . import net
         store = os.path.abspath(args.store) if args.store else os.path.join(KIT_ROOT, "cases", "_server")
@@ -199,8 +217,7 @@ def main(argv=None):
     ui = UI(auto=headless)
     stamp = log.stamp()
     mirror = log.add_temp_mirror(stamp) if envmod.kind() == "windows" else None
-    LOG.info("START | RecoveryKit %s argv=%r kit_root=%s", __version__,
-             ["<token>" if i and argv[i - 1] == "--token" else a for i, a in enumerate(argv)], KIT_ROOT)
+    LOG.info("%s", start_line(args))
     if sys.maxsize <= 2**32:
         ui.say("RecoveryKit needs 64-bit Python (WinRE has no 32-bit support).")
         return 2

@@ -96,8 +96,22 @@ def kit_env(tmp, path_dir=None, keep_only=False):
     return env
 
 
-def run_kit(args, env, timeout=420):
-    return subprocess.run([BUNDLED, "-m", "recoverykit"] + args, cwd=ROOT, env=env, capture_output=True,
+# Child bootstrap for "no tools at all": an empty PATH no longer hides tools (the runner only looks in
+# System32), so the resolver is patched before the kit starts. PowerShell 7's fallback path is hidden too.
+NO_TOOLS_BOOTSTRAP = (
+    "import os, sys, shutil\n"
+    "import recoverykit.core.runner as r\n"
+    "r.Runner.resolve = lambda self, name: None\n"
+    "shutil.which = lambda *a, **k: None\n"
+    "_isfile = os.path.isfile\n"
+    "os.path.isfile = lambda p: False if str(p).lower().endswith('pwsh.exe') else _isfile(p)\n"
+    "import recoverykit.__main__ as m\n"
+    "sys.exit(m.main(sys.argv[1:]))\n")
+
+
+def run_kit(args, env, timeout=420, bootstrap=None):
+    cmd = [BUNDLED, "-c", bootstrap] if bootstrap else [BUNDLED, "-m", "recoverykit"]
+    return subprocess.run(cmd + args, cwd=ROOT, env=env, capture_output=True,
                           text=True, encoding="utf-8", errors="replace", timeout=timeout)
 
 
@@ -154,7 +168,7 @@ class NoToolsAtAll(TmpMixin, unittest.TestCase):
         fakewin.make_target(cls.target)
         cls.out = os.path.join(tmp, "cases")
         cls.proc = run_kit(["--scan", "--auto", "--target-path", cls.target, "--out", cls.out, "--ticket", "5"],
-                           kit_env(tmp, empty_path, keep_only=True))
+                           kit_env(tmp, empty_path, keep_only=True), bootstrap=NO_TOOLS_BOOTSTRAP)
         cls.case_dir = find_case_dir(cls.out)
         cls.case = load_case(cls.case_dir) if cls.case_dir else None
 
@@ -220,7 +234,14 @@ class SomeToolsMissing(TmpMixin, unittest.TestCase):
         cls.target = os.path.join(tmp, "target")
         fakewin.make_target(cls.target)
         fake = types.SimpleNamespace(which=fake_which_factory(MISSING_TOOLS))
-        with mock.patch.object(runnermod, "shutil", fake), mock.patch.object(envmod, "shutil", fake):
+        real_resolve, real_isfile = runnermod.Runner.resolve, os.path.isfile
+        hide = mock.patch.object(runnermod.Runner, "resolve", autospec=True,
+                                 side_effect=lambda self, name: None if runnermod._base(name) in MISSING_TOOLS
+                                 else real_resolve(self, name))
+        # run_ps() falls back to %ProgramFiles%\PowerShell\7\pwsh.exe: hide that one path too
+        no_pwsh = mock.patch.object(os.path, "isfile", side_effect=lambda p: False if str(p).lower().endswith("pwsh.exe")
+                                    else real_isfile(p))
+        with hide, no_pwsh, mock.patch.object(envmod, "shutil", fake):
             cls.engine = Engine(ROOT, os.path.join(tmp, "cases"), QuietUI(), dry_run=True,
                                 options={"ticket": "5", "target_path": cls.target, "answers": {}})
             cls.addClassCleanup(cls.engine.close)
