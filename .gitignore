@@ -22,6 +22,8 @@ config/token*
 *.log
 debug/*
 .project/
+# Requests from other agents; stays ignored even if .project/ is ever tracked
+.project/inbox/
 .vscode/
 .idea/
 Thumbs.db
